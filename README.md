@@ -79,6 +79,7 @@ jobs:
           unstable-ref: github:NixOS/nixpkgs/nixos-unstable
           whitelist: path/to/manual_analysis.csv
           nixprs: true
+          nixtracker: true
           cachix-caches: nix-community my-org
 ```
 
@@ -118,6 +119,7 @@ see [example-scan.yml](.github/workflows/example-scan.yml).
 | `unstable-ref` | no | `""` | Optional third scan target, typically `github:NixOS/nixpkgs/nixos-unstable`. |
 | `whitelist` | no | `""` | Path to a suppressions CSV in the caller repository. |
 | `nixprs` | no | `false` | Enable best-effort nixpkgs PR enrichment during report rendering. |
+| `nixtracker` | no | `false` | Enable best-effort Nixpkgs security tracker enrichment during report rendering. |
 | `token` | no | `""` | Optional token for `nixprs`; when empty, the trusted report step falls back to `github.token`. |
 | `cachix-caches` | no | `""` | Space-delimited Cachix cache names to add as read-only substituters. |
 
@@ -143,8 +145,8 @@ fresh state for the next run. It persists:
 
 - the `grype` database
 - the `vulnix` database
-- `sbomnix`'s shared HTTP cache for OSV, repology, and optional `nixprs`
-  lookups
+- `sbomnix`'s shared HTTP cache for OSV, repology, and optional `nixprs` /
+  `nixtracker` lookups
 - the previous-run findings baseline used for "since last run" sections
 
 ## Local usage
@@ -228,6 +230,14 @@ Enable best-effort `nixprs` enrichment:
 ```bash
 nix run .#flakevuln -- local \
   --nixprs \
+  packages.x86_64-linux.default
+```
+
+Enable best-effort Nixpkgs security tracker enrichment:
+
+```bash
+nix run .#flakevuln -- local \
+  --nixtracker \
   packages.x86_64-linux.default
 ```
 

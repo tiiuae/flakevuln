@@ -219,6 +219,7 @@ def _local_args(tmp_path, **overrides):
         "project_url": "",
         "whitelist": None,
         "nixprs": False,
+        "nixtracker": False,
         "outdir": tmp_path / "local-out",
         "verbose": 1,
     }
@@ -248,6 +249,7 @@ def test_local_subcommand_runs_scan_then_report(monkeypatch, tmp_path):
         project_url="https://example.test/proj",
         whitelist=tmp_path / "wl.csv",
         nixprs=True,
+        nixtracker=True,
         outdir=outdir,
         verbose=2,
     )
@@ -272,6 +274,7 @@ def test_local_subcommand_runs_scan_then_report(monkeypatch, tmp_path):
     )
     assert report_kwargs["findings"] == scan_kwargs["findings"]
     assert report_kwargs["nixprs_enabled"] is True
+    assert report_kwargs["nixtracker_enabled"] is True
     assert report_kwargs["outdir"].name == "report"
     expected_baseline = flakevuln_main._baseline_findings_path(
         ".", ["pkgA", "pkgB"], "nixpkgs"
@@ -926,6 +929,37 @@ def test_apply_nixprs_merges_links_into_matching_scan_rows(tmp_path):
     assert lock.iloc[0]["nixpkgs_pr"].endswith("/pull/1")
 
 
+def test_apply_nixtracker_merges_issue_by_vuln_id(tmp_path):
+    """Nixpkgs tracker metadata is CVE-level and applies across packages."""
+    target = "packages.x86_64-linux.default"
+    scanner = _make_scanner(tmp_path, flakeref="flake")
+    scanner.df_scan = pd.DataFrame(
+        [
+            _scan_row(target, PIN_CURRENT, "CVE-1", "pkgA"),
+            _scan_row(target, PIN_LOCK_UPDATED, "CVE-1", "pkgA"),
+            _scan_row(target, PIN_CURRENT, "CVE-1", "pkgB"),
+            _scan_row(target, PIN_CURRENT, "CVE-2", "pkgC"),
+        ]
+    )
+    actionable = [
+        {
+            "target": target,
+            "vuln_id": "CVE-1",
+            "package": "pkgA",
+            "nixpkgs_issue": "NIXPKGS-2026-0001",
+            "nixpkgs_issue_status": "affected",
+        }
+    ]
+
+    scanner.apply_nixtracker(actionable)
+
+    cve1 = scanner.df_scan[scanner.df_scan["vuln_id"] == "CVE-1"]
+    assert cve1["nixpkgs_issue"].tolist() == ["NIXPKGS-2026-0001"] * 3
+    assert cve1["nixpkgs_issue_status"].tolist() == ["affected"] * 3
+    cve2 = scanner.df_scan[scanner.df_scan["vuln_id"] == "CVE-2"]
+    assert cve2.iloc[0]["nixpkgs_issue"] == ""
+
+
 def test_diff_sections_render_nixprs_links_for_upstream_and_unstable(tmp_path):
     """Diff tables reuse the merged PR links once scan rows are enriched."""
     target = "packages.x86_64-linux.default"
@@ -1093,6 +1127,7 @@ def test_report_table_escapes_untrusted_markdown_cells(tmp_path):
                 ),
                 url="https://example.com/advisories/CVE(1)",
                 nixpkgs_pr="https://github.com/NixOS/nixpkgs/pull/9",
+                nixpkgs_issue="NIXPKGS-2026-2319",
             )
         ]
     )
@@ -1111,6 +1146,91 @@ def test_report_table_escapes_untrusted_markdown_cells(tmp_path):
     assert "[link](https://evil.example/owned)" in table
     assert "[link](<https://good.example/a(b)>)" in table
     assert "[PR](https://github.com/NixOS/nixpkgs/pull/9)" in table
+    tracker_link = (
+        "[TRACKER](https://tracker.security.nixos.org/issues/NIXPKGS-2026-2319)"
+    )
+    assert tracker_link in table
+    assert ("[PR](https://github.com/NixOS/nixpkgs/pull/9), " + tracker_link) in table
+    assert (
+        table.index("plain \\`tick\\`") < table.index("[PR]") < table.index("[TRACKER]")
+    )
+
+
+def test_report_ignores_invalid_nixtracker_issue_code(tmp_path):
+    """Untrusted tracker fields should not become links unless validated."""
+    scanner = _make_scanner(tmp_path)
+    df = pd.DataFrame(
+        [
+            _scan_row(
+                "packages.x86_64-linux.default",
+                PIN_CURRENT,
+                "CVE-1",
+                "pkg",
+                nixpkgs_issue="NIXPKGS-2026-1\n# injected",
+            )
+        ]
+    )
+
+    table = scanner._df_to_report_tbl(df)
+
+    assert "tracker.security.nixos.org" not in table
+    assert "# injected" not in table
+
+
+def test_report_runs_nixtracker_only_in_report_phase(monkeypatch, tmp_path):
+    """--nixtracker enriches reports without mutating input findings."""
+    target = "packages.x86_64-linux.default"
+    scanner = _make_scanner(tmp_path, flakeref="flake")
+    scanner.scanned_targets = [("flake", target)]
+    scanner.df_scan = pd.DataFrame(
+        [
+            _scan_row(target, PIN_CURRENT, "CVE-1", "pkg"),
+            _scan_row(target, PIN_CURRENT, "CVE-2", "pkg-whitelist", whitelist="True"),
+        ]
+    )
+    findings = tmp_path / "findings.json"
+    scanner.write_findings(findings)
+    original_findings = findings.read_text(encoding="utf-8")
+    next_baseline = tmp_path / "next-baseline.json"
+    seen = {}
+
+    def fake_enrich(actionable, **_kwargs):
+        seen["vuln_ids"] = [finding["vuln_id"] for finding in actionable]
+        for finding in actionable:
+            finding["nixpkgs_issue"] = f"NIXPKGS-2026-000{finding['vuln_id'][-1]}"
+            finding["nixpkgs_issue_status"] = "affected"
+        return True
+
+    monkeypatch.setattr(flakevuln_main.nixtracker, "enrich_actionable", fake_enrich)
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(tmp_path / "summary.md"))
+    args = argparse.Namespace(
+        command="report",
+        findings=findings,
+        outdir=None,
+        nixprs=False,
+        nixtracker=True,
+        baseline_findings=None,
+        update_baseline_findings=next_baseline,
+        verbose=1,
+    )
+    monkeypatch.setattr(flakevuln_main, "_getargs", lambda: args)
+    monkeypatch.setattr(flakevuln_main, "_init_logging", lambda _v: None)
+
+    flakevuln_main.main()
+
+    assert seen["vuln_ids"] == ["CVE-1", "CVE-2"]
+    summary_text = (tmp_path / "summary.md").read_text(encoding="utf-8")
+    assert "Nixpkgs security tracker lookup: complete for CVE findings" in summary_text
+    assert (
+        "[TRACKER](https://tracker.security.nixos.org/issues/NIXPKGS-2026-0001)"
+    ) in summary_text
+    assert findings.read_text(encoding="utf-8") == original_findings
+    persisted = json.loads(next_baseline.read_text(encoding="utf-8"))
+    persisted_issues = {
+        row["vuln_id"]: row["nixpkgs_issue"] for row in persisted["scan_rows"]
+    }
+    assert persisted_issues["CVE-1"] == "NIXPKGS-2026-0001"
+    assert persisted_issues["CVE-2"] == "NIXPKGS-2026-0002"
 
 
 def test_report_runs_nixprs_only_in_report_phase(monkeypatch, tmp_path):

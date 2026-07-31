@@ -12,6 +12,7 @@ inputs:
   unstable-ref:    { default: '' }        # empty skips the third scan
   whitelist:       { default: '' }
   nixprs:          { default: 'false' }   # opt-in PR enrichment; best-effort only
+  nixtracker:      { default: 'false' }   # opt-in Nixpkgs security tracker enrichment; best-effort only
   token:           { default: '' }        # optional auth for --nixprs; empty falls back to github.token in the trusted report step
   cachix-caches:   { default: '' }        # space-separated cachix cache names (read-only substituters)
 
@@ -134,7 +135,7 @@ runs:
           ${{ steps.cache-meta.outputs.vulnix_prefix }}
 
     # Restore sbomnix's shared requests-cache database across runs. This
-    # covers OSV, repology, and optional nixprs lookups without persisting the
+    # covers OSV, repology, and optional nixprs/nixtracker lookups without persisting the
     # unrelated dataframe/meta lock files that live under the same cache root.
     # Honor XDG_CACHE_HOME when the caller sets it.
     - name: Restore sbomnix HTTP responses
@@ -204,6 +205,7 @@ runs:
         FLAKEVULN_BIN: ${{ steps.build.outputs.bin }}
         FINDINGS: ${{ steps.scan.outputs.findings }}
         NIXPRS: ${{ inputs.nixprs }}
+        NIXTRACKER: ${{ inputs.nixtracker }}
         BASELINE_FINDINGS: ${{ steps.baseline-scope.outputs.baseline_path }}
         # Composite actions do not auto-inherit github.token.
         GH_TOKEN: ${{ inputs.token || github.token }}
@@ -211,6 +213,7 @@ runs:
         set -euo pipefail
         args=( report --findings="$FINDINGS" )
         if [ "$NIXPRS" = "true" ]; then args+=( --nixprs ); fi
+        if [ "$NIXTRACKER" = "true" ]; then args+=( --nixtracker ); fi
         args+=( --baseline-findings="$BASELINE_FINDINGS" )
         args+=( --update-baseline-findings="$BASELINE_FINDINGS" )
         "$FLAKEVULN_BIN" "${args[@]}"

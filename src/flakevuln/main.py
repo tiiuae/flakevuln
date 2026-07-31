@@ -25,7 +25,7 @@ import pandas as pd
 from colorlog import ColoredFormatter, default_log_colors
 from tabulate import tabulate
 
-from flakevuln import nixprs
+from flakevuln import nixprs, nixtracker
 from flakevuln.version import get_py_pkg_version
 
 LOG_SPAM = logging.DEBUG - 1
@@ -47,6 +47,8 @@ EMPTY_SCAN_COLUMNS = [
     "url",
     "whitelist_comment",
     "nixpkgs_pr",
+    "nixpkgs_issue",
+    "nixpkgs_issue_status",
 ]
 
 # Lock states recorded in findings output.
@@ -209,6 +211,12 @@ def _add_report_parser(subparsers):
     )
     report.add_argument("--nixprs", help=helps, action="store_true")
     helps = (
+        "Enable best-effort Nixpkgs security tracker enrichment. Runs once on "
+        "the current findings set during report rendering, uses the public "
+        "tracker API, and is non-fatal."
+    )
+    report.add_argument("--nixtracker", help=helps, action="store_true")
+    helps = (
         "Optional directory for the detailed markdown report. When omitted, "
         "only the Step Summary is produced."
     )
@@ -283,6 +291,11 @@ def _add_local_parser(subparsers, scan_parser, report_parser):
     local.add_argument(
         "--nixprs",
         help=report_parser._option_string_actions["--nixprs"].help,
+        action="store_true",
+    )
+    local.add_argument(
+        "--nixtracker",
+        help=report_parser._option_string_actions["--nixtracker"].help,
         action="store_true",
     )
     helps = (
@@ -1882,6 +1895,38 @@ class FlakeScanner:
             axis=1,
         )
 
+    def apply_nixtracker(self, actionable):
+        """Fold Nixpkgs security tracker metadata into matching scan rows.
+
+        Tracker lookup is CVE-level metadata, so it is keyed only by `vuln_id`
+        and applied to every matching row regardless of package, target, or
+        flakeref.
+        """
+        issues = {
+            f["vuln_id"]: (
+                f.get("nixpkgs_issue", ""),
+                f.get("nixpkgs_issue_status", ""),
+            )
+            for f in actionable
+            if f.get("nixpkgs_issue")
+        }
+        if not issues or self.df_scan.empty:
+            return
+        for column in ("nixpkgs_issue", "nixpkgs_issue_status"):
+            if column not in self.df_scan.columns:
+                self.df_scan[column] = ""
+        self.df_scan[["nixpkgs_issue", "nixpkgs_issue_status"]] = self.df_scan.apply(
+            lambda row: issues.get(
+                row["vuln_id"],
+                (
+                    row.get("nixpkgs_issue", ""),
+                    row.get("nixpkgs_issue_status", ""),
+                ),
+            ),
+            axis=1,
+            result_type="expand",
+        )
+
     def _diff_scans(self, df, left_pin, right_pin, df_right_source=None):
         LOG.debug("'%s' diff '%s'", left_pin, right_pin)
         if "pintype" not in df.columns or df.empty:
@@ -1957,6 +2002,9 @@ class FlakeScanner:
         # Add PR search links
         if "nixpkgs_pr" in df.columns:
             df["comment"] = df.apply(_reformat_pr_search, axis=1)
+        # Add Nixpkgs security tracker links
+        if "nixpkgs_issue" in df.columns:
+            df["comment"] = df.apply(_reformat_nixtracker, axis=1)
         # Select only the report_cols
         df = df[report_cols]
         for column in (
@@ -2527,12 +2575,45 @@ def _reformat_pr_search(row):
                 fallback=_safe_markdown_table_text(token),
             )
         )
-    pr_search = ", ".join(link for link in links if link)
-    if pr_search:
-        pr_search = f" *{pr_search}*"
-    if row.comment:
-        pr_search = f"{row.comment} {pr_search}"
-    return pr_search
+    return _append_enrichment_links(row.comment, links)
+
+
+def _reformat_nixtracker(row):
+    comment = row.comment if hasattr(row, "comment") else ""
+    if not hasattr(row, "nixpkgs_issue") or not row.nixpkgs_issue:
+        return comment
+    raw_codes = [code.strip() for code in str(row.nixpkgs_issue).split(",")]
+    codes = [code for code in raw_codes if code]
+    links = []
+    for code in codes:
+        url = nixtracker.tracker_issue_url(code)
+        if not url:
+            continue
+        label = "TRACKER" if len(codes) == 1 else f"TRACKER:{code}"
+        links.append(
+            _markdown_link(
+                label,
+                url,
+                fallback=_safe_markdown_table_text(code),
+            )
+        )
+    return _append_enrichment_links(comment, links)
+
+
+def _append_enrichment_links(comment, links):
+    links_text = ", ".join(link for link in links if link)
+    if not links_text:
+        return comment
+    if not comment:
+        return f"*{links_text}*"
+    stripped = comment.rstrip()
+    if stripped.startswith("*") and stripped.endswith("*"):
+        return f"*{stripped[1:-1]}, {links_text}*"
+    marker = " *"
+    idx = stripped.rfind(marker)
+    if idx >= 0 and stripped.endswith("*"):
+        return f"{stripped[:idx]} *{stripped[idx + len(marker) : -1]}, {links_text}*"
+    return f"{comment} *{links_text}*"
 
 
 # Main
@@ -2649,6 +2730,7 @@ def _run_report(  # noqa: PLR0913
     findings,
     outdir=None,
     nixprs_enabled=False,
+    nixtracker_enabled=False,
     baseline_findings=None,
     update_baseline_findings=None,
     token=None,
@@ -2657,9 +2739,10 @@ def _run_report(  # noqa: PLR0913
     reporter = FlakeScanner.from_findings(findings)
     reporter.baseline = _load_baseline_reporter(baseline_findings)
     comparison_notes = getattr(reporter, "_comparison_notes", lambda: [])()
-    # PR enrichment runs only here, in the trusted phase, once on the current
-    # findings set, with the token taken from the environment, and is non-fatal.
+    # Network enrichment runs only here, in the trusted phase, once on the
+    # current findings set, and is non-fatal.
     notes = []
+    actionable = None
     if nixprs_enabled:
         token = os.environ.get("GH_TOKEN", "") if token is None else token
         actionable = reporter.compute_actionable()
@@ -2673,6 +2756,19 @@ def _run_report(  # noqa: PLR0913
                 if ok
                 else "nixpkgs PR link lookup: partial; some actionable findings "
                 "could not be enriched with candidate PR links"
+            )
+        )
+    if nixtracker_enabled:
+        if actionable is None:
+            actionable = reporter.compute_actionable()
+        ok = nixtracker.enrich_actionable(actionable)
+        reporter.apply_nixtracker(actionable)
+        notes.append(
+            (
+                "Nixpkgs security tracker lookup: complete for CVE findings"
+                if ok
+                else "Nixpkgs security tracker lookup: partial; some CVE "
+                "findings could not be enriched with tracker links"
             )
         )
     notes.extend(
@@ -2697,7 +2793,8 @@ def _cmd_report(args):
     _run_report(
         findings=args.findings,
         outdir=args.outdir,
-        nixprs_enabled=args.nixprs,
+        nixprs_enabled=getattr(args, "nixprs", False),
+        nixtracker_enabled=getattr(args, "nixtracker", False),
         baseline_findings=getattr(args, "baseline_findings", None),
         update_baseline_findings=getattr(args, "update_baseline_findings", None),
         token=os.environ.get("GH_TOKEN", ""),
@@ -2768,6 +2865,7 @@ def _cmd_local(args):
             findings=findings,
             outdir=report_dir,
             nixprs_enabled=args.nixprs,
+            nixtracker_enabled=getattr(args, "nixtracker", False),
             baseline_findings=baseline_findings,
             update_baseline_findings=None,
             token=os.environ.get("GH_TOKEN", ""),
