@@ -28,3 +28,4 @@ jobs:
             packages.x86_64-linux.flakevuln
           unstable-ref: github:NixOS/nixpkgs/nixos-unstable
           nixprs: true
+          nixtracker: true
