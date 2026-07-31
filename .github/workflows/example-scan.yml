@@ -27,5 +27,6 @@ jobs:
           targets: |
             packages.x86_64-linux.flakevuln
           unstable-ref: github:NixOS/nixpkgs/nixos-unstable
+          whitelist: .github/flakevuln/manual_analysis.csv
           nixprs: true
           nixtracker: true

@@ -77,7 +77,7 @@ jobs:
             packages.x86_64-linux.default
             devShells.x86_64-linux.default
           unstable-ref: github:NixOS/nixpkgs/nixos-unstable
-          whitelist: path/to/manual_analysis.csv
+          whitelist: .github/flakevuln/manual_analysis.csv
           nixprs: true
           nixtracker: true
           cachix-caches: nix-community my-org
@@ -221,7 +221,7 @@ Use a suppressions CSV:
 
 ```bash
 nix run .#flakevuln -- local \
-  --whitelist examples/manual_analysis.csv \
+  --whitelist .github/flakevuln/manual_analysis.csv \
   packages.x86_64-linux.default
 ```
 
@@ -270,8 +270,9 @@ nix run .#flakevuln -- report \
 ### Whitelist format
 
 The `whitelist` action input and the `--whitelist` CLI flag both point to a CSV
-that you keep in your own repository. Start from
-[`examples/manual_analysis.csv`](examples/manual_analysis.csv).
+that you keep in your own repository. This repository's dogfood scan keeps its
+triage in
+[`.github/flakevuln/manual_analysis.csv`](.github/flakevuln/manual_analysis.csv).
 
 Prefer explicit `True` and `False` values in the `whitelist` column:
 
