@@ -25,7 +25,7 @@ import pandas as pd
 from colorlog import ColoredFormatter, default_log_colors
 from tabulate import tabulate
 
-from flakevuln import nixprs, nixtracker
+from flakevuln import evidence, nixprs, nixtracker
 from flakevuln.version import get_py_pkg_version
 
 LOG_SPAM = logging.DEBUG - 1
@@ -49,7 +49,25 @@ EMPTY_SCAN_COLUMNS = [
     "nixpkgs_pr",
     "nixpkgs_issue",
     "nixpkgs_issue_status",
+    # vulnxscan patch-evidence aggregates. An empty scan frame carries them
+    # too, so a clean scan with no triage rows is not mistaken for triage
+    # output that is missing its evidence columns.
+    "finding_id",
+    "evidence_scope",
+    "patch_state",
+    *evidence.COUNT_FIELDS,
 ]
+TRIAGE_EVIDENCE_COLUMNS = (
+    "vuln_id",
+    "package",
+    "version_local",
+    "severity",
+    "url",
+    "sortcol",
+    "evidence_scope",
+    "patch_state",
+    *evidence.COUNT_FIELDS,
+)
 
 # Lock states recorded in findings output.
 PIN_CURRENT = "current"  # the flake's committed flake.lock
@@ -841,6 +859,9 @@ class FlakeScanner:
         excluded_paths=(),
     ):
         self.df_scan = _empty_scan_df()
+        self.evidence_findings = []
+        self.component_evidence = []
+        self.evidence_included = True
         self.flakeref = flakeref
         self.input_name = input_name
         self.unstable_ref = unstable_ref
@@ -1506,12 +1527,13 @@ class FlakeScanner:
         # is why flakevuln does not use `vulnxscan --nixprs` here: keeping the
         # lookup out of the untrusted scan/eval path avoids mixing GitHub-token
         # use into the phase that evaluates the scanned flake.
-        out = self.tmpdir / "vulnxscan.csv"
+        # Output paths are scan-state specific and are appended by
+        # `_read_scan_results`, so one target's three scans cannot read each
+        # other's leftovers.
         cmd_vulnxscan = [
             "vulnxscan",
             f"--verbose={self.verbosity}",
             "--triage",
-            f"--out={out}",
         ]
         if buildtime:
             cmd_vulnxscan.append("--buildtime")
@@ -2134,36 +2156,135 @@ class FlakeScanner:
         if diffstr:
             LOG.info("Updated lockfile:\n%s", diffstr)
 
+    def _scan_output_paths(self, target, pintype):
+        """Return fresh, scan-state specific vulnxscan output paths."""
+        stem = hashlib.sha256(f"{target}\0{pintype}".encode("utf-8")).hexdigest()[:16]
+        out = self.tmpdir / f"vulnxscan.{stem}.csv"
+        paths = (
+            out,
+            out.with_name(f"{out.stem}.triage{out.suffix}"),
+            out.with_name(f"{out.stem}.evidence.json"),
+        )
+        for path in paths:
+            path.unlink(missing_ok=True)
+        return paths
+
+    def _record_scan_error(self, target, pintype, message, details=""):
+        """Record a scan failure for `(target, pintype)` and log it."""
+        LOG.warning("%s", message)
+        self.errors[self._error_key(self.scope_flakeref, target, pintype)] = {
+            "message": message,
+            "details": _tail_text(details),
+        }
+
     def _read_scan_results(self, cmd, target, pintype, override=None):
-        out_triage = self.tmpdir / "vulnxscan.triage.csv"
-        out_triage.unlink(missing_ok=True)
         drv_path = self._evaluate_target_drv(target, pintype, override=override)
         if drv_path is None:
             return
-        cmd = [*cmd, str(drv_path)]
+        out, out_triage, out_evidence = self._scan_output_paths(target, pintype)
+        cmd = [
+            *cmd,
+            f"--out={out}",
+            f"--evidence-out={out_evidence}",
+            str(drv_path),
+        ]
         # Run vulnxscan in the disposable tmpdir: at higher verbosity it writes
         # df_vulnix.csv/df_grype.csv/df_osv.csv/df_report_raw.csv/meta.csv
         # relative to cwd, and we never want those in the user's worktree.
-        ret = exec_cmd(cmd, cwd=self.tmpdir)
+        ret = exec_cmd(cmd, raise_on_error=False, capture=True, cwd=self.tmpdir)
         LOG.debug("vulnxscan ==>\n\n%s\n\n<== vulnxscan\n", ret.stderr)
-        if not out_triage.exists():
-            LOG.info(
-                "vulnxscan triage output not found for '%s' (%s); "
-                "treating as zero vulnerabilities",
+        if ret.returncode != 0:
+            self._record_scan_error(
                 target,
                 pintype,
+                f"Error scanning '{target}' on {pintype}",
+                ret.stderr or ret.stdout,
             )
             return
-        df = df_from_csv_file(out_triage, exit_on_error=False)
-        if df is None:
-            LOG.warning("Invalid vulnxscan output '%s'", out_triage)
+        try:
+            findings, components = evidence.load_sidecar(out_evidence)
+        except evidence.EvidenceError as error:
+            # A missing or unreadable evidence report must never be mistaken
+            # for a scan that found nothing.
+            self._record_scan_error(
+                target,
+                pintype,
+                f"Invalid vulnxscan evidence for '{target}' on {pintype}",
+                str(error),
+            )
             return
-        # Add the following columns to the beginning of df
-        df.insert(0, "pintype", pintype)
-        df.insert(0, "scope_flakeref", self.scope_flakeref)
-        df.insert(0, "flakeref", self.flakeref)
-        df.insert(0, "target", target)
-        self.df_scan = pd.concat([self.df_scan, df], ignore_index=True)
+        df = self._read_triage_rows(target, pintype, out_triage, findings)
+        if df is None:
+            return
+        if not df.empty:
+            # Add the following columns to the beginning of df
+            df.insert(0, "pintype", pintype)
+            df.insert(0, "scope_flakeref", self.scope_flakeref)
+            df.insert(0, "flakeref", self.flakeref)
+            df.insert(0, "target", target)
+            self.df_scan = pd.concat([self.df_scan, df], ignore_index=True)
+        annotation = {
+            "flakeref": self.flakeref,
+            "scope_flakeref": self.scope_flakeref,
+            "target": target,
+            "pintype": pintype,
+        }
+        self.evidence_findings.extend(evidence.annotate(findings, **annotation))
+        self.component_evidence.extend(evidence.annotate(components, **annotation))
+
+    def _read_triage_rows(self, target, pintype, out_triage, findings):
+        """Return the triage rows that match the accepted evidence findings.
+
+        Returns None -- after recording a scan failure -- whenever the triage
+        output disagrees with the evidence report. Repology can emit several
+        triage rows for one finding, so the two are compared as ID *sets*.
+        """
+        active_ids = evidence.active_finding_ids(findings)
+        df = None
+        if out_triage.exists():
+            df = df_from_csv_file(out_triage, exit_on_error=False)
+            if df is None:
+                self._record_scan_error(
+                    target,
+                    pintype,
+                    f"Invalid vulnxscan output '{out_triage}'",
+                )
+                return None
+        if df is None or df.empty:
+            triage_ids = set()
+            df = _empty_scan_df()
+        elif "finding_id" not in df.columns:
+            self._record_scan_error(
+                target,
+                pintype,
+                f"vulnxscan triage output for '{target}' on {pintype} "
+                "is missing the finding_id column",
+            )
+            return None
+        else:
+            triage_ids = set(df["finding_id"].astype(str))
+        if triage_ids != active_ids:
+            self._record_scan_error(
+                target,
+                pintype,
+                f"vulnxscan triage output for '{target}' on {pintype} "
+                "does not match its evidence report",
+                f"{len(triage_ids - active_ids)} triage finding(s) without "
+                f"evidence, {len(active_ids - triage_ids)} active evidence "
+                "finding(s) without triage rows",
+            )
+            return None
+        mismatch = _triage_evidence_mismatch(df, findings)
+        if mismatch:
+            self._record_scan_error(
+                target,
+                pintype,
+                f"vulnxscan triage output for '{target}' on {pintype} "
+                "does not match its evidence report",
+                mismatch,
+            )
+            return None
+        return df
 
 
 # Helpers
@@ -2515,6 +2636,44 @@ def _wants_submodules(flakeref):
     """
     _base, _sep, query = str(flakeref).partition("?")
     return any(part == "submodules=1" for part in query.split("&"))
+
+
+def _triage_evidence_mismatch(df, findings):
+    """Return why triage rows disagree with evidence, or empty on success."""
+    missing = [column for column in TRIAGE_EVIDENCE_COLUMNS if column not in df.columns]
+    if missing:
+        return f"missing evidence column(s): {', '.join(missing)}"
+
+    expected = {}
+    for finding in findings:
+        if finding.get(evidence.SUPPRESSED, False):
+            continue
+        expected[str(finding[evidence.FINDING_ID])] = {
+            "vuln_id": finding["vuln_id"],
+            "package": finding["package"],
+            "version_local": finding["version"],
+            "severity": finding["severity"],
+            "url": finding["url"],
+            "sortcol": finding["sortcol"],
+            "evidence_scope": finding[evidence.EVIDENCE_SCOPE],
+            "patch_state": finding[evidence.PATCH_STATE],
+            **{field: finding[field] for field in evidence.COUNT_FIELDS},
+        }
+
+    for row in df.to_dict(orient="records"):
+        finding_id = str(row.get(evidence.FINDING_ID, ""))
+        expected_row = expected.get(finding_id)
+        if expected_row is None:
+            continue
+        for column, expected_value in expected_row.items():
+            actual = str(row.get(column, ""))
+            expected_text = str(expected_value)
+            if actual != expected_text:
+                return (
+                    f"finding_id '{finding_id}' has {column}={actual!r}, "
+                    f"evidence has {expected_text!r}"
+                )
+    return ""
 
 
 def _render_section(text, name, keep):

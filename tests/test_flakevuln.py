@@ -2715,6 +2715,8 @@ def test_read_scan_results_runs_vulnxscan_in_tmpdir(monkeypatch, tmp_path):
         captured["cwd"] = kwargs.get("cwd")
 
         class _Ret:
+            returncode = 0
+            stdout = ""
             stderr = ""
 
         return _Ret()
