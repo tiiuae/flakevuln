@@ -10,7 +10,8 @@ failure instead of mistaking it for a clean scan.
 
 import hashlib
 import json
-from pathlib import Path
+import re
+from pathlib import Path, PurePath
 
 # Flakevuln findings schema. Version 1 has no `schema_version` key at all and
 # carries no evidence; version 2 adds the two evidence arrays.
@@ -282,12 +283,14 @@ def validate_evidence(findings, components, *, annotated):
     its originating flakeref/target/pintype.
     """
     by_key = {}
+    vuln_ids = {}
     for finding in findings:
         _validate_finding(finding, annotated=annotated)
         key = (*_row_key(finding, annotated), str(finding[FINDING_ID]))
         if key in by_key:
             raise EvidenceError(f"duplicate evidence finding '{key[-1]}'")
         by_key[key] = []
+        vuln_ids[key] = str(finding["vuln_id"])
     for component in components:
         _validate_component(component, annotated=annotated)
         key = (*_row_key(component, annotated), str(component[FINDING_ID]))
@@ -295,6 +298,7 @@ def validate_evidence(findings, components, *, annotated):
             raise EvidenceError(
                 f"component evidence references unknown finding '{key[-1]}'"
             )
+        _validate_component_patch_evidence(component, vuln_ids[key])
         by_key[key].append(component)
     _validate_component_uniqueness(components, annotated=annotated)
     for finding in findings:
@@ -374,6 +378,59 @@ def _validate_component(component, *, annotated):
         raise EvidenceError(
             f"component '{component['component_id']}' reports a matching patch "
             "that is not among its patches"
+        )
+
+
+def matching_patch_paths(patch_paths, vuln_id):
+    """Return the patch paths whose file name names `vuln_id`.
+
+    A deliberate reimplementation of the vulnxscan rule rather than a shared
+    import: this validates untrusted scan output, so it has to be able to
+    disagree with the producer. Only the file name counts, because a
+    vulnerability ID in a parent directory says nothing about what a patch
+    changes.
+    """
+    token = re.compile(
+        rf"(?<![A-Za-z0-9]){re.escape(str(vuln_id))}(?![A-Za-z0-9])",
+        re.IGNORECASE,
+    )
+    return [path for path in patch_paths if token.search(PurePath(path).name)]
+
+
+def _validate_component_patch_evidence(component, vuln_id):
+    """Require a component's claimed state to agree with its own patch paths.
+
+    Every suppression rests on `patch_evidence_state`. Checking only that the
+    suppression flag agrees with that string would let the scan phase claim a
+    match while carrying no patch that names the vulnerability, and the finding
+    built on it would vanish from the report.
+    """
+    state = component[PATCH_EVIDENCE_STATE]
+    matching = component["matching_patch_paths"]
+    expected = matching_patch_paths(component["patches"], vuln_id)
+    if state == COMPONENT_STATE_MATCH:
+        if not matching or matching != expected:
+            raise EvidenceError(
+                f"component '{component['component_id']}' claims a patch match "
+                f"that its own patch paths do not support for '{vuln_id}'"
+            )
+        return
+    if matching:
+        raise EvidenceError(
+            f"component '{component['component_id']}' reports a matching patch "
+            f"while claiming state '{state}'"
+        )
+    if state == COMPONENT_STATE_NO_MATCH and expected:
+        raise EvidenceError(
+            f"component '{component['component_id']}' claims no patch match but "
+            f"carries a patch naming '{vuln_id}'"
+        )
+    # COMPONENT_STATE_METADATA_UNAVAILABLE asserts nothing further: the reason
+    # the metadata was unusable is not serialized, and the patch list may be
+    # populated even when other metadata was not readable.
+    if state == COMPONENT_STATE_PACKAGE_VERSION_ONLY and component["patches"]:
+        raise EvidenceError(
+            f"unresolved component of finding '{component[FINDING_ID]}' reports patches"
         )
 
 

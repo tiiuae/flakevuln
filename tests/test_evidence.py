@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Tests for vulnxscan component-evidence validation, scans, and storage."""
+"""Tests for vulnxscan component-evidence ingestion, storage, and rendering."""
 
 import json
 
+import pandas as pd
 import pytest
 import testutils as tu
 
@@ -16,7 +17,10 @@ from flakevuln.main import (
 )
 
 TARGET = "packages.x86_64-linux.default"
-COMPONENT_EVIDENCE_HEADING = "Component Evidence"
+# The full collapsed summary, not the bare section name: the active-section
+# note points readers at "Component Evidence" by name, so splitting a report on
+# the short string would cut it at the pointer instead of at the section.
+COMPONENT_EVIDENCE_HEADING = "Patched and Partially Patched Findings (press to expand)"
 
 
 def _run_scan(monkeypatch, tmp_path, *, pintype=PIN_CURRENT, scanner=None, **fake):
@@ -222,6 +226,40 @@ def test_suppressed_finding_without_matching_components_is_rejected():
     component["patch_evidence_state"] = evidence.COMPONENT_STATE_NO_MATCH
     component[evidence.SUPPRESSED] = False
     with pytest.raises(evidence.EvidenceError):
+        evidence.validate_document(tu.evidence_document([finding], [component]))
+
+
+@pytest.mark.parametrize(
+    ("label", "patches", "matching"),
+    [
+        ("no patches at all", [], []),
+        (
+            "the vulnerability ID only in a parent directory",
+            ["/nix/store/ddd-CVE-2026-1/unrelated.patch"],
+            ["/nix/store/ddd-CVE-2026-1/unrelated.patch"],
+        ),
+    ],
+)
+def test_patch_match_claim_must_be_backed_by_the_patch_paths(label, patches, matching):
+    """A suppression must rest on a patch, not just on the state string.
+
+    The scan phase is untrusted, so `patch_evidence_state` is recomputed from
+    the serialized paths. Otherwise a document could hide a finding while
+    carrying no patch that names it.
+    """
+    finding, component = tu.matched_finding()
+    component["patches"] = patches
+    component["matching_patch_paths"] = matching
+    with pytest.raises(evidence.EvidenceError, match="patch"):
+        evidence.validate_document(tu.evidence_document([finding], [component]))
+
+
+def test_ignoring_a_patch_that_names_the_vulnerability_is_rejected():
+    """The reverse direction is a contradiction too."""
+    finding = tu.evidence_finding()
+    component = tu.evidence_component(finding)
+    component["patches"] = [f"/nix/store/ddd-{finding['vuln_id']}.patch"]
+    with pytest.raises(evidence.EvidenceError, match="claims no patch match"):
         evidence.validate_document(tu.evidence_document([finding], [component]))
 
 
@@ -1077,3 +1115,553 @@ def test_compact_baseline_omits_evidence_but_keeps_scan_rows(monkeypatch, tmp_pa
     reloaded = flakevuln_main._load_baseline_reporter(baseline)
     assert reloaded is not None
     assert reloaded.evidence_findings == []
+
+
+# --- rendering -------------------------------------------------------------
+
+
+def _render(scanner, tmp_path):
+    outdir = tmp_path / "report"
+    scanner.report(outdir)
+    return (outdir / f"{TARGET}.md").read_text(encoding="utf-8")
+
+
+def test_mixed_evidence_lists_both_derivations_in_the_diagnostics(
+    monkeypatch, tmp_path
+):
+    """A finding whose derivations disagree is the case worth reading."""
+    finding, components = tu.mixed_finding()
+    scanner = _scanner_with(
+        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+    )
+    report = _render(scanner, tmp_path)
+    diagnostics = report.split(COMPONENT_EVIDENCE_HEADING)[1]
+
+    assert "aaa-pkg-1.0.drv" in diagnostics
+    assert "ddd-pkg-1.0.drv" in diagnostics
+    assert "patch names this vulnerability" in diagnostics
+    assert "no patch names this vulnerability" in diagnostics
+
+
+def test_active_tables_carry_no_per_finding_evidence_column(monkeypatch, tmp_path):
+    """Evidence is exception reporting, not a column on every row.
+
+    On a real closure over 96% of findings are plain `no_component_match`, so
+    a per-row column repeats one uninformative phrase down the whole table.
+    """
+    finding, components = tu.mixed_finding()
+    scanner = _scanner_with(
+        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+    )
+    report = _render(scanner, tmp_path)
+    current_section = report.split(COMPONENT_EVIDENCE_HEADING)[0]
+
+    assert "patch_evidence" not in current_section
+    assert "Mixed patch evidence" not in current_section
+    assert finding["vuln_id"] in current_section
+
+
+def test_suppressed_findings_appear_only_in_component_diagnostics(
+    monkeypatch, tmp_path
+):
+    finding, component = tu.matched_finding()
+    active = tu.evidence_finding("CVE-2026-2")
+    active_component = tu.evidence_component(active)
+    scanner = _scanner_with(
+        monkeypatch,
+        tmp_path,
+        [finding, active],
+        [component, active_component],
+        [tu.triage_row(active)],
+    )
+    report = _render(scanner, tmp_path)
+    current_section = report.split(COMPONENT_EVIDENCE_HEADING)[0]
+
+    assert finding["vuln_id"] not in current_section
+    assert finding["vuln_id"] in report
+    assert "hidden as patched" in report
+    assert active["vuln_id"] in current_section
+
+
+def test_bulk_no_match_findings_are_excluded_from_the_diagnostics(
+    monkeypatch, tmp_path
+):
+    """Only findings the active tables cannot explain reach the section.
+
+    A real closure produces hundreds of plain `no_component_match` findings,
+    each already listed in full above. Repeating a row per derivation here
+    buries the suppressed and ambiguous ones, which appear nowhere else.
+    """
+    findings = []
+    components = []
+    triage_rows = []
+    for index in range(30):
+        finding = tu.evidence_finding(f"CVE-2026-1{index:03d}")
+        findings.append(finding)
+        components.append(tu.evidence_component(finding))
+        triage_rows.append(tu.triage_row(finding))
+    suppressed, suppressed_component = tu.matched_finding("CVE-2026-9999")
+    findings.append(suppressed)
+    components.append(suppressed_component)
+    mixed, mixed_components = tu.mixed_finding("CVE-2026-5555")
+    findings.append(mixed)
+    components.extend(mixed_components)
+    triage_rows.append(tu.triage_row(mixed))
+
+    scanner = _scanner_with(monkeypatch, tmp_path, findings, components, triage_rows)
+    report = _render(scanner, tmp_path)
+    diagnostics = report.split(COMPONENT_EVIDENCE_HEADING)[1]
+
+    assert mixed["vuln_id"] in diagnostics
+    assert suppressed["vuln_id"] in diagnostics
+    for finding in findings[:30]:
+        assert finding["vuln_id"] not in diagnostics
+    # Ambiguous evidence outranks a suppression: it still needs a human.
+    assert diagnostics.index(mixed["vuln_id"]) < diagnostics.index(
+        suppressed["vuln_id"]
+    )
+    assert "not shown" not in diagnostics
+
+
+def test_suppressed_findings_are_accounted_for_in_the_active_section(
+    monkeypatch, tmp_path
+):
+    """A suppressed finding leaves no gap: the count says where it went.
+
+    The findings file is a CI artifact and expires; the report does not. So
+    the fact that rows were suppressed has to survive in the report itself.
+    """
+    suppressed, suppressed_component = tu.matched_finding("CVE-2026-9999")
+    active = tu.evidence_finding("CVE-2026-2")
+    scanner = _scanner_with(
+        monkeypatch,
+        tmp_path,
+        [suppressed, active],
+        [suppressed_component, tu.evidence_component(active)],
+        [tu.triage_row(active)],
+    )
+    report = _render(scanner, tmp_path)
+    current_section = report.split(COMPONENT_EVIDENCE_HEADING)[0]
+
+    assert "A further 1 finding is omitted here" in current_section
+    assert "[Patched and Partially Patched Findings](#" in current_section
+    assert suppressed["vuln_id"] not in current_section
+    assert suppressed["vuln_id"] in report.split(COMPONENT_EVIDENCE_HEADING)[1]
+
+
+def test_diagnostics_use_plain_language_not_schema_enums(monkeypatch, tmp_path):
+    """A reader should never have to decode `no_vuln_id_patch_name_match`."""
+    finding, components = tu.mixed_finding()
+    scanner = _scanner_with(
+        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+    )
+    report = _render(scanner, tmp_path)
+
+    for raw in (
+        evidence.COMPONENT_STATE_MATCH,
+        evidence.COMPONENT_STATE_NO_MATCH,
+        "patch-suppressed",
+    ):
+        assert raw not in report
+        assert raw.replace("_", r"\_") not in report
+    assert "no patch names this vulnerability" in report
+    assert "still listed" in report
+
+
+def test_diagnostics_link_the_vulnerability_and_omit_output_paths(
+    monkeypatch, tmp_path
+):
+    """Match the other tables: linked IDs, and no store paths nobody reads."""
+    finding, components = tu.mixed_finding()
+    components[0]["output_paths"] = ["/nix/store/eee-pkg-1.0-out"]
+    scanner = _scanner_with(
+        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+    )
+    report = _render(scanner, tmp_path)
+    diagnostics = report.split(COMPONENT_EVIDENCE_HEADING)[1]
+
+    assert f"[{finding['vuln_id']}]({finding['url']})" in diagnostics
+    assert "output_paths" not in diagnostics
+    assert "/nix/store/eee-pkg-1.0-out" not in diagnostics
+    # The derivation and its matching patch are still there.
+    assert "aaa-pkg-1.0.drv" in diagnostics
+    assert "ccc-CVE-2026-1.patch" in diagnostics
+
+
+def test_partially_patched_findings_are_marked_and_linked(monkeypatch, tmp_path):
+    """The active tables point at the evidence for the ambiguous findings."""
+    finding, components = tu.mixed_finding()
+    scanner = _scanner_with(
+        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+    )
+    report = _render(scanner, tmp_path)
+    current_section, diagnostics = report.split(COMPONENT_EVIDENCE_HEADING)
+    anchor = scanner._evidence_anchor(scanner.flakeref, TARGET)
+
+    assert f"[(*)](#{anchor})" in current_section
+    assert f'<a id="{anchor}"></a>' in report
+    assert "A (*) marks the 1 finding" in current_section
+
+
+def test_evidence_links_survive_githubs_id_rewrite(monkeypatch, tmp_path):
+    """Every link target must be spelled the way GitHub stores the id.
+
+    GitHub's markdown sanitizer rewrites `id` to `user-content-<id>` and leaves
+    `href="#..."` alone, so an unprefixed anchor renders a link that resolves to
+    nothing. Prefixing is idempotent there, so emitting it on both sides is what
+    keeps the id and the links that name it in agreement.
+    """
+    finding, components = tu.mixed_finding()
+    scanner = _scanner_with(
+        monkeypatch,
+        tmp_path,
+        [finding],
+        components,
+        [tu.triage_row(finding, whitelist="True")],
+    )
+    report = _render(scanner, tmp_path)
+    anchor = scanner._evidence_anchor(scanner.flakeref, TARGET)
+
+    assert anchor.startswith("user-content-")
+    # Nothing may point at the bare id, since those are the links that break.
+    assert f"](#{anchor[len('user-content-') :]})" not in report
+    assert f'<a id="{anchor}"></a>' in report
+    assert f"](#{anchor})" in report
+
+
+def test_the_marker_is_separated_from_an_existing_comment(monkeypatch, tmp_path):
+    """A marker appended to a comment must not read as part of it.
+
+    The cell is a comma-separated list of fragments (whitelist text, PR and
+    tracker links), so a bare space made the marker look like it belonged to
+    the last one rather than standing alongside it.
+    """
+    finding, components = tu.mixed_finding()
+    scanner = _scanner_with(
+        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+    )
+    marks = scanner._evidence_marks(scanner.flakeref, TARGET)
+    row = {
+        **tu.triage_row(finding, whitelist_comment="fixed downstream"),
+        "pintype": PIN_CURRENT,
+    }
+
+    table = scanner._df_to_report_tbl(pd.DataFrame([row]), marks=marks)
+
+    assert f"fixed downstream, [(*)](#{marks[0]})" in table
+
+
+@pytest.mark.parametrize("comment", ["not exploitable.", "see below:", "why?"])
+def test_the_marker_does_not_double_existing_punctuation(
+    monkeypatch, tmp_path, comment
+):
+    """A comment that already ends in punctuation gets no comma of its own.
+
+    Whitelist comments are free text, and `text., (*)` reads as a typo rather
+    than as a list. The cell escaper leaves terminal punctuation alone, so what
+    is tested is what a reader sees.
+    """
+    finding, components = tu.mixed_finding()
+    scanner = _scanner_with(
+        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+    )
+    marks = scanner._evidence_marks(scanner.flakeref, TARGET)
+    row = {
+        **tu.triage_row(finding, whitelist_comment=comment),
+        "pintype": PIN_CURRENT,
+    }
+
+    table = scanner._df_to_report_tbl(pd.DataFrame([row]), marks=marks)
+
+    assert f"[(*)](#{marks[0]})" in table
+    assert ", [(*)]" not in table
+
+
+def test_rows_from_another_run_are_not_marked(monkeypatch, tmp_path):
+    """Markers follow this run's evidence, not a row's pintype.
+
+    Previous-baseline rows carry `pintype == current` too, so keying on it
+    marked findings that this run never saw with a link to a section that
+    cannot explain them.
+    """
+    finding, components = tu.mixed_finding()
+    scanner = _scanner_with(
+        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+    )
+    marks = scanner._evidence_marks(scanner.flakeref, TARGET)
+    stale = pd.DataFrame(
+        [
+            {
+                **tu.triage_row(tu.evidence_finding("CVE-2026-404")),
+                "pintype": PIN_CURRENT,
+                "patch_state": evidence.PATCH_STATE_MIXED,
+                "finding_id": "sha256:not-from-this-run",
+            }
+        ]
+    )
+
+    table = scanner._df_to_report_tbl(stale, marks=marks)
+
+    assert "CVE-2026-404" in table
+    assert "(*)" not in table
+
+
+def test_one_finding_is_marked_alike_in_every_pin_state(monkeypatch, tmp_path):
+    """The whitelist table spans pins, so copies must not disagree.
+
+    A marker on only the current-pin copy left the same finding rendered both
+    marked and unmarked, and the two near-identical rows survived
+    deduplication.
+    """
+    finding, components = tu.mixed_finding()
+    scanner = tu.make_scanner(tmp_path)
+    scanner.evidence_included = True
+    scanner.scanned_targets = [(scanner.flakeref, TARGET)]
+    for pintype in (PIN_CURRENT, PIN_LOCK_UPDATED):
+        _run_scan(
+            monkeypatch,
+            tmp_path,
+            scanner=scanner,
+            pintype=pintype,
+            document=tu.evidence_document([finding], components),
+            triage_rows=[tu.triage_row(finding, whitelist="True")],
+        )
+    report = _render(scanner, tmp_path)
+    whitelisted = report.split("<summary>Whitelisted")[1].split("</details>")[0]
+    rows = [line for line in whitelisted.splitlines() if finding["vuln_id"] in line]
+
+    assert rows, "the finding should appear in the whitelisted table"
+    assert all("(*)" in row for row in rows)
+
+
+def test_marker_count_covers_whitelisted_findings_too(monkeypatch, tmp_path):
+    """The count is report-wide, so it must include the whitelisted tables.
+
+    A marked finding that is whitelisted leaves the active table but keeps its
+    marker in the whitelisted one, so a count scoped to the active table would
+    contradict the markers a reader sees further down the same page.
+    """
+    listed, listed_components = tu.mixed_finding("CVE-2026-1")
+    hidden, hidden_components = tu.mixed_finding("CVE-2026-2")
+    scanner = _scanner_with(
+        monkeypatch,
+        tmp_path,
+        [listed, hidden],
+        [*listed_components, *hidden_components],
+        [tu.triage_row(listed), tu.triage_row(hidden, whitelist="True")],
+    )
+    report = _render(scanner, tmp_path)
+    current_section = report.split(COMPONENT_EVIDENCE_HEADING)[0]
+
+    assert "A (*) marks the 2 findings in this report" in current_section
+    blocks = {
+        block.split("</summary>")[0]: block
+        for block in current_section.split("<summary>")[1:]
+    }
+    active = next(v for k, v in blocks.items() if k.startswith("Currently Active"))
+    whitelisted = next(v for k, v in blocks.items() if k.startswith("Whitelisted"))
+    assert "[(*)](#" in active
+    assert "[(*)](#" in whitelisted
+
+
+def test_no_marker_when_every_finding_is_a_plain_no_match(monkeypatch, tmp_path):
+    finding = tu.evidence_finding()
+    scanner = _scanner_with(
+        monkeypatch,
+        tmp_path,
+        [finding],
+        [tu.evidence_component(finding)],
+        [tu.triage_row(finding)],
+    )
+    report = _render(scanner, tmp_path)
+
+    assert "(*)" not in report
+
+
+def test_no_suppression_note_when_nothing_was_suppressed(monkeypatch, tmp_path):
+    finding, components = tu.mixed_finding()
+    scanner = _scanner_with(
+        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+    )
+    report = _render(scanner, tmp_path)
+
+    assert "is omitted here" not in report.split(COMPONENT_EVIDENCE_HEADING)[0]
+
+
+def test_package_version_only_findings_stay_active_and_are_flagged(
+    monkeypatch, tmp_path
+):
+    """Unresolvable component identity is ambiguous, so it stays visible."""
+    finding, component = tu.package_version_only_finding()
+    scanner = _scanner_with(
+        monkeypatch, tmp_path, [finding], [component], [tu.triage_row(finding)]
+    )
+    report = _render(scanner, tmp_path)
+    current_section, diagnostics = report.split(COMPONENT_EVIDENCE_HEADING)
+
+    assert finding["vuln_id"] in current_section
+    assert finding["vuln_id"] in diagnostics
+    assert "derivation not identified" in diagnostics
+    # The marker covers every ambiguous state, not just a partial patch, so
+    # its explanation must not claim some derivations were patched.
+    anchor = scanner._evidence_anchor(scanner.flakeref, TARGET)
+    assert f"[(*)](#{anchor})" in current_section
+    assert "only some" not in current_section
+    assert "patch evidence needs review" in current_section
+
+
+def test_a_no_match_only_scan_renders_an_empty_diagnostics_section(
+    monkeypatch, tmp_path
+):
+    """Nothing to explain means nothing to read, not a wall of default rows."""
+    finding = tu.evidence_finding()
+    component = tu.evidence_component(finding)
+    scanner = _scanner_with(
+        monkeypatch, tmp_path, [finding], [component], [tu.triage_row(finding)]
+    )
+    report = _render(scanner, tmp_path)
+    current_section, diagnostics = report.split(COMPONENT_EVIDENCE_HEADING)
+
+    assert finding["vuln_id"] in current_section
+    assert "```No reportable component evidence```" in diagnostics
+    assert component["component_id"] not in diagnostics
+
+
+def test_component_evidence_renders_untrusted_paths_inert(monkeypatch, tmp_path):
+    """Store and patch paths come from the untrusted scan phase."""
+    finding, components = tu.mixed_finding()
+    hostile = "<img src=x onerror=alert(1)>|[click](javascript:alert(1))\r\n`x`"
+    # The patch path still has to name the vulnerability, or validation
+    # rejects the match claim before anything is rendered.
+    hostile_patch = f"/nix/store/{hostile}-{finding['vuln_id']}.patch"
+    components[0]["drv_path"] = hostile
+    components[0]["output_paths"] = [hostile]
+    components[0]["patches"] = [hostile_patch]
+    components[0]["matching_patch_paths"] = [hostile_patch]
+    scanner = _scanner_with(
+        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+    )
+    report = _render(scanner, tmp_path)
+
+    assert "<img" not in report
+    assert "&lt;img" in report
+    assert "[click](javascript:" not in report
+    assert "\r" not in report
+    assert r"onerror=alert\(1\)&gt;\|\[click\]" in report
+
+
+def test_evidence_paths_render_as_code_spans(monkeypatch, tmp_path):
+    """Paths must be code spans, or GitHub links the CVE ids inside them.
+
+    GitHub autolinks any CVE id that has an advisory database entry, even in
+    the middle of a store path, so a patch file name rendered as plain text
+    picks up a link for some findings and not others. That reads as a claim
+    about the finding rather than about GitHub's advisory coverage.
+    """
+    finding, components = tu.mixed_finding()
+    patch = f"/nix/store/ccc-{finding['vuln_id']}_2.patch"
+    components[0]["patches"] = [patch]
+    components[0]["matching_patch_paths"] = [patch]
+    scanner = _scanner_with(
+        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+    )
+
+    report = _render(scanner, tmp_path)
+
+    assert f"`{patch}`" in report
+    assert f"`{components[0]['drv_path']}`" in report
+    # An underscore is legal in a store path, so escaping it here would show
+    # the backslash: inside a span it is literal rather than consumed.
+    assert "\\_" not in report
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("/nix/store/a-b_1.patch", "`/nix/store/a-b_1.patch`"),
+        ("has `tick` inside", "``has `tick` inside``"),
+        ("`edge`", "`` `edge` ``"),
+        ("a|b", "`a\\|b`"),
+        ("", ""),
+    ],
+)
+def test_code_span_rendering_survives_its_own_content(raw, expected):
+    """A span has to hold backticks and pipes without ending early."""
+    assert flakevuln_main._safe_markdown_code_span(raw) == expected
+
+
+def test_component_diagnostics_bounds_affect_rendering_only(monkeypatch, tmp_path):
+    """Truncation is reported, and never touches the persisted evidence."""
+    finding, components = tu.mixed_finding()
+    components[1]["output_paths"] = [f"/nix/store/out-{i}" for i in range(7)]
+    scanner = _scanner_with(
+        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+    )
+    monkeypatch.setattr(evidence, "MAX_RENDERED_COMPONENT_ROWS", 1)
+    monkeypatch.setattr(evidence, "MAX_RENDERED_PATHS", 2)
+    report = _render(scanner, tmp_path)
+
+    assert "1 further component row not shown." in report
+    assert len(scanner.component_evidence) == 2
+    assert len(scanner.component_evidence[1]["output_paths"]) == 7
+    findings_file = tmp_path / "findings.json"
+    scanner.write_findings(findings_file)
+    data = json.loads(findings_file.read_text(encoding="utf-8"))
+    assert len(data["component_evidence"][1]["output_paths"]) == 7
+
+
+def test_long_scalar_values_are_bounded_in_diagnostics(monkeypatch, tmp_path):
+    finding, components = tu.mixed_finding()
+    components[0]["drv_path"] = "/nix/store/" + "a" * 2000
+    scanner = _scanner_with(
+        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+    )
+    report = _render(scanner, tmp_path)
+    assert "a" * 2000 not in report
+    assert "a" * 400 in report
+
+
+def test_step_summary_and_target_report_share_the_component_section(
+    monkeypatch, tmp_path
+):
+    finding, components = tu.mixed_finding()
+    scanner = _scanner_with(
+        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+    )
+    report = _render(scanner, tmp_path)
+    summary = scanner.render_detailed_summary()
+
+    section = scanner._target_report_sections(scanner.flakeref, TARGET)
+    assert section["component_evidence"].strip() in report
+    assert section["component_evidence"].strip() in summary
+    assert COMPONENT_EVIDENCE_HEADING in summary
+
+
+def test_component_diagnostics_are_scoped_to_the_current_scan(monkeypatch, tmp_path):
+    """Diagnostics explain the current scan, not the comparison scans."""
+    # Suppressed findings carry no triage rows, so each scan below is a
+    # suppressed-only scan, a clean success with no active vulnerabilities.
+    finding, component = tu.matched_finding()
+    other, other_component = tu.matched_finding("CVE-2026-2")
+    other_component["component_id"] = "/nix/store/eee-only-unstable.drv"
+    scanner = tu.make_scanner(tmp_path)
+    scanner.evidence_included = True
+    scanner.scanned_targets = [(scanner.flakeref, TARGET)]
+    _run_scan(
+        monkeypatch,
+        tmp_path,
+        scanner=scanner,
+        document=tu.evidence_document([finding], [component]),
+        triage_rows=None,
+    )
+    _run_scan(
+        monkeypatch,
+        tmp_path,
+        scanner=scanner,
+        pintype=PIN_LOCK_UPDATED,
+        document=tu.evidence_document([other], [other_component]),
+        triage_rows=None,
+    )
+
+    rows = scanner._component_evidence_rows(scanner.flakeref, TARGET)
+    assert [row[1]["component_id"] for row in rows] == [component["component_id"]]

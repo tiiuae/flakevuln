@@ -86,6 +86,27 @@ _SECTION_NO_LONGER_ACTIVE = "Vulnerabilities No Longer Active Since Last Run"
 _SECTION_CURRENTLY_ACTIVE = "Currently Active Vulnerabilities"
 _SECTION_WHITELISTED = "Whitelisted Vulnerabilities"
 _SECTION_WHITELISTED_COLLAPSED = f"{_SECTION_WHITELISTED} (press to expand)"
+_SECTION_COMPONENT_EVIDENCE = "Patched and Partially Patched Findings"
+_SECTION_COMPONENT_EVIDENCE_COLLAPSED = (
+    f"{_SECTION_COMPONENT_EVIDENCE} (press to expand)"
+)
+# Anchor base for in-document links to the section above. A Step Summary holds
+# one section per target, so the anchor is suffixed per target to stay unique.
+_COMPONENT_EVIDENCE_ANCHOR = "patched-and-partially-patched-findings"
+# GitHub's markdown sanitizer rewrites every `id` to `user-content-<id>` but
+# leaves `href="#..."` untouched, so an unprefixed pair resolves to nothing on
+# the Actions run page. Writing the prefix on both sides keeps them matched.
+# The rewrite is idempotent, so GitHub leaves an already-prefixed id alone, and
+# renderers that do not rewrite ids see a pair that agrees with itself. This
+# only fixes clicking a link in the rendered report. A fragment in the run
+# page's URL still cannot work, because that page injects the Step Summary
+# after the browser has resolved the fragment against a document without it.
+_ANCHOR_PREFIX = "user-content-"
+# Marks an active finding whose patch evidence needs a look, in the comment
+# column of every table.
+_PARTIAL_PATCH_MARKER = "(*)"
+# Comment endings that already separate the marker from what precedes it.
+_MARKER_SEPARATORS = (",", ";", ":", ".", "!", "?")
 
 # Sentinel meaning "remove this variable from the child env".
 DROP_ENV_VAR = object()
@@ -394,10 +415,45 @@ def _escape_inline_markdown_text(text):
     return re.sub(r"([\\`*_{}\[\]()|>~])", r"\\\1", text)
 
 
+# The inline set above, without the backtick that fencing handles and the
+# underscore that valid store paths carry. See `_safe_markdown_code_span`.
+_CODE_SPAN_ESCAPE_RE = re.compile(r"([\\*{}\[\]()|>~])")
+
+
 def _safe_markdown_table_text(text):
     """Return inert plain text safe inside GFM table cells."""
     escaped = html.escape(_single_line_text(text))
     return _escape_inline_markdown_text(escaped)
+
+
+def _safe_markdown_code_span(text):
+    """Return inert text rendered as a code span inside a GFM table cell.
+
+    A code span does more than the escaper above: it also stops GitHub from
+    autolinking identifiers it recognizes inside a longer token. A store path
+    that happens to contain a CVE id with an entry in GitHub's advisory
+    database otherwise renders with a link buried in the middle of it, and only
+    for the ids that have such an entry, so an unremarkable difference between
+    two paths looks like a claim the report is not making.
+    """
+    raw = _single_line_text(text)
+    if not raw:
+        return ""
+    # Markdown in a code span is already literal, so these escapes are belt and
+    # braces: keeping tag and link syntax out of the report source must not
+    # depend on a renderer treating the span the way the spec says. The set is
+    # smaller than the inline one because a backslash is literal in here too,
+    # and `_` is the one character of that set a valid store path carries, so
+    # escaping it would put visible backslashes into ordinary paths. It is also
+    # the one that cannot open a tag or a link.
+    raw = _CODE_SPAN_ESCAPE_RE.sub(r"\\\1", html.escape(raw))
+    # Fencing with more backticks than the longest run in the content is what
+    # lets a span hold backticks at all. Content that starts or ends with one
+    # needs the padding space, which the renderer strips back off.
+    longest = max((len(run) for run in re.findall(r"`+", raw)), default=0)
+    fence = "`" * (longest + 1)
+    pad = " " if raw.startswith("`") or raw.endswith("`") else ""
+    return f"{fence}{pad}{raw}{pad}{fence}"
 
 
 def _safe_markdown_fragment_text(text):
@@ -1684,7 +1740,10 @@ class FlakeScanner:
         )
         left = baseline_current if removed else current_df
         right = current_df if removed else baseline_current
-        return self._df_to_report_tbl(self._diff_left_only_df(left, right))
+        return self._df_to_report_tbl(
+            self._diff_left_only_df(left, right),
+            marks=self._evidence_marks(flakeref, target),
+        )
 
     def _snapshot_workspace(self, flakeref):
         """Materialize a disposable snapshot of the workspace and target it.
@@ -2029,6 +2088,11 @@ class FlakeScanner:
         report_str = _render_section(
             report_str, PIN_NIX_UNSTABLE, keep=bool(self.unstable_ref)
         )
+        # Legacy findings carry no evidence: drop the section rather than
+        # rendering an empty one.
+        report_str = _render_section(
+            report_str, "component_evidence", keep=bool(self.evidence_findings)
+        )
         sections = self._target_report_sections(flakeref, target)
         report_str = report_str.replace(
             "PROJECT_REFERENCE",
@@ -2091,6 +2155,18 @@ class FlakeScanner:
                 open_by_default=False,
             ),
         )
+        report_str = report_str.replace(
+            "COMPONENT_EVIDENCE_SECTION",
+            _anchored(
+                self._evidence_anchor(flakeref, target),
+                _render_collapsible_block(
+                    _SECTION_COMPONENT_EVIDENCE_COLLAPSED,
+                    notes["component_evidence"],
+                    sections["component_evidence"],
+                    open_by_default=False,
+                ),
+            ),
+        )
         # Write the target report
         target_report.write_text(report_str)
         return target_report
@@ -2120,8 +2196,13 @@ class FlakeScanner:
             "fixed_since_last_run": self._since_last_run_section(
                 flakeref, target, removed=True
             ),
-            "current": _render_error(err) or self._df_to_report_tbl(df_current),
+            "current": _render_error(err)
+            or self._df_to_report_tbl(
+                df_current, marks=self._evidence_marks(flakeref, target)
+            ),
             "whitelisted": self._whitelisted_tbl(flakeref, target),
+            "component_evidence": _render_error(err)
+            or self._component_evidence_tbl(flakeref, target),
         }
 
     def _target_report_notes(self, flakeref, target):
@@ -2153,6 +2234,19 @@ class FlakeScanner:
             "current": (
                 "The following table lists all non-whitelisted vulnerabilities "
                 f"detected in the current scan for {target_ref}:"
+                f"{self._suppressed_note(flakeref, target)}"
+                f"{self._partial_patch_note(flakeref, target)}"
+            ),
+            "component_evidence": (
+                "Per-derivation patch evidence behind the current scan for "
+                f"{target_ref}. It lists only the findings the tables above "
+                "leave unexplained: those suppressed because every derivation "
+                "carries a patch naming the vulnerability, and those whose "
+                "evidence is ambiguous. Evidence is ambiguous when the "
+                "derivations disagree, when the patch metadata could not be "
+                "read, or when no derivation could be identified. A matching "
+                "patch file name is evidence that a fix was applied, not "
+                "proof:"
             ),
             "whitelisted": (
                 "These rows matched the whitelist input and are kept for audit "
@@ -2226,6 +2320,19 @@ class FlakeScanner:
                 )
             )
             blocks.append("")
+            if self.evidence_findings:
+                blocks.append(
+                    _anchored(
+                        self._evidence_anchor(flakeref, target),
+                        _render_collapsible_block(
+                            _SECTION_COMPONENT_EVIDENCE_COLLAPSED,
+                            notes["component_evidence"],
+                            sections["component_evidence"],
+                            open_by_default=False,
+                        ),
+                    )
+                )
+                blocks.append("")
             blocks.append("</details>")
             blocks.append("")
         return "\n".join(blocks).rstrip()
@@ -2251,13 +2358,183 @@ class FlakeScanner:
         df_right = self._target_df(flakeref, target)
         df = self._diff_scans(df_target, left_pin, right_pin, df_right)
         err = self._read_error(flakeref, target, [left_pin, right_pin])
-        return _render_error(err) or self._df_to_report_tbl(df)
+        return _render_error(err) or self._df_to_report_tbl(
+            df, marks=self._evidence_marks(flakeref, target)
+        )
+
+    def _evidence_anchor(self, flakeref, target):
+        """Return this target's anchor for the patched-findings section.
+
+        Suffixed per target because a Step Summary renders one section per
+        scanned target into a single document, and `_ANCHOR_PREFIX`-ed so that
+        the id this names survives GitHub's sanitizer as written.
+        """
+        digest = hashlib.sha256(f"{flakeref}\0{target}".encode("utf-8")).hexdigest()
+        return f"{_ANCHOR_PREFIX}{_COMPONENT_EVIDENCE_ANCHOR}-{digest[:12]}"
+
+    def _current_scan_key(self, flakeref, target):
+        """Return the evidence scan key of the current pin for `target`."""
+        return (self._scope_target_flakeref(flakeref), str(target), PIN_CURRENT)
+
+    def _current_scan_findings(self, flakeref, target):
+        """Return the current-scan evidence findings keyed by finding ID."""
+        key = self._current_scan_key(flakeref, target)
+        return {
+            str(finding[evidence.FINDING_ID]): finding
+            for finding in self.evidence_findings
+            if evidence.scan_key(finding) == key
+        }
+
+    def _suppressed_note(self, flakeref, target):
+        """Return the sentence accounting for patch-suppressed findings.
+
+        Suppressed findings are absent from every active table, so without this
+        the only trace of them is the findings file, which as a CI artifact
+        outlives the report by far less than the report itself.
+        """
+        findings = self._current_scan_findings(flakeref, target)
+        count = sum(1 for finding in findings.values() if finding[evidence.SUPPRESSED])
+        if not count:
+            return ""
+        anchor = self._evidence_anchor(flakeref, target)
+        return (
+            f" A further {count} "
+            f"{_plural(count, 'finding is', 'findings are')} omitted here "
+            "because every matched derivation carries a patch naming the "
+            f"vulnerability; see [{_SECTION_COMPONENT_EVIDENCE}](#{anchor})."
+        )
+
+    def _evidence_marks(self, flakeref, target):
+        """Return `(anchor, finding_ids)` for the rows this run may mark.
+
+        The IDs come from this run's current-pin evidence, so a row can only be
+        marked when the section it links to actually explains it.
+        """
+        findings = self._current_scan_findings(flakeref, target)
+        return (
+            self._evidence_anchor(flakeref, target),
+            {
+                fid
+                for fid, finding in findings.items()
+                if finding[evidence.PATCH_STATE] in _AMBIGUOUS_PATCH_STATES
+            },
+        )
+
+    def _partial_patch_note(self, flakeref, target):
+        """Return the sentence explaining the `(*)` marker, when one is used.
+
+        The count is report-wide, and says so: markers land in every table that
+        carries the finding, including the whitelisted one, so a count scoped
+        to the active table would disagree with the markers a reader sees a few
+        lines further down.
+        """
+        findings = self._current_scan_findings(flakeref, target)
+        count = sum(
+            1
+            for finding in findings.values()
+            if finding[evidence.PATCH_STATE] in _AMBIGUOUS_PATCH_STATES
+        )
+        if not count:
+            return ""
+        anchor = self._evidence_anchor(flakeref, target)
+        return (
+            f" A {_PARTIAL_PATCH_MARKER} marks the {count} "
+            f"{_plural(count, 'finding', 'findings')} in this report whose "
+            "patch evidence needs review: the matched derivations disagree, "
+            "or the evidence could not be established. Marked findings appear "
+            "in whichever tables list them, including the whitelisted one. "
+            f"See [{_SECTION_COMPONENT_EVIDENCE}](#{anchor})."
+        )
+
+    def _component_evidence_rows(self, flakeref, target):
+        """Return current-scan component rows joined to their evidence finding.
+
+        Only findings whose evidence says something the active tables do not
+        are kept: those vulnxscan suppressed as fully patch-matched, and those
+        whose evidence is ambiguous. A plain `no_component_match` finding is
+        already listed in full above, and on a real closure those outnumber
+        everything else by two orders of magnitude, so repeating one row per
+        derivation here buries the rows worth reading.
+
+        Ordered so ambiguous findings come before suppressed ones, then by the
+        usual vulnerability sort order.
+        """
+        key = self._current_scan_key(flakeref, target)
+        findings = self._current_scan_findings(flakeref, target)
+        rows = [
+            (findings[str(component[evidence.FINDING_ID])], component)
+            for component in self.component_evidence
+            if evidence.scan_key(component) == key
+            and str(component[evidence.FINDING_ID]) in findings
+            and _is_reportable_evidence(findings[str(component[evidence.FINDING_ID])])
+        ]
+        rows.sort(key=lambda pair: _component_evidence_sort_key(*pair))
+        return rows
+
+    def _component_evidence_tbl(self, flakeref, target):
+        """Render the bounded per-target component evidence diagnostics."""
+        rows = self._component_evidence_rows(flakeref, target)
+        if not rows:
+            # Not "no component evidence": the scan may well have produced
+            # plenty, all of it the plain no-match this section filters out.
+            return "```No reportable component evidence```"
+        shown = rows[: evidence.MAX_RENDERED_COMPONENT_ROWS]
+        omitted_rows = len(rows) - len(shown)
+        omitted_paths = 0
+        records = []
+        for finding, component in shown:
+            patches, cut_patches = _bounded_paths(component["matching_patch_paths"])
+            omitted_paths += cut_patches
+            state = component[evidence.PATCH_EVIDENCE_STATE]
+            records.append(
+                {
+                    "vuln_id": _markdown_link(
+                        finding["vuln_id"],
+                        finding["url"],
+                        fallback=_bounded_scalar(finding["vuln_id"]),
+                    ),
+                    "package": _bounded_scalar(finding["package"]),
+                    "version": _bounded_scalar(finding["version"]),
+                    "status": (
+                        "hidden as patched"
+                        if finding[evidence.SUPPRESSED]
+                        else "still listed"
+                    ),
+                    "patch_evidence": _PATCH_EVIDENCE_LABELS.get(
+                        state, _bounded_scalar(state)
+                    ),
+                    "drv_path": _bounded_code(component["drv_path"]),
+                    "matching_patch_paths": patches,
+                }
+            )
+        table = tabulate(
+            pd.DataFrame(records),
+            headers="keys",
+            tablefmt="github",
+            stralign="left",
+            showindex=False,
+        )
+        notes = []
+        if omitted_rows:
+            notes.append(
+                f"{omitted_rows} further component "
+                f"{_plural(omitted_rows, 'row', 'rows')} not shown."
+            )
+        if omitted_paths:
+            notes.append(
+                f"{omitted_paths} further "
+                f"{_plural(omitted_paths, 'path', 'paths')} not shown."
+            )
+        note = f"\n{' '.join(notes)}\n" if notes else ""
+        return f"\n{table}\n{note}"
 
     def _whitelisted_tbl(self, flakeref, target):
         """Render the whitelisted-only table for `target`."""
         df = self._target_df(flakeref, target)
         df = df[df["whitelist"] != "False"]
-        return self._df_to_report_tbl(df, up_ver=False)
+        return self._df_to_report_tbl(
+            df, up_ver=False, marks=self._evidence_marks(flakeref, target)
+        )
 
     def apply_nixprs(self, actionable):
         """Fold enriched `nixpkgs_pr` links into matching scan rows.
@@ -2359,7 +2636,7 @@ class FlakeScanner:
         df = df.astype(str)
         return df
 
-    def _df_to_report_tbl(self, df, up_ver=True):
+    def _df_to_report_tbl(self, df, up_ver=True, marks=None):
         LOG.debug("")
         if df.empty:
             return "```No vulnerabilities```"
@@ -2405,6 +2682,11 @@ class FlakeScanner:
         # Add Nixpkgs security tracker links
         if "nixpkgs_issue" in df.columns:
             df["comment"] = df.apply(_reformat_nixtracker, axis=1)
+        # Flag the findings of this run whose patch evidence is worth a look
+        if marks and marks[1] and "finding_id" in df.columns:
+            df["comment"] = df.apply(
+                lambda row: _append_partial_patch_marker(row, marks), axis=1
+            )
         # Select only the report_cols
         df = df[report_cols]
         for column in (
@@ -3144,6 +3426,16 @@ def _render_section(text, name, keep):
     return pattern.sub((lambda m: m.group("body")) if keep else "", text)
 
 
+def _anchored(anchor, block):
+    """Prefix `block` with a link target so tables can point at it.
+
+    A `<summary>` produces no heading anchor of its own, so the section needs
+    an explicit one for the `(*)` markers to link to. `anchor` must already
+    carry `_ANCHOR_PREFIX`, since the links that point here cannot add it.
+    """
+    return f'<a id="{anchor}"></a>\n\n{block}'
+
+
 def _render_collapsible_block(summary, *parts, open_by_default=True):
     """Render a `<details>` block with markdown body content."""
     open_attr = " open" if open_by_default else ""
@@ -3153,6 +3445,86 @@ def _render_collapsible_block(summary, *parts, open_by_default=True):
         lines.extend(["", body, ""])
     lines.append("</details>")
     return "\n".join(lines)
+
+
+# Plain-language renderings of the vulnxscan evidence enums. The raw values
+# stay in findings.json, which is a machine contract; a report reader should
+# not have to decode `no_vuln_id_patch_name_match`. "vulnerability" rather than
+# "CVE" because scanners also report OSV and GHSA identifiers.
+_PATCH_EVIDENCE_LABELS = {
+    evidence.COMPONENT_STATE_MATCH: "patch names this vulnerability",
+    evidence.COMPONENT_STATE_NO_MATCH: "no patch names this vulnerability",
+    evidence.COMPONENT_STATE_METADATA_UNAVAILABLE: "patch list unreadable",
+    evidence.COMPONENT_STATE_PACKAGE_VERSION_ONLY: "derivation not identified",
+}
+
+# Aggregate states that leave a finding active but unexplained by the tables.
+_AMBIGUOUS_PATCH_STATES = frozenset(
+    {
+        evidence.PATCH_STATE_MIXED,
+        evidence.PATCH_STATE_METADATA_UNAVAILABLE,
+        evidence.PATCH_STATE_PACKAGE_VERSION_ONLY,
+    }
+)
+
+
+def _is_reportable_evidence(finding):
+    """Return whether a finding's component evidence is worth rendering.
+
+    Everything except a plain `no_component_match`: the suppressed findings,
+    which this section is the only place to see, and the ambiguous ones.
+    Ambiguous means `mixed_component_evidence` where derivations disagree,
+    `metadata_unavailable` where patch metadata could not be read, or
+    `package_version_only` where no derivation could be identified at all.
+    """
+    return finding[evidence.PATCH_STATE] != evidence.PATCH_STATE_NO_MATCH
+
+
+def _component_evidence_rank(finding):
+    """Rank a reportable finding by how much its evidence explains.
+
+    Ambiguous findings come first, because they are the ones a reader has to
+    resolve by hand. Patch-suppressed findings follow.
+    """
+    return 1 if finding[evidence.SUPPRESSED] else 0
+
+
+def _component_evidence_sort_key(finding, component):
+    """Order component diagnostics by evidence value, then by severity."""
+    return (
+        _component_evidence_rank(finding),
+        -_severity_score(finding.get("severity", "")),
+        -_numeric_score(finding.get("sortcol", "")),
+        str(finding.get("package", "")),
+        str(finding.get("version", "")),
+        str(finding.get("vuln_id", "")),
+        str(component.get("component_id", "")),
+    )
+
+
+def _plural(count, singular, plural):
+    """Return the noun form matching `count`."""
+    return singular if count == 1 else plural
+
+
+def _bounded_scalar(text):
+    """Return one escaped, length-bounded value for a diagnostic table cell."""
+    return _safe_markdown_table_text(str(text)[: evidence.MAX_RENDERED_SCALAR_CHARS])
+
+
+def _bounded_code(text):
+    """Return one length-bounded value as a code span for a diagnostic table."""
+    return _safe_markdown_code_span(str(text)[: evidence.MAX_RENDERED_SCALAR_CHARS])
+
+
+def _bounded_paths(paths):
+    """Return `(rendered, omitted)` for a bounded list of store/patch paths."""
+    shown = list(paths)[: evidence.MAX_RENDERED_PATHS]
+    omitted = len(paths) - len(shown)
+    # The separator stays outside the spans, since a code span is literal and
+    # would render the tag rather than break the line.
+    rendered = "<br>".join(_bounded_code(path) for path in shown)
+    return rendered, omitted
 
 
 def _reformat_vuln_id(row):
@@ -3210,6 +3582,37 @@ def _reformat_nixtracker(row):
             )
         )
     return _append_enrichment_links(comment, links)
+
+
+def _append_partial_patch_marker(row, marks):
+    """Append the partial-patch marker to one table row's comment.
+
+    Rows are marked by membership in this run's ambiguous current findings,
+    not by their own `pintype` or `patch_state`. A row's pintype records which
+    pin it came from, not which run: previous-baseline rows are current-pin
+    too, so keying on it marked removed findings with a link to evidence that
+    does not describe them. Membership also marks every copy of a finding
+    alike, where the all-pin whitelist table previously rendered the same
+    finding both marked and unmarked.
+    """
+    comment = row.comment if hasattr(row, "comment") else ""
+    anchor, finding_ids = marks
+    if str(getattr(row, "finding_id", "")) not in finding_ids:
+        return comment
+    marker = (
+        f"[{_PARTIAL_PATCH_MARKER}](#{anchor})" if anchor else _PARTIAL_PATCH_MARKER
+    )
+    if not comment:
+        return marker
+    # The marker is one more fragment in a cell that already lists them comma
+    # separated (whitelist text, PR links, tracker links), so it joins them the
+    # same way. A comment ending in punctuation that already separates is left
+    # as it is, since a comma there would be doubled or wrong. Whitelist
+    # comments are free text, and the cell escaper leaves their terminal
+    # punctuation alone, so the ending tested here is the rendered one.
+    stripped = comment.rstrip()
+    separator = "" if stripped.endswith(_MARKER_SEPARATORS) else ","
+    return f"{stripped}{separator} {marker}"
 
 
 def _append_enrichment_links(comment, links):

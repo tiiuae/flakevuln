@@ -19,6 +19,7 @@ report.
 - Optionally adds a third scan against an explicit unstable input such as
   `github:NixOS/nixpkgs/nixos-unstable`.
 - Writes machine-readable findings plus markdown reports.
+- Explains each finding with per-derivation patch evidence from `vulnxscan`.
 - Reuses the same engine locally and in GitHub Actions.
 - Persists `grype`, `vulnix`, `sbomnix` HTTP cache data, and prior-run baseline
   findings across workflow runs.
@@ -266,6 +267,33 @@ nix run .#flakevuln -- report \
   --outdir report \
   --nixprs
 ```
+
+### Patch evidence
+
+Reports explain why a finding survived filtering, as an exception rather than
+as a column on every row. Every target report and Step Summary includes a
+collapsed **Patched and Partially Patched Findings** section listing the
+derivations behind a finding and any patches whose file names mention the
+vulnerability ID. It holds only the findings the active tables cannot explain
+by themselves: those hidden because every derivation is patch-matched, and
+those whose derivations disagree, whose patch metadata could not be read, or
+whose derivation could not be identified at all.
+
+Findings whose derivations all carry a matching vulnerability-ID patch are
+hidden from the active tables and listed only in that section. The active
+section note reports how many were hidden, so the report itself records the
+omission even after the findings artifact has expired. Findings whose patch
+evidence needs review stay in the active tables with a `(*)` in the comment
+column, linking to their per-derivation detail: either the matched derivations
+disagree, or their patch evidence could not be established.
+
+A matching patch file name is evidence that a fix was applied, not proof, and
+an absent one is not proof of exposure: a patch named `fix-build.patch` can
+carry the same fix without naming the vulnerability.
+
+`findings.json` keeps the full evidence under `schema_version: 2`. See
+[doc/component-evidence.md](doc/component-evidence.md) for the schema, the
+scan-outcome rules, and the trust boundary.
 
 ### Whitelist format
 
