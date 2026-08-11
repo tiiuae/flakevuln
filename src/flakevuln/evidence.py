@@ -118,6 +118,11 @@ _COMPONENT_STR_LIST_FIELDS = (
 # composite key below is what identifies a row inside flakevuln.
 ANNOTATION_FIELDS = ("flakeref", "scope_flakeref", "target", "pintype")
 SCAN_KEY_FIELDS = ("scope_flakeref", "target", "pintype")
+# The pin states a scan can produce. Spelled out rather than imported from
+# `main` to keep this module free of report-side imports. An unknown pintype
+# reconciles fine against scan rows carrying the same unknown value, yet no
+# report section looks for it, so the whole scan state would vanish silently.
+PINTYPES = frozenset({"current", "lock_updated", "nix_unstable"})
 
 # Ingestion safety limits. These are validation limits: exceeding one is an
 # error, never a silent truncation of machine-readable data.
@@ -322,6 +327,7 @@ def _validate_finding(finding, *, annotated):
     fields = _FINDING_STR_FIELDS + (ANNOTATION_FIELDS if annotated else ())
     for field in fields:
         _require_str(finding, field, "evidence finding")
+    _require_pintype(finding, "evidence finding", annotated=annotated)
     for field in _FINDING_STR_LIST_FIELDS:
         _require_str_list(finding, field, "evidence finding")
     for field in COUNT_FIELDS:
@@ -348,6 +354,7 @@ def _validate_component(component, *, annotated):
     fields = _COMPONENT_STR_FIELDS + (ANNOTATION_FIELDS if annotated else ())
     for field in fields:
         _require_str(component, field, "component evidence")
+    _require_pintype(component, "component evidence", annotated=annotated)
     for field in _COMPONENT_STR_LIST_FIELDS:
         _require_str_list(component, field, "component evidence")
     suppressed = _require_bool(component, SUPPRESSED, "component evidence")
@@ -452,6 +459,15 @@ def _require_list(value, what):
         if not isinstance(entry, dict):
             raise EvidenceError(f"evidence '{what}' entries must be JSON objects")
     return value
+
+
+def _require_pintype(row, what, *, annotated):
+    """Require an annotated row to name a pin state the report can render."""
+    if not annotated:
+        return
+    pintype = row.get("pintype")
+    if pintype not in PINTYPES:
+        raise EvidenceError(f"{what} has unknown pintype '{pintype}'")
 
 
 def _require_str(row, field, what):

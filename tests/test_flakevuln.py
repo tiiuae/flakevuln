@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+from testutils import make_scanner as _make_scanner
 
 from flakevuln import main as flakevuln_main
 from flakevuln import version as flakevuln_version
@@ -20,7 +21,6 @@ from flakevuln.main import (
     PIN_LOCK_UPDATED,
     PIN_NIX_UNSTABLE,
     FlakeScanner,
-    _empty_scan_df,
 )
 from flakevuln.version import get_py_pkg_version
 
@@ -32,40 +32,11 @@ WHITELISTED_COLLAPSED_SECTION = (
 )
 
 
-def _make_scanner(tmp_path, flakeref="github:example/flake", unstable_ref=""):
-    """Create a scanner instance without cloning a real flake."""
-    scanner_tmpdir = tmp_path / "scanner"
-    scanner_tmpdir.mkdir(parents=True, exist_ok=True)
-    scanner = FlakeScanner.__new__(FlakeScanner)
-    scanner.df_scan = _empty_scan_df()
-    scanner.errors = {}
-    scanner.flakeref = flakeref
-    scanner.scope_flakeref = flakevuln_main._canonical_scope_flakeref(flakeref)
-    scanner.input_name = "nixpkgs"
-    scanner.unstable_ref = unstable_ref
-    scanner.project_name = flakeref
-    scanner.project_url = flakeref
-    scanner.repo_head = "deadbeef"
-    scanner.generated_at = "2026-06-17T06:34:12Z"
-    scanner.input_locked_rev = "abc123"
-    scanner.run_context = {
-        "kind": "local",
-        "server_url": "",
-        "repository": "",
-        "run_id": "",
-    }
-    scanner.baseline = None
-    scanner.scope_targets = []
-    scanner.scanned_targets = []
-    scanner.tmpdir = scanner_tmpdir
-    scanner.lockfile = scanner_tmpdir / "flake.lock"
-    scanner.lockfile_bak = scanner_tmpdir / "flake.lock.bak"
-    scanner.lockfile.write_text("changed", encoding="utf-8")
-    scanner.lockfile_bak.write_text("orig", encoding="utf-8")
-    scanner.eval_flakeref = "."
-    scanner.remote_flake = False
-    scanner.verbosity = 1
-    scanner.comparison_state = scanner._default_comparison_state()
+def _mark_current_only(scanner):
+    """Mark synthetic findings as a current-only scan."""
+    scanner._set_comparison_skipped(
+        PIN_LOCK_UPDATED, "test fixture scanned only the current pin"
+    )
     return scanner
 
 
@@ -298,7 +269,9 @@ def test_local_subcommand_persists_report_enrichment_to_outputs_and_baseline(
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
 
     def fake_run_scan(**kwargs):
-        scanner = _make_scanner(tmp_path / "scan", flakeref=kwargs["flakeref"])
+        scanner = _mark_current_only(
+            _make_scanner(tmp_path / "scan", flakeref=kwargs["flakeref"])
+        )
         scanner.scanned_targets = [(kwargs["flakeref"], target)]
         scanner.df_scan = pd.DataFrame([_scan_row(target, PIN_CURRENT, "CVE-1", "pkg")])
         scanner.write_findings(kwargs["findings"])
@@ -633,7 +606,9 @@ def test_findings_round_trip_scan_to_report(tmp_path):
     target = "packages.x86_64-linux.default"
     scanner.scanned_targets = [(scanner.flakeref, target)]
     scanner.repo_head = "cafef00d"
-    scanner.errors = {scanner._error_key(scanner.flakeref, target, PIN_CURRENT): "boom"}
+    scanner.errors = {
+        scanner._error_key(scanner.flakeref, target, PIN_LOCK_UPDATED): "boom"
+    }
     scanner.df_scan = pd.DataFrame(
         [
             {
@@ -664,10 +639,22 @@ def test_findings_round_trip_scan_to_report(tmp_path):
     assert restored.input_locked_rev == "abc123"
     assert restored.run_context["kind"] == "local"
     assert restored.errors == {
-        scanner._error_key(scanner.flakeref, target, PIN_CURRENT): "boom"
+        scanner._error_key(scanner.flakeref, target, PIN_LOCK_UPDATED): "boom"
     }
     assert restored.comparison_state == scanner.comparison_state
     assert restored.df_scan["vuln_id"].tolist() == ["CVE-0000-0001"]
+
+
+def test_scope_targets_are_derived_from_the_persisted_scope(tmp_path):
+    """Relative flakerefs must not be reinterpreted in the report process cwd."""
+    scanner = _mark_current_only(_make_scanner(tmp_path, flakeref="."))
+    target = "packages.x86_64-linux.default"
+    scanner.scope_flakeref = "nested/project"
+    scanner.scanned_targets = [(scanner.flakeref, target)]
+
+    restored = flakevuln_main.FlakeScanner.from_findings_data(scanner._findings_data())
+
+    assert restored.scope_targets == [(scanner.scope_flakeref, target)]
 
 
 def test_from_findings_invalid_comparison_state_falls_back_to_defaults(tmp_path):
@@ -694,8 +681,15 @@ def test_from_findings_invalid_comparison_state_falls_back_to_defaults(tmp_path)
 
     restored = flakevuln_main.FlakeScanner.from_findings(findings)
 
-    assert restored._comparison_enabled(PIN_LOCK_UPDATED) is True
-    assert restored._comparison_enabled(PIN_NIX_UNSTABLE) is True
+    # Unreadable state skips the comparisons rather than enabling them: the
+    # file no longer says whether they ran, and defaulting to enabled would
+    # diff against a scan that may never have happened and call every finding
+    # fixed by an update nobody performed.
+    assert restored._comparison_enabled(PIN_LOCK_UPDATED) is False
+    assert restored._comparison_enabled(PIN_NIX_UNSTABLE) is False
+    assert "does not record whether" in restored._comparison_skip_reason(
+        PIN_LOCK_UPDATED
+    )
 
 
 def test_from_findings_missing_file_exits(tmp_path):
@@ -875,7 +869,7 @@ def test_findings_file_omits_legacy_actionable_key(tmp_path):
 def test_report_writes_step_summary_without_outdir(monkeypatch, tmp_path):
     """`report` always writes a Step Summary; markdown is opt-in via --outdir."""
     target = "packages.x86_64-linux.default"
-    scanner = _make_scanner(tmp_path, flakeref="flake")
+    scanner = _mark_current_only(_make_scanner(tmp_path, flakeref="flake"))
     scanner.scanned_targets = [("flake", target)]
     scanner.df_scan = pd.DataFrame([_scan_row(target, PIN_CURRENT, "CVE-1", "pkg")])
     findings = tmp_path / "findings.json"
@@ -1180,7 +1174,7 @@ def test_report_ignores_invalid_nixtracker_issue_code(tmp_path):
 def test_report_runs_nixtracker_only_in_report_phase(monkeypatch, tmp_path):
     """--nixtracker enriches reports without mutating input findings."""
     target = "packages.x86_64-linux.default"
-    scanner = _make_scanner(tmp_path, flakeref="flake")
+    scanner = _mark_current_only(_make_scanner(tmp_path, flakeref="flake"))
     scanner.scanned_targets = [("flake", target)]
     scanner.df_scan = pd.DataFrame(
         [
@@ -1288,10 +1282,12 @@ def test_report_runs_nixprs_only_in_report_phase(monkeypatch, tmp_path):
 
 
 def test_report_detailed_summary_includes_report_layout(tmp_path, monkeypatch):
-    scanner = _make_scanner(
-        tmp_path,
-        flakeref="flake",
-        unstable_ref="github:NixOS/nixpkgs/nixos-unstable",
+    scanner = _mark_current_only(
+        _make_scanner(
+            tmp_path,
+            flakeref="flake",
+            unstable_ref="github:NixOS/nixpkgs/nixos-unstable",
+        )
     )
     target = "packages.x86_64-linux.default"
     scanner.scanned_targets = [("flake", target)]
@@ -1382,7 +1378,7 @@ def test_report_detailed_summary_includes_report_layout(tmp_path, monkeypatch):
 def test_report_summary_works_without_extra_notes(tmp_path, monkeypatch):
     """The default summary uses the detailed report layout."""
     target = "packages.x86_64-linux.default"
-    scanner = _make_scanner(tmp_path, flakeref="flake")
+    scanner = _mark_current_only(_make_scanner(tmp_path, flakeref="flake"))
     scanner.scanned_targets = [("flake", target)]
     scanner.df_scan = pd.DataFrame(
         [
@@ -1439,7 +1435,7 @@ def test_report_summary_works_without_extra_notes(tmp_path, monkeypatch):
 def test_report_summary_groups_multiple_targets_in_collapsible_blocks(
     tmp_path, monkeypatch
 ):
-    scanner = _make_scanner(tmp_path, flakeref="flake")
+    scanner = _mark_current_only(_make_scanner(tmp_path, flakeref="flake"))
     target_a = "packages.x86_64-linux.default"
     target_b = "packages.x86_64-linux.flakevuln"
     scanner.scanned_targets = [("flake", target_a), ("flake", target_b)]
@@ -1482,7 +1478,7 @@ def test_report_summary_groups_multiple_targets_in_collapsible_blocks(
 def test_report_summary_escapes_html_in_target_headers(tmp_path, monkeypatch):
     flakeref = "github:acme/widget?dir=sub&narHash=<test>"
     target = "packages.x86_64-linux.default"
-    scanner = _make_scanner(tmp_path, flakeref=flakeref)
+    scanner = _mark_current_only(_make_scanner(tmp_path, flakeref=flakeref))
     scanner.scanned_targets = [(flakeref, target)]
     scanner.df_scan = pd.DataFrame(
         [
@@ -1524,7 +1520,7 @@ def test_report_summary_escapes_markdown_sensitive_target_index_input(
 ):
     flakeref = "flake`name\nspoof"
     target = "packages.x86_64-linux.default"
-    scanner = _make_scanner(tmp_path, flakeref=flakeref)
+    scanner = _mark_current_only(_make_scanner(tmp_path, flakeref=flakeref))
     scanner.scanned_targets = [(flakeref, target)]
     scanner.df_scan = pd.DataFrame(
         [
@@ -1601,7 +1597,7 @@ def test_report_uses_previous_run_baseline_across_equivalent_local_flakeref_spel
     monkeypatch.chdir(repo)
 
     target = "packages.x86_64-linux.default"
-    current = _make_scanner(tmp_path / "current", flakeref=".")
+    current = _mark_current_only(_make_scanner(tmp_path / "current", flakeref="."))
     current.scanned_targets = [(".", target)]
     current.df_scan = pd.DataFrame(
         [_scan_row(target, PIN_CURRENT, "CVE-NEW", "pkg-new", flakeref=".")]
@@ -1609,7 +1605,9 @@ def test_report_uses_previous_run_baseline_across_equivalent_local_flakeref_spel
     current_findings = tmp_path / "current-findings.json"
     current.write_findings(current_findings)
 
-    previous = _make_scanner(tmp_path / "previous", flakeref=str(repo))
+    previous = _mark_current_only(
+        _make_scanner(tmp_path / "previous", flakeref=str(repo))
+    )
     previous.scanned_targets = [(str(repo), target)]
     previous.df_scan = pd.DataFrame(
         [
@@ -1648,7 +1646,7 @@ def test_report_summary_renders_previous_run_sections_and_validated_link(
     tmp_path, monkeypatch
 ):
     target = "packages.x86_64-linux.default"
-    current = _make_scanner(tmp_path / "current", flakeref="flake")
+    current = _mark_current_only(_make_scanner(tmp_path / "current", flakeref="flake"))
     current.scanned_targets = [("flake", target)]
     current.df_scan = pd.DataFrame(
         [_scan_row(target, PIN_CURRENT, "CVE-NEW", "pkg-new")]
@@ -1656,7 +1654,9 @@ def test_report_summary_renders_previous_run_sections_and_validated_link(
     current_findings = tmp_path / "current-findings.json"
     current.write_findings(current_findings)
 
-    previous = _make_scanner(tmp_path / "previous", flakeref="flake")
+    previous = _mark_current_only(
+        _make_scanner(tmp_path / "previous", flakeref="flake")
+    )
     previous.scanned_targets = [("flake", target)]
     previous.generated_at = "2026-06-16T05:04:03Z"
     previous.input_locked_rev = "rev-prev"
@@ -1726,13 +1726,15 @@ def test_report_summary_escapes_untrusted_last_run_metadata_as_plain_text(
     tmp_path, monkeypatch
 ):
     target = "packages.x86_64-linux.default"
-    current = _make_scanner(tmp_path / "current", flakeref="flake")
+    current = _mark_current_only(_make_scanner(tmp_path / "current", flakeref="flake"))
     current.scanned_targets = [("flake", target)]
     current.df_scan = pd.DataFrame([_scan_row(target, PIN_CURRENT, "CVE-1", "pkg")])
     current_findings = tmp_path / "current-findings.json"
     current.write_findings(current_findings)
 
-    previous = _make_scanner(tmp_path / "previous", flakeref="flake")
+    previous = _mark_current_only(
+        _make_scanner(tmp_path / "previous", flakeref="flake")
+    )
     previous.scanned_targets = [("flake", target)]
     previous.generated_at = "**boom**"
     previous.input_name = "[x](https://evil.example)"
@@ -1770,13 +1772,15 @@ def test_report_summary_invalid_github_run_metadata_falls_back_to_plain_text(
     tmp_path, monkeypatch
 ):
     target = "packages.x86_64-linux.default"
-    current = _make_scanner(tmp_path / "current", flakeref="flake")
+    current = _mark_current_only(_make_scanner(tmp_path / "current", flakeref="flake"))
     current.scanned_targets = [("flake", target)]
     current.df_scan = pd.DataFrame([_scan_row(target, PIN_CURRENT, "CVE-1", "pkg")])
     current_findings = tmp_path / "current-findings.json"
     current.write_findings(current_findings)
 
-    previous = _make_scanner(tmp_path / "previous", flakeref="flake")
+    previous = _mark_current_only(
+        _make_scanner(tmp_path / "previous", flakeref="flake")
+    )
     previous.scanned_targets = [("flake", target)]
     previous.generated_at = "2026-06-16T05:04:03Z"
     previous.input_locked_rev = "rev-prev"
@@ -1810,13 +1814,15 @@ def test_report_summary_invalid_github_run_metadata_falls_back_to_plain_text(
 
 def test_report_summary_rejects_userinfo_smuggled_github_run_url(tmp_path, monkeypatch):
     target = "packages.x86_64-linux.default"
-    current = _make_scanner(tmp_path / "current", flakeref="flake")
+    current = _mark_current_only(_make_scanner(tmp_path / "current", flakeref="flake"))
     current.scanned_targets = [("flake", target)]
     current.df_scan = pd.DataFrame([_scan_row(target, PIN_CURRENT, "CVE-1", "pkg")])
     current_findings = tmp_path / "current-findings.json"
     current.write_findings(current_findings)
 
-    previous = _make_scanner(tmp_path / "previous", flakeref="flake")
+    previous = _mark_current_only(
+        _make_scanner(tmp_path / "previous", flakeref="flake")
+    )
     previous.scanned_targets = [("flake", target)]
     previous.run_context = {
         "kind": "github",
@@ -1849,13 +1855,15 @@ def test_report_summary_rejects_userinfo_smuggled_github_run_url(tmp_path, monke
 
 def test_report_summary_rejects_offsite_https_github_run_url(tmp_path, monkeypatch):
     target = "packages.x86_64-linux.default"
-    current = _make_scanner(tmp_path / "current", flakeref="flake")
+    current = _mark_current_only(_make_scanner(tmp_path / "current", flakeref="flake"))
     current.scanned_targets = [("flake", target)]
     current.df_scan = pd.DataFrame([_scan_row(target, PIN_CURRENT, "CVE-1", "pkg")])
     current_findings = tmp_path / "current-findings.json"
     current.write_findings(current_findings)
 
-    previous = _make_scanner(tmp_path / "previous", flakeref="flake")
+    previous = _mark_current_only(
+        _make_scanner(tmp_path / "previous", flakeref="flake")
+    )
     previous.scanned_targets = [("flake", target)]
     previous.run_context = {
         "kind": "github",
@@ -1890,7 +1898,7 @@ def test_update_next_baseline_writes_current_findings_and_skips_failed_current_s
     tmp_path,
 ):
     target = "packages.x86_64-linux.default"
-    current = _make_scanner(tmp_path / "current", flakeref="flake")
+    current = _mark_current_only(_make_scanner(tmp_path / "current", flakeref="flake"))
     current.scanned_targets = [("flake", target)]
     current.df_scan = pd.DataFrame([_scan_row(target, PIN_CURRENT, "CVE-1", "pkg")])
     current_findings = tmp_path / "current-findings.json"
@@ -1903,7 +1911,7 @@ def test_update_next_baseline_writes_current_findings_and_skips_failed_current_s
         == "CVE-1"
     )
 
-    failing = _make_scanner(tmp_path / "failing", flakeref="flake")
+    failing = _mark_current_only(_make_scanner(tmp_path / "failing", flakeref="flake"))
     failing.scanned_targets = [("flake", target)]
     failing.errors = {failing._error_key("flake", target, PIN_CURRENT): "boom"}
     failing_findings = tmp_path / "failing-findings.json"

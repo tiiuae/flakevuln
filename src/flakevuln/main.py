@@ -49,9 +49,10 @@ EMPTY_SCAN_COLUMNS = [
     "nixpkgs_pr",
     "nixpkgs_issue",
     "nixpkgs_issue_status",
-    # vulnxscan patch-evidence aggregates. An empty scan frame carries them
-    # too, so a clean scan with no triage rows is not mistaken for triage
-    # output that is missing its evidence columns.
+    # vulnxscan patch-evidence aggregates. Empty for legacy findings written
+    # before the evidence contract, which still render exactly as before. An
+    # empty scan frame carries them too, so a clean scan with no triage rows is
+    # not mistaken for triage output that is missing its evidence columns.
     "finding_id",
     "evidence_scope",
     "patch_state",
@@ -73,6 +74,9 @@ TRIAGE_EVIDENCE_COLUMNS = (
 PIN_CURRENT = "current"  # the flake's committed flake.lock
 PIN_LOCK_UPDATED = "lock_updated"  # nixpkgs re-locked in-channel
 PIN_NIX_UNSTABLE = "nix_unstable"  # nixpkgs overridden to the unstable ref
+_COMPARISON_STATE_UNREADABLE = (
+    "Comparison skipped: the findings file does not record whether this comparison ran."
+)
 
 # User-facing report section titles.
 _SECTION_FIXED_IN_PINNED_NIXPKGS = "Vulnerabilities Fixed by Updating Pinned nixpkgs"
@@ -765,6 +769,16 @@ def _safe_code_block(text):
     return f"```text\n{body}\n```"
 
 
+def _renderable_error_payload(error):
+    """Return whether a persisted scan error would render as visible text."""
+    if isinstance(error, dict):
+        return bool(
+            _safe_code_block(error.get("message", ""))
+            or _safe_code_block(error.get("details", ""))
+        )
+    return bool(_safe_code_block(error)) if error is not None else False
+
+
 def _render_error(error):
     """Render a persisted scan error safely for markdown output."""
     if error is None:
@@ -842,6 +856,35 @@ def _load_json_file(path, *, what, missing_ok=False):
         sys.exit(1)
 
 
+def _findings_file_size_ok(path, *, what):
+    """True when `path` is small enough to ingest.
+
+    A missing or unreadable file is left to the JSON loader to report; only an
+    oversized one is rejected here, before it is read into memory.
+    """
+    try:
+        size = Path(path).stat().st_size
+    except OSError:
+        return True
+    if size <= evidence.MAX_FINDINGS_FILE_BYTES:
+        return True
+    LOG.warning(
+        "%s '%s' is %d bytes, over the %d byte limit",
+        what,
+        path,
+        size,
+        evidence.MAX_FINDINGS_FILE_BYTES,
+    )
+    return False
+
+
+def _check_findings_file_size(path, *, what):
+    """Exit when a primary findings input exceeds the ingestion limit."""
+    if not _findings_file_size_ok(path, what=what):
+        LOG.fatal("Refusing to read oversized %s '%s'", what, path)
+        sys.exit(1)
+
+
 class FlakeScanner:
     """Scan and report nix flake target vulnerabilities"""
 
@@ -880,6 +923,7 @@ class FlakeScanner:
         self.baseline = None
         self.scope_targets = []
         self.scanned_targets = []
+        self.completed_scans = set()
         self.eval_flakeref = "."
         self.remote_flake = False
         LOG.info("Scanning '%s'", flakeref)
@@ -920,18 +964,46 @@ class FlakeScanner:
         if not self.project_url:
             self.project_url = self.source_project_url or str(self.flakeref)
 
-    def _normalize_comparison_state(self, state=None):
+    def _normalize_comparison_state(self, state=None, *, unreadable_is_skip=False):
+        """Return a canonical comparison state.
+
+        `unreadable_is_skip` is for untrusted input. This state is what tells a
+        report whether a comparison ran at all, so falling back to the enabled
+        defaults when it cannot be read would diff against a scan that may
+        never have happened and call every finding fixed. An unreadable state
+        therefore skips the comparison instead of enabling it, which keeps a
+        malformed file renderable without letting it make false claims.
+        """
         normalized = self._default_comparison_state()
-        if not isinstance(state, dict):
+        if state is None and not unreadable_is_skip:
             return normalized
+        unreadable = _COMPARISON_STATE_UNREADABLE
+        if not isinstance(state, dict):
+            if not unreadable_is_skip:
+                return normalized
+            return {
+                pintype: {"show": False, "skip_reason": unreadable}
+                for pintype in normalized
+            }
         for pintype in normalized:
             info = state.get(pintype)
-            if not isinstance(info, dict):
+            if not isinstance(info, dict) or (
+                unreadable_is_skip and not isinstance(info.get("show"), bool)
+            ):
+                if unreadable_is_skip:
+                    normalized[pintype] = {"show": False, "skip_reason": unreadable}
                 continue
-            normalized[pintype]["show"] = bool(info.get("show"))
-            normalized[pintype]["skip_reason"] = str(
-                info.get("skip_reason", "")
-            ).strip()
+            show = bool(info.get("show"))
+            reason = str(info.get("skip_reason", "")).strip()
+            if show and reason:
+                # A shown comparison that also states why it was skipped
+                # contradicts itself. The summary believes the reason while
+                # the diff believes `show`, so it reports findings as fixed by
+                # a comparison it simultaneously says did not run. Resolve to
+                # the safe half.
+                show = False
+            normalized[pintype]["show"] = show
+            normalized[pintype]["skip_reason"] = reason
         return normalized
 
     def _comparison_info(self, pintype):
@@ -1035,11 +1107,34 @@ class FlakeScanner:
         must never evaluate the flake. The findings file is untrusted
         input written by the untrusted `scan` phase, so it is read fresh here
         and never merged into pre-existing state.
+
+        Raises `evidence.EvidenceError` for a findings schema this release
+        cannot read. Callers decide whether that is fatal (a primary
+        `--findings` input) or merely ignorable (an optional baseline).
         """
         self = cls.__new__(cls)
+        findings_schema_version = data.get(
+            "schema_version", evidence.LEGACY_FINDINGS_SCHEMA_VERSION
+        )
+        (
+            self.evidence_findings,
+            self.component_evidence,
+            self.evidence_included,
+        ) = evidence.read_findings_evidence(data)
         rows = data.get("scan_rows", [])
         self.df_scan = _normalize_scan_df(pd.DataFrame(rows))
-        self.scanned_targets = [tuple(t) for t in data.get("scanned_targets", [])]
+        self.scanned_targets = _validated_target_pairs(
+            data.get("scanned_targets", []), "scanned_targets"
+        )
+        completed_scans_included = (
+            findings_schema_version == evidence.FINDINGS_SCHEMA_VERSION
+            and "completed_scans" in data
+        )
+        self.completed_scans = (
+            _validated_scan_keys(data["completed_scans"], "completed_scans")
+            if completed_scans_included
+            else set()
+        )
         self.errors = data.get("errors", {})
         self.repo_head = data.get("repo_head", "")
         self.flakeref = data.get("flakeref", "")
@@ -1055,47 +1150,291 @@ class FlakeScanner:
         self.run_context = _normalize_run_context(data.get("run_context"))
         self.verbosity = 1
         self.baseline = None
+        # Derived, not trusted: it is a canonicalization of `scanned_targets`,
+        # so recomputing it costs nothing and removes a second manifest that
+        # baseline matching would otherwise believe over the real one.
         self.scope_targets = [
-            tuple(t)
-            for t in data.get(
-                "scope_targets",
-                [
-                    [_canonical_scope_flakeref(flakeref), target]
-                    for flakeref, target in self.scanned_targets
-                ],
-            )
+            (self._scope_target_flakeref(flakeref), target)
+            for flakeref, target in self.scanned_targets
         ]
         self.comparison_state = self._normalize_comparison_state(
-            data.get("comparison_state")
+            data.get("comparison_state"), unreadable_is_skip=True
         )
         self.tmpdir = Path(tempfile.mkdtemp())
         LOG.debug("Using tmpdir: %s", self.tmpdir)
+        rows = _normalize_scan_df(self.df_scan).to_dict(orient="records")
+        reachable = self._reachable_scan_targets(rows)
+        self._validate_scan_keys_are_reachable(rows, reachable)
+        self._validate_error_keys(rows, reachable)
+        if not completed_scans_included:
+            if findings_schema_version == evidence.FINDINGS_SCHEMA_VERSION:
+                LOG.warning(
+                    "Findings schema v2 is missing completed_scans; inferring "
+                    "successful scans from rows and evidence"
+                )
+            self.completed_scans = self._completed_scan_key_set(rows)
+        self._validate_completed_scans(rows, reachable, completed_scans_included)
+        self._check_evidence_covers_scan_rows()
         return self
 
     @classmethod
     def from_findings(cls, findings):
         """Build a report-only scanner from a `scan`-materialized findings file."""
+        _check_findings_file_size(findings, what="findings file")
         data = _load_json_file(findings, what="findings file")
         if not isinstance(data, dict):
             LOG.fatal("Invalid findings file '%s':\nexpected a JSON object", findings)
             sys.exit(1)
-        return cls.from_findings_data(data)
+        try:
+            return cls.from_findings_data(data)
+        except evidence.EvidenceError as error:
+            LOG.fatal("Invalid findings file '%s':\n%s", findings, error)
+            sys.exit(1)
 
-    def write_findings(self, findings):
-        """Materialize the scanned findings to `findings` (json) for `report`."""
+    def _check_evidence_covers_scan_rows(self):
+        """Require complete evidence whenever the file claims to carry it.
+
+        `evidence_included` is a promise that every aggregate row rendered from
+        `scan_rows` can be explained. An incomplete file would silently render
+        some findings with evidence and others without.
+        """
+        if not self.evidence_included:
+            if self.evidence_findings or self.component_evidence:
+                raise evidence.EvidenceError(
+                    "evidence_included is false but evidence arrays are not empty"
+                )
+            return
+        expected = {}
+        active_ids = {}
+        for finding in self.evidence_findings:
+            key = evidence.scan_key(finding)
+            active_ids.setdefault(key, set())
+            if finding.get(evidence.SUPPRESSED, False):
+                continue
+            active_ids[key].add(str(finding[evidence.FINDING_ID]))
+            expected[(key, str(finding[evidence.FINDING_ID]))] = _expected_evidence_row(
+                finding
+            )
+        row_ids = {}
+        # Reconcile the rows that are kept, not a canonicalized copy of them.
+        # `_normalized_scan_rows` recomputes `scope_flakeref` from `flakeref`,
+        # so validating that copy accepted rows whose stored scope no longer
+        # matched any target, and the report then silently rendered nothing.
+        for row in _normalize_scan_df(self.df_scan).to_dict(orient="records"):
+            finding_id = str(row.get("finding_id", ""))
+            if not finding_id:
+                raise evidence.EvidenceError(
+                    "scan row is missing a finding_id but evidence_included is true"
+                )
+            key = evidence.scan_key(row)
+            row_ids.setdefault(key, set()).add(finding_id)
+            # Matching IDs are not enough: the row is what gets rendered and
+            # enriched, so its own fields have to say what the evidence says.
+            expected_row = expected.get((key, finding_id))
+            if expected_row is not None:
+                mismatch = _evidence_row_mismatch(row, expected_row)
+                if mismatch:
+                    raise evidence.EvidenceError(mismatch)
+        for key in set(row_ids) | set(active_ids):
+            if row_ids.get(key, set()) != active_ids.get(key, set()):
+                raise evidence.EvidenceError(
+                    f"evidence findings do not cover the scan rows of {list(key)}"
+                )
+
+    def _reachable_scan_targets(self, rows):
+        """Return `(scope_flakeref, target)` pairs the report can reach."""
+        targets = {
+            (self._scope_target_flakeref(flakeref), str(target))
+            for flakeref, target in self.scanned_targets
+        }
+        targets |= {
+            (str(row.get("scope_flakeref", "")), str(row.get("target", "")))
+            for row in rows
+        }
+        return targets
+
+    def _scan_result_keys(self, rows):
+        """Return scan keys that have persisted row or evidence results."""
+        keys = {evidence.scan_key(row) for row in rows}
+        keys |= {evidence.scan_key(row) for row in self.evidence_findings}
+        keys |= {evidence.scan_key(row) for row in self.component_evidence}
+        return keys
+
+    def _validate_reachable_scan_key(self, key, reachable, what):
+        """Require `key` to name a pin and target the report can render."""
+        scope, target, pintype = key
+        self._require_renderable_pintype(pintype)
+        if (scope, target) not in reachable:
+            raise evidence.EvidenceError(
+                f"{what} names unscanned target {[scope, target]}, "
+                "which is not among the scanned targets"
+            )
+
+    def _validate_scan_keys_are_reachable(self, rows, reachable):
+        """Require every stored scan key to name a target the report renders.
+
+        Rows and evidence agreeing with each other is not enough. Both are
+        selected by `(scope_flakeref, target)`, so a key whose scope does not
+        follow from its own `flakeref`, or whose target was never scanned,
+        describes findings no report section can reach. That renders as a clean
+        scan rather than as the missing data it is, and it hides suppressed
+        findings outright, since those have no scan rows to fall out of step.
+        """
+        for row in rows + list(self.evidence_findings) + list(self.component_evidence):
+            flakeref = str(row.get("flakeref", ""))
+            scope = str(row.get("scope_flakeref", ""))
+            expected_scope = self._scope_target_flakeref(flakeref)
+            if scope != expected_scope:
+                raise evidence.EvidenceError(
+                    f"scope_flakeref '{scope}' does not follow from flakeref "
+                    f"'{flakeref}', which resolves to '{expected_scope}'"
+                )
+            # Scan rows authorize themselves here, since they are part of
+            # `reachable`; the check bites for evidence rows, which must name a
+            # target that the manifest or some row already puts on the report.
+            self._validate_reachable_scan_key(
+                evidence.scan_key(row), reachable, "scan row/evidence"
+            )
+
+    def _require_renderable_pintype(self, pintype):
+        """Require a pin state the report actually renders a section for.
+
+        A known enum is not enough. A comparison whose `show` is false has its
+        section removed from the report, so rows parked there are unreachable:
+        the current table honestly reports nothing while the findings sit in a
+        section nobody renders.
+        """
+        if pintype not in evidence.PINTYPES:
+            raise evidence.EvidenceError(f"unknown pintype '{pintype}'")
+        disabled = pintype != PIN_CURRENT and not self._comparison_enabled(pintype)
+        # The unstable section has an additional template-level gate, separate
+        # from comparison_state. Both must agree that the pin is renderable.
+        disabled = disabled or (pintype == PIN_NIX_UNSTABLE and not self.unstable_ref)
+        if disabled:
+            raise evidence.EvidenceError(
+                f"pintype '{pintype}' is a disabled comparison in this scan, "
+                "so nothing would render it"
+            )
+
+    def _validate_completed_scans(self, rows, reachable, require_complete):
+        """Require successful scan markers to agree with persisted results.
+
+        A scan that succeeds with zero findings has no rows and, in compact
+        output, no evidence. The explicit marker is what distinguishes that from
+        a scan state that simply never happened.
+        """
+        for key in self.completed_scans:
+            self._validate_reachable_scan_key(key, reachable, "completed scan")
+        missing = self._scan_result_keys(rows) - self.completed_scans
+        if missing:
+            key = sorted(missing)[0]
+            raise evidence.EvidenceError(
+                f"scan results for {list(key)} are missing a completed scan marker"
+            )
+        if not require_complete:
+            return
+        expected_pintypes = [PIN_CURRENT]
+        if self._comparison_enabled(PIN_LOCK_UPDATED):
+            expected_pintypes.append(PIN_LOCK_UPDATED)
+        if self._comparison_enabled(PIN_NIX_UNSTABLE):
+            expected_pintypes.append(PIN_NIX_UNSTABLE)
+        for flakeref, target in self._report_target_pairs():
+            scope = self._scope_target_flakeref(flakeref)
+            for pintype in expected_pintypes:
+                key = (scope, target, pintype)
+                if key in self.completed_scans or self._read_error(
+                    flakeref, target, [pintype]
+                ):
+                    continue
+                raise evidence.EvidenceError(
+                    f"scan state {list(key)} has neither results nor an error"
+                )
+
+    def _validate_error_keys(self, rows, reachable):
+        """Require recorded scan failures to name reachable, result-free keys.
+
+        A failure and a result for the same scan state are mutually exclusive:
+        `_read_error` short-circuits every section for that key, so an injected
+        error blanks tables that still hold rows. Failures are also selected by
+        the same `(scope, target, pintype)` key as everything else, so one that
+        names an unscanned target can never be surfaced.
+
+        Keys are rebuilt in `_error_key` form as they are validated. `json`
+        accepts any equivalent spelling, but `_read_error` looks up one exact
+        serialization, so a compact key would validate and then never be found,
+        rendering a failed scan as a clean one.
+        """
+        with_results = set(self.completed_scans) | self._scan_result_keys(rows)
+        if not isinstance(self.errors, dict):
+            raise evidence.EvidenceError("scan errors must be a JSON object")
+        canonical = {}
+        for raw_key, message in self.errors.items():
+            try:
+                decoded = json.loads(raw_key)
+            except (TypeError, ValueError) as error:
+                raise evidence.EvidenceError(
+                    f"malformed scan error key {raw_key!r}"
+                ) from error
+            if (
+                not isinstance(decoded, list)
+                or len(decoded) != 3
+                or not all(isinstance(part, str) for part in decoded)
+            ):
+                raise evidence.EvidenceError(f"malformed scan error key {raw_key!r}")
+            scope, target, pintype = decoded
+            key = (scope, target, pintype)
+            self._validate_reachable_scan_key(key, reachable, "scan error")
+            if key in with_results:
+                raise evidence.EvidenceError(
+                    f"scan error for {list(key)} contradicts its own results"
+                )
+            if not _renderable_error_payload(message):
+                # A failure whose payload renders to nothing is indistinguishable
+                # from no failure at all: `_read_error` returns something falsy
+                # or empty, the section renders clean, and the run counts as a
+                # success that may overwrite the last good baseline.
+                raise evidence.EvidenceError(
+                    f"scan error for {list(key)} has no renderable message"
+                )
+            error_key = self._error_key(scope, target, pintype)
+            if error_key in canonical:
+                raise evidence.EvidenceError(f"duplicate scan error for {list(key)}")
+            canonical[error_key] = message
+        self.errors = canonical
+
+    def write_findings(self, findings, *, compact=False):
+        """Materialize the scanned findings to `findings` (json) for `report`.
+
+        `compact` drops the evidence arrays. It is used for the rolling
+        previous-run baseline, whose comparisons consume only `scan_rows`, so
+        that the cache does not accumulate full component evidence.
+        """
         findings = Path(findings)
         findings.parent.mkdir(parents=True, exist_ok=True)
-        data = self._findings_data()
+        data = self._findings_data(compact=compact)
         tmp = findings.with_name(f".{findings.name}.tmp")
         tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
         tmp.replace(findings)
         LOG.info("Wrote: %s", findings)
 
-    def _findings_data(self):
+    def _findings_data(self, *, compact=False):
         """Return the persisted findings payload for this scanner state."""
         normalized_scan_rows = _normalize_scan_df(self.df_scan)
+        scan_rows = self._normalized_scan_rows(normalized_scan_rows).to_dict(
+            orient="records"
+        )
         self.generated_at = self.generated_at or _utc_now_iso()
+        evidence_included = bool(self.evidence_included) and not compact
         return {
+            "schema_version": evidence.FINDINGS_SCHEMA_VERSION,
+            "vulnxscan_evidence_schema_version": (
+                evidence.VULNXSCAN_EVIDENCE_SCHEMA_VERSION
+            ),
+            "evidence_included": evidence_included,
+            "evidence_findings": list(self.evidence_findings) if not compact else [],
+            "component_evidence": (
+                list(self.component_evidence) if not compact else []
+            ),
             "flakeref": str(self.flakeref),
             "scope_flakeref": self.scope_flakeref,
             "input_name": self.input_name,
@@ -1107,22 +1446,56 @@ class FlakeScanner:
             "input_locked_rev": self.input_locked_rev,
             "run_context": self.run_context,
             "scanned_targets": [list(t) for t in self.scanned_targets],
+            "completed_scans": [
+                list(key) for key in sorted(self._completed_scan_key_set(scan_rows))
+            ],
             "scope_targets": [
                 [self._scope_target_flakeref(flakeref), target]
                 for flakeref, target in self.scanned_targets
             ],
             "errors": self.errors,
             "comparison_state": self.comparison_state,
-            "scan_rows": self._normalized_scan_rows(normalized_scan_rows).to_dict(
-                orient="records"
-            ),
+            "scan_rows": scan_rows,
         }
 
+    def _report_target_pairs(self):
+        """Return the `(flakeref, target)` pairs the report actually renders.
+
+        The recorded manifest and the targets the scan rows name, deduplicated.
+        Anything keyed off targets has to use this union or it disagrees with
+        what the reader sees: a target introduced only by rows still gets its
+        sections rendered.
+        """
+        df_targets = self._report_targets_df()
+        return list(
+            dict.fromkeys(
+                zip(df_targets["flakeref"], df_targets["target"], strict=True)
+            )
+        )
+
+    def _completed_scan_key_set(self, rows):
+        """Return successful scan keys, including keys implied by result rows."""
+        completed = set(getattr(self, "completed_scans", []))
+        completed |= {evidence.scan_key(row) for row in rows}
+        completed |= {evidence.scan_key(row) for row in self.evidence_findings}
+        completed |= {evidence.scan_key(row) for row in self.component_evidence}
+        completed |= {
+            (self._scope_target_flakeref(flakeref), str(target), PIN_CURRENT)
+            for flakeref, target in self.scanned_targets
+            if self._read_error(flakeref, target, [PIN_CURRENT]) is None
+        }
+        return completed
+
     def has_current_scan_failures(self):
-        """True when any target failed on the baseline `current` scan."""
+        """True when any target failed on the baseline `current` scan.
+
+        Uses the rendered target union, not just the manifest: otherwise a
+        failure on a row-only target is invisible here and a failed run counts
+        as good enough to overwrite the last usable baseline.
+        """
         return any(
             self._read_error(flakeref, target, [PIN_CURRENT]) is not None
-            for flakeref, target in dict.fromkeys(self.scanned_targets)
+            for flakeref, target in self._report_target_pairs()
         )
 
     def _scope_target_flakeref(self, flakeref):
@@ -1204,7 +1577,7 @@ class FlakeScanner:
         """
         findings = []
         df = _normalize_scan_df(self.df_scan)
-        for flakeref, target in dict.fromkeys(self.scanned_targets):
+        for flakeref, target in self._report_target_pairs():
             if self._read_error(flakeref, target, [PIN_CURRENT]):
                 continue  # current scan failed: no actionable baseline
             if df.empty:
@@ -1863,9 +2236,14 @@ class FlakeScanner:
         if baseline_err:
             return _render_error(baseline_err)
         if not self._comparison_enabled(right_pin):
+            # Short-circuit on any disabled comparison, with or without a
+            # stated reason. Falling through diffs the current findings
+            # against a scan that never ran, which renders every one of them
+            # as fixed by an update nobody performed.
             reason = self._comparison_skip_reason(right_pin)
-            if reason:
-                return _safe_markdown_text(reason)
+            return _safe_markdown_text(
+                reason or f"Comparison against {right_pin} was not run"
+            )
         if left_pin == PIN_LOCK_UPDATED and not self._comparison_enabled(
             PIN_LOCK_UPDATED
         ):
@@ -2231,6 +2609,11 @@ class FlakeScanner:
         }
         self.evidence_findings.extend(evidence.annotate(findings, **annotation))
         self.component_evidence.extend(evidence.annotate(components, **annotation))
+        self._record_completed_scan(target, pintype)
+
+    def _record_completed_scan(self, target, pintype):
+        """Remember a successful scan state, even when it found no rows."""
+        self.completed_scans.add((self.scope_flakeref, str(target), str(pintype)))
 
     def _read_triage_rows(self, target, pintype, out_triage, findings):
         """Return the triage rows that match the accepted evidence findings.
@@ -2479,19 +2862,6 @@ def _load_optional_json_file(path, *, what):
     return data
 
 
-def _write_baseline_copy(source, dest):
-    """Atomically replace `dest` with a copy of `source`."""
-    source = Path(source)
-    dest = Path(dest)
-    try:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        tmp = dest.with_name(f".{dest.name}.tmp")
-        shutil.copy2(source, tmp)
-        tmp.replace(dest)
-    except OSError as error:
-        LOG.warning("Could not update previous-run baseline '%s': %s", dest, error)
-
-
 def _local_outdir_marker_path(outdir):
     """Return the hidden ownership marker path for a local outdir."""
     return Path(outdir) / LOCAL_OUTDIR_MARKER
@@ -2638,41 +3008,124 @@ def _wants_submodules(flakeref):
     return any(part == "submodules=1" for part in query.split("&"))
 
 
+def _validated_target_pairs(value, what):
+    """Return `value` as a list of unique `(flakeref, target)` string pairs.
+
+    The manifest decides which targets a report renders and which scan keys
+    are reachable, so a malformed one has to fail as an `EvidenceError` the
+    caller already handles, not as an unpacking `ValueError` from deep inside
+    validation.
+    """
+    if not isinstance(value, list):
+        raise evidence.EvidenceError(f"{what} must be a JSON array")
+    pairs = []
+    seen = set()
+    for entry in value:
+        if (
+            not isinstance(entry, list)
+            or len(entry) != 2
+            or not all(isinstance(part, str) for part in entry)
+        ):
+            raise evidence.EvidenceError(
+                f"{what} entries must be [flakeref, target] string pairs"
+            )
+        pair = (entry[0], entry[1])
+        if pair in seen:
+            raise evidence.EvidenceError(f"{what} repeats {list(pair)}")
+        seen.add(pair)
+        pairs.append(pair)
+    return pairs
+
+
+def _validated_scan_keys(value, what):
+    """Return `value` as unique `(scope_flakeref, target, pintype)` keys."""
+    if not isinstance(value, list):
+        raise evidence.EvidenceError(f"{what} must be a JSON array")
+    keys = set()
+    for entry in value:
+        if (
+            not isinstance(entry, list)
+            or len(entry) != 3
+            or not all(isinstance(part, str) for part in entry)
+        ):
+            raise evidence.EvidenceError(
+                f"{what} entries must be [scope_flakeref, target, pintype] "
+                "string triples"
+            )
+        key = (entry[0], entry[1], entry[2])
+        if key in keys:
+            raise evidence.EvidenceError(f"{what} repeats {list(key)}")
+        keys.add(key)
+    return keys
+
+
+def _deduplicated_targets(targets):
+    """Return `targets` without repeats, preserving the given order.
+
+    Scanning a target twice appends the same annotated evidence twice, which
+    `write_findings` emits happily and the report loader then rejects as
+    duplicate evidence. Repeats reach here from repeated CLI arguments or a
+    duplicated line in the action's `targets` input, so they are dropped before
+    the expensive scans rather than failing after them.
+    """
+    seen = set()
+    unique = []
+    for target in targets:
+        if target in seen:
+            LOG.warning("Ignoring repeated target '%s'", target)
+            continue
+        seen.add(target)
+        unique.append(target)
+    return unique
+
+
+def _expected_evidence_row(finding):
+    """Return the aggregate-row fields `finding` implies."""
+    return {
+        "vuln_id": finding["vuln_id"],
+        "package": finding["package"],
+        "version_local": finding["version"],
+        "severity": finding["severity"],
+        "url": finding["url"],
+        "sortcol": finding["sortcol"],
+        "evidence_scope": finding[evidence.EVIDENCE_SCOPE],
+        "patch_state": finding[evidence.PATCH_STATE],
+        **{field: finding[field] for field in evidence.COUNT_FIELDS},
+    }
+
+
+def _evidence_row_mismatch(row, expected_row):
+    """Return why one row disagrees with its finding, or empty on success."""
+    finding_id = str(row.get(evidence.FINDING_ID, ""))
+    for column, expected_value in expected_row.items():
+        actual = str(row.get(column, ""))
+        expected_text = str(expected_value)
+        if actual != expected_text:
+            return (
+                f"finding_id '{finding_id}' has {column}={actual!r}, "
+                f"evidence has {expected_text!r}"
+            )
+    return ""
+
+
 def _triage_evidence_mismatch(df, findings):
     """Return why triage rows disagree with evidence, or empty on success."""
     missing = [column for column in TRIAGE_EVIDENCE_COLUMNS if column not in df.columns]
     if missing:
         return f"missing evidence column(s): {', '.join(missing)}"
 
-    expected = {}
-    for finding in findings:
-        if finding.get(evidence.SUPPRESSED, False):
-            continue
-        expected[str(finding[evidence.FINDING_ID])] = {
-            "vuln_id": finding["vuln_id"],
-            "package": finding["package"],
-            "version_local": finding["version"],
-            "severity": finding["severity"],
-            "url": finding["url"],
-            "sortcol": finding["sortcol"],
-            "evidence_scope": finding[evidence.EVIDENCE_SCOPE],
-            "patch_state": finding[evidence.PATCH_STATE],
-            **{field: finding[field] for field in evidence.COUNT_FIELDS},
-        }
-
+    expected = {
+        str(finding[evidence.FINDING_ID]): _expected_evidence_row(finding)
+        for finding in findings
+        if not finding.get(evidence.SUPPRESSED, False)
+    }
     for row in df.to_dict(orient="records"):
-        finding_id = str(row.get(evidence.FINDING_ID, ""))
-        expected_row = expected.get(finding_id)
+        expected_row = expected.get(str(row.get(evidence.FINDING_ID, "")))
         if expected_row is None:
             continue
-        for column, expected_value in expected_row.items():
-            actual = str(row.get(column, ""))
-            expected_text = str(expected_value)
-            if actual != expected_text:
-                return (
-                    f"finding_id '{finding_id}' has {column}={actual!r}, "
-                    f"evidence has {expected_text!r}"
-                )
+        mismatch = _evidence_row_mismatch(row, expected_row)
+        if mismatch:
+            return mismatch
     return ""
 
 
@@ -2795,13 +3248,23 @@ def _cmd_scan(args):
 
 
 def _load_baseline_reporter(path):
-    """Best-effort loader for an optional previous-run findings baseline."""
+    """Best-effort loader for an optional previous-run findings baseline.
+
+    An unusable baseline is only a lost comparison, never a reason to fail the
+    report, so an oversized or incompatible one is warned about and dropped.
+    """
     if path is None:
+        return None
+    if not _findings_file_size_ok(path, what="baseline findings"):
         return None
     data = _load_optional_json_file(path, what="baseline findings")
     if data is None:
         return None
-    return FlakeScanner.from_findings_data(data)
+    try:
+        return FlakeScanner.from_findings_data(data)
+    except evidence.EvidenceError as error:
+        LOG.warning("Ignoring invalid baseline findings '%s': %s", path, error)
+        return None
 
 
 def _update_next_baseline(current_findings, next_baseline):
@@ -2809,10 +3272,7 @@ def _update_next_baseline(current_findings, next_baseline):
     if next_baseline is None:
         return
     current = FlakeScanner.from_findings(current_findings)
-    if current.has_current_scan_failures():
-        LOG.info("Skipping previous-run baseline update: current scan had failures")
-        return
-    _write_baseline_copy(current_findings, next_baseline)
+    _update_next_baseline_reporter(current, next_baseline)
 
 
 def _update_next_baseline_reporter(reporter, next_baseline):
@@ -2823,7 +3283,9 @@ def _update_next_baseline_reporter(reporter, next_baseline):
         LOG.info("Skipping previous-run baseline update: current scan had failures")
         return
     try:
-        reporter.write_findings(next_baseline)
+        # The rolling cache baseline only ever feeds aggregate `scan_rows`
+        # comparisons, so it is written without the evidence arrays.
+        reporter.write_findings(next_baseline, compact=True)
     except OSError as error:
         LOG.warning(
             "Could not update previous-run baseline '%s': %s", next_baseline, error
@@ -2878,6 +3340,7 @@ def _run_scan(  # noqa: PLR0913
         excluded_paths=excluded_paths,
     )
     whitelist = _usable_whitelist_path(whitelist)
+    targets = _deduplicated_targets(targets)
     for target in targets:
         scanner.scan_target(target, whitelist=whitelist)
     scanner.write_findings(findings)

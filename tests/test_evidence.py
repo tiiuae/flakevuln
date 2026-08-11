@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for vulnxscan component-evidence validation and scan ingestion."""
+"""Tests for vulnxscan component-evidence validation, scans, and storage."""
 
 import json
 
@@ -8,9 +8,15 @@ import testutils as tu
 
 from flakevuln import evidence
 from flakevuln import main as flakevuln_main
-from flakevuln.main import PIN_CURRENT, PIN_LOCK_UPDATED, PIN_NIX_UNSTABLE
+from flakevuln.main import (
+    PIN_CURRENT,
+    PIN_LOCK_UPDATED,
+    PIN_NIX_UNSTABLE,
+    FlakeScanner,
+)
 
 TARGET = "packages.x86_64-linux.default"
+COMPONENT_EVIDENCE_HEADING = "Component Evidence"
 
 
 def _run_scan(monkeypatch, tmp_path, *, pintype=PIN_CURRENT, scanner=None, **fake):
@@ -26,6 +32,20 @@ def _run_scan(monkeypatch, tmp_path, *, pintype=PIN_CURRENT, scanner=None, **fak
         flakevuln_main, "exec_cmd", tu.fake_vulnxscan(**fake), raising=True
     )
     scanner._read_scan_results(["vulnxscan"], TARGET, pintype)
+    return scanner
+
+
+def _scanner_with(monkeypatch, tmp_path, findings, components, triage_rows):
+    """Return a scanner that completed one current scan with given evidence."""
+    scanner = _run_scan(
+        monkeypatch,
+        tmp_path,
+        document=tu.evidence_document(findings, components),
+        triage_rows=triage_rows,
+    )
+    scanner._set_comparison_skipped(
+        PIN_LOCK_UPDATED, "test fixture scanned only the current pin"
+    )
     return scanner
 
 
@@ -555,3 +575,505 @@ def test_evidence_is_annotated_per_scan_state(monkeypatch, tmp_path):
     assert {row["flakeref"] for row in scanner.evidence_findings} == {scanner.flakeref}
     # The same finding_id recurs in every scan state, so it cannot be the key.
     assert len({row["finding_id"] for row in scanner.evidence_findings}) == 1
+
+
+# --- persistence -----------------------------------------------------------
+
+
+def test_version_2_findings_round_trip(monkeypatch, tmp_path):
+    """Evidence survives write/read with its JSON arrays intact."""
+    finding, components = tu.mixed_finding()
+    scanner = _scanner_with(
+        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+    )
+    findings_file = tmp_path / "findings.json"
+    scanner.write_findings(findings_file)
+
+    data = json.loads(findings_file.read_text(encoding="utf-8"))
+    assert data["schema_version"] == evidence.FINDINGS_SCHEMA_VERSION
+    assert data["vulnxscan_evidence_schema_version"] == 1
+    assert data["evidence_included"] is True
+    assert data["completed_scans"] == [[scanner.scope_flakeref, TARGET, PIN_CURRENT]]
+
+    reloaded = FlakeScanner.from_findings(findings_file)
+    assert reloaded.evidence_included is True
+    assert reloaded.completed_scans == {(scanner.scope_flakeref, TARGET, PIN_CURRENT)}
+    assert len(reloaded.evidence_findings) == 1
+    assert len(reloaded.component_evidence) == 2
+    assert reloaded.component_evidence[0]["output_paths"] == ["/nix/store/bbb-pkg-1.0"]
+    assert reloaded.component_evidence[0]["identity_sources"] == [
+        "scanner_component_ref"
+    ]
+
+
+def test_legacy_findings_load_and_render_as_before(tmp_path):
+    """A version-1 file has no schema_version and no evidence at all."""
+    scanner = tu.make_scanner(tmp_path, flakeref="flake")
+    scanner.scanned_targets = [("flake", TARGET)]
+    findings_file = tmp_path / "findings.json"
+    scanner.write_findings(findings_file)
+    data = json.loads(findings_file.read_text(encoding="utf-8"))
+    del data["schema_version"]
+    del data["evidence_included"]
+    del data["evidence_findings"]
+    del data["component_evidence"]
+    findings_file.write_text(json.dumps(data), encoding="utf-8")
+
+    reloaded = FlakeScanner.from_findings(findings_file)
+    assert reloaded.evidence_included is False
+    assert reloaded.evidence_findings == []
+    outdir = tmp_path / "report"
+    reloaded.report(outdir)
+    report = (outdir / f"{TARGET}.md").read_text(encoding="utf-8")
+    assert COMPONENT_EVIDENCE_HEADING not in report
+    assert "patch_evidence" not in report
+    assert COMPONENT_EVIDENCE_HEADING not in reloaded.render_detailed_summary()
+
+
+def _findings_payload(monkeypatch, tmp_path):
+    """Return a written v2 findings payload with one active finding."""
+    finding, components = tu.mixed_finding()
+    scanner = _scanner_with(
+        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+    )
+    path = tmp_path / "findings.json"
+    scanner.write_findings(path)
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+EVIDENCE_GROUPS = ("scan_rows", "evidence_findings", "component_evidence")
+
+
+def _set_field(data, field, value, groups=EVIDENCE_GROUPS):
+    for group in groups:
+        for row in data[group]:
+            row[field] = value
+
+
+def _error_key(data, *, target=None, pintype=None):
+    """Return a canonical error key for the first scan row's scan state."""
+    row = data["scan_rows"][0]
+    return json.dumps(
+        [
+            row["scope_flakeref"],
+            row["target"] if target is None else target,
+            row["pintype"] if pintype is None else pintype,
+        ]
+    )
+
+
+def _park_on_unstable(data, *, show):
+    _set_field(data, "pintype", PIN_NIX_UNSTABLE)
+    data["comparison_state"] = {
+        PIN_LOCK_UPDATED: {"show": True, "skip_reason": ""},
+        PIN_NIX_UNSTABLE: {"show": show, "skip_reason": "no unstable ref"},
+    }
+
+
+def _record_lock_updated_error(data, payload):
+    data["comparison_state"][PIN_LOCK_UPDATED] = {"show": True, "skip_reason": ""}
+    data["errors"] = {_error_key(data, pintype=PIN_LOCK_UPDATED): payload}
+
+
+# Every way a findings file can pass one validation layer and still describe
+# findings the report cannot show. The scan phase is untrusted, so each of
+# these has to fail loudly instead of rendering as a clean scan.
+@pytest.mark.parametrize(
+    ("mutate", "match"),
+    [
+        # The scan key must follow from the row's own flakeref.
+        (
+            lambda d: _set_field(d, "scope_flakeref", "wrong-scope", ("scan_rows",)),
+            "does not follow from flakeref",
+        ),
+        # Pin states that no report section renders.
+        (lambda d: _set_field(d, "pintype", "telepathy"), "unknown pintype"),
+        (lambda d: _park_on_unstable(d, show=False), "disabled comparison"),
+        # A row sharing an evidence finding's ID but not its fields.
+        (
+            lambda d: d["scan_rows"][0].update(package="not-the-package"),
+            "evidence has",
+        ),
+        # Recorded failures: a failure and results for one key are mutually
+        # exclusive, the key must name a reachable target, be the canonical
+        # three-string array, and carry a message that renders.
+        (
+            lambda d: d.update(errors={_error_key(d): "boom"}),
+            "contradicts its own results",
+        ),
+        (
+            lambda d: d.update(errors={_error_key(d, target="ghost-target"): "boom"}),
+            "unscanned target",
+        ),
+        (
+            lambda d: d.update(
+                errors={json.dumps(dict.fromkeys(json.loads(_error_key(d)), 0)): "boom"}
+            ),
+            "malformed scan error key",
+        ),
+        (
+            lambda d: _record_lock_updated_error(
+                d, {"message": "\x00\x01", "details": ""}
+            ),
+            "no renderable message",
+        ),
+        # The target manifest decides which keys are reachable at all.
+        (lambda d: d.update(scanned_targets="notalist"), "must be a JSON array"),
+        (lambda d: d.update(scanned_targets=[["only-one"]]), "string pairs"),
+        (
+            lambda d: d.update(scanned_targets=[["a", "t"], ["a", "t"]]),
+            "repeats",
+        ),
+        (
+            lambda d: d.update(completed_scans=[["only", "two"]]),
+            "string triples",
+        ),
+    ],
+)
+def test_tampered_findings_file_is_rejected(monkeypatch, tmp_path, mutate, match):
+    data = _findings_payload(monkeypatch, tmp_path)
+    mutate(data)
+
+    with pytest.raises(evidence.EvidenceError, match=match):
+        FlakeScanner.from_findings_data(data)
+
+
+def test_evidence_for_an_unscanned_target_is_rejected(monkeypatch, tmp_path):
+    """Suppressed findings have no scan rows, so nothing else catches this.
+
+    Moving one to a target that was never scanned leaves the row/evidence
+    reconciliation satisfied, because both sides hold nothing for that key,
+    and the finding simply vanishes from the patched-findings section.
+    """
+    suppressed, suppressed_component = tu.matched_finding("CVE-2026-9999")
+    active, active_components = tu.mixed_finding("CVE-2026-1")
+    scanner = _scanner_with(
+        monkeypatch,
+        tmp_path,
+        [suppressed, active],
+        [suppressed_component, *active_components],
+        [tu.triage_row(active)],
+    )
+    path = tmp_path / "findings.json"
+    scanner.write_findings(path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    for row in data["evidence_findings"] + data["component_evidence"]:
+        if row["finding_id"] == suppressed["finding_id"]:
+            row["target"] = "ghost-target"
+
+    with pytest.raises(evidence.EvidenceError, match="not among the scanned targets"):
+        FlakeScanner.from_findings_data(data)
+
+
+def test_compact_findings_still_get_their_keys_validated(monkeypatch, tmp_path):
+    """Key validation cannot hang off `evidence_included`.
+
+    A compact file has scan rows and no evidence to reconcile them against, so
+    skipping validation left its rows selectable by nobody.
+    """
+    data = _findings_payload(monkeypatch, tmp_path)
+    data["evidence_included"] = False
+    data["evidence_findings"] = []
+    data["component_evidence"] = []
+    compact = json.loads(json.dumps(data))
+    FlakeScanner.from_findings_data(compact)  # a clean compact file still loads
+
+    data["scan_rows"][0]["pintype"] = "telepathy"
+    with pytest.raises(evidence.EvidenceError, match="unknown pintype"):
+        FlakeScanner.from_findings_data(data)
+
+
+def test_v2_without_completed_scans_loads_by_inference(monkeypatch, tmp_path, caplog):
+    """Older v2 artifacts predate the explicit success manifest."""
+    data = _findings_payload(monkeypatch, tmp_path)
+    del data["completed_scans"]
+
+    scanner = FlakeScanner.from_findings_data(data)
+
+    assert scanner.completed_scans == {(scanner.scope_flakeref, TARGET, PIN_CURRENT)}
+    assert "missing completed_scans" in caplog.text
+
+
+def test_enabled_comparison_requires_success_or_failure_record(monkeypatch, tmp_path):
+    """An omitted comparison must not render every current finding as fixed."""
+    data = _findings_payload(monkeypatch, tmp_path)
+    data["comparison_state"][PIN_LOCK_UPDATED] = {"show": True, "skip_reason": ""}
+
+    with pytest.raises(evidence.EvidenceError, match="neither results nor an error"):
+        FlakeScanner.from_findings_data(data)
+
+
+def test_completed_empty_comparison_can_report_fixed(monkeypatch, tmp_path):
+    """A successful zero-finding comparison is distinct from a missing one."""
+    data = _findings_payload(monkeypatch, tmp_path)
+    row = data["scan_rows"][0]
+    data["comparison_state"][PIN_LOCK_UPDATED] = {"show": True, "skip_reason": ""}
+    data["completed_scans"].append(
+        [row["scope_flakeref"], row["target"], PIN_LOCK_UPDATED]
+    )
+
+    scanner = FlakeScanner.from_findings_data(data)
+    section = scanner._diff_section(
+        scanner._target_df(scanner.flakeref, TARGET, active_only=True),
+        scanner.flakeref,
+        TARGET,
+        PIN_CURRENT,
+        PIN_LOCK_UPDATED,
+    )
+
+    assert row["vuln_id"] in section
+
+
+def test_scan_error_keys_are_canonicalized_on_load(monkeypatch, tmp_path):
+    """`_read_error` looks up one exact spelling of the key.
+
+    `json` accepts any equivalent serialization, so a compact key validated
+    fine and was then never found, rendering a failed scan as a clean one.
+    """
+    data = _findings_payload(monkeypatch, tmp_path)
+    row = data["scan_rows"][0]
+    scope, target = row["scope_flakeref"], row["target"]
+    data["scan_rows"] = []
+    data["evidence_findings"] = []
+    data["component_evidence"] = []
+    data["evidence_included"] = False
+    del data["completed_scans"]
+    compact = json.dumps([scope, target, PIN_CURRENT], separators=(",", ":"))
+    data["errors"] = {compact: "current scan failed"}
+
+    scanner = FlakeScanner.from_findings_data(data)
+
+    assert compact not in scanner.errors
+    assert scanner._read_error(scanner.flakeref, target, [PIN_CURRENT]) == (
+        "current scan failed"
+    )
+
+
+def test_disabled_comparison_never_reports_findings_as_fixed(monkeypatch, tmp_path):
+    """A comparison that did not run cannot say anything was fixed.
+
+    The skip only used to apply when a reason string was present, so a
+    disabled comparison with an empty reason fell through and diffed the
+    current findings against a scan that never happened.
+    """
+    finding, components = tu.mixed_finding()
+    scanner = _scanner_with(
+        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+    )
+    scanner.comparison_state = {
+        PIN_LOCK_UPDATED: {"show": False, "skip_reason": ""},
+        PIN_NIX_UNSTABLE: {"show": False, "skip_reason": ""},
+    }
+
+    section = scanner._diff_section(
+        scanner._target_df(scanner.flakeref, TARGET, active_only=True),
+        scanner.flakeref,
+        TARGET,
+        PIN_CURRENT,
+        PIN_LOCK_UPDATED,
+    )
+
+    assert finding["vuln_id"] not in section
+    assert "was not run" in section
+
+
+def test_shown_comparison_that_states_a_skip_reason_is_disabled(monkeypatch, tmp_path):
+    """`show` and a skip reason contradict; resolve to the safe half.
+
+    The summary believed the reason while the diff believed `show`, so the
+    report claimed findings were fixed by a comparison it also said did not
+    run.
+    """
+    finding, components = tu.mixed_finding()
+    scanner = _scanner_with(
+        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+    )
+    scanner.comparison_state = scanner._normalize_comparison_state(
+        {
+            PIN_LOCK_UPDATED: {"show": True, "skip_reason": "comparison did not run"},
+            PIN_NIX_UNSTABLE: {"show": False, "skip_reason": "off"},
+        }
+    )
+
+    assert scanner._comparison_enabled(PIN_LOCK_UPDATED) is False
+    section = scanner._diff_section(
+        scanner._target_df(scanner.flakeref, TARGET, active_only=True),
+        scanner.flakeref,
+        TARGET,
+        PIN_CURRENT,
+        PIN_LOCK_UPDATED,
+    )
+    assert finding["vuln_id"] not in section
+
+
+def test_failure_on_a_row_only_target_counts_as_a_failure(monkeypatch, tmp_path):
+    """Failure detection must use the same target union the report renders.
+
+    A row-only target renders its sections, so a current-scan failure there
+    has to block the baseline update like any other.
+    """
+    finding, components = tu.mixed_finding()
+    scanner = tu.make_scanner(tmp_path)
+    scanner.evidence_included = True
+    scanner.scanned_targets = [(scanner.flakeref, TARGET)]
+    # The current scan failed, so only the comparison pin produced rows; those
+    # rows are the only thing naming the target once the manifest is dropped.
+    _run_scan(
+        monkeypatch,
+        tmp_path,
+        scanner=scanner,
+        pintype=PIN_LOCK_UPDATED,
+        document=tu.evidence_document([finding], components),
+        triage_rows=[tu.triage_row(finding)],
+    )
+    path = tmp_path / "findings.json"
+    scanner.write_findings(path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    scope = data["scan_rows"][0]["scope_flakeref"]
+    target = data["scan_rows"][0]["target"]
+    data["scanned_targets"] = []
+    data["completed_scans"] = [
+        key for key in data["completed_scans"] if key[2] != PIN_CURRENT
+    ]
+    data["errors"] = {
+        json.dumps([scope, target, PIN_CURRENT]): {"message": "boom", "details": ""}
+    }
+
+    scanner = FlakeScanner.from_findings_data(data)
+
+    assert scanner._read_error(scanner.flakeref, target, [PIN_CURRENT]) is not None
+    assert scanner.has_current_scan_failures() is True
+
+
+def test_row_only_target_contributes_actionable_findings(monkeypatch, tmp_path):
+    """Actionable enrichment must cover every target the report renders."""
+    data = _findings_payload(monkeypatch, tmp_path)
+    data["scanned_targets"] = []
+
+    scanner = FlakeScanner.from_findings_data(data)
+
+    actionable = scanner.compute_actionable()
+    assert [(row["target"], row["vuln_id"]) for row in actionable] == [
+        (data["scan_rows"][0]["target"], data["scan_rows"][0]["vuln_id"])
+    ]
+
+
+def test_repeated_targets_are_scanned_once(monkeypatch, tmp_path, caplog):
+    """Duplicate evidence would be written and then rejected on reload."""
+    with caplog.at_level("WARNING"):
+        unique = flakevuln_main._deduplicated_targets([TARGET, "other", TARGET])
+
+    assert unique == [TARGET, "other"]
+    assert "repeated target" in caplog.text
+
+
+def test_unsupported_findings_schema_is_never_a_clean_scan(tmp_path, caplog):
+    """A future findings file must fail loudly, not read as zero findings."""
+    findings_file = tmp_path / "findings.json"
+    findings_file.write_text(
+        json.dumps({"schema_version": 99, "scan_rows": []}), encoding="utf-8"
+    )
+    with pytest.raises(SystemExit) as excinfo:
+        FlakeScanner.from_findings(findings_file)
+    assert excinfo.value.code == 1
+    assert "unsupported findings schema version 99" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "vulnxscan_evidence_schema_version",
+        "evidence_included",
+        "evidence_findings",
+        "component_evidence",
+    ],
+)
+def test_version_2_findings_requires_evidence_metadata(field):
+    """Schema v2 findings cannot silently degrade to aggregate-only data."""
+    data = {
+        "schema_version": evidence.FINDINGS_SCHEMA_VERSION,
+        "vulnxscan_evidence_schema_version": evidence.VULNXSCAN_EVIDENCE_SCHEMA_VERSION,
+        "evidence_included": False,
+        "evidence_findings": [],
+        "component_evidence": [],
+        "scan_rows": [],
+    }
+    del data[field]
+    with pytest.raises(evidence.EvidenceError, match=field):
+        FlakeScanner.from_findings_data(data)
+
+
+def test_oversized_primary_findings_file_is_fatal(monkeypatch, tmp_path):
+    findings_file = tmp_path / "findings.json"
+    findings_file.write_text(json.dumps({"scan_rows": []}), encoding="utf-8")
+    monkeypatch.setattr(evidence, "MAX_FINDINGS_FILE_BYTES", 2)
+    with pytest.raises(SystemExit):
+        FlakeScanner.from_findings(findings_file)
+
+
+def test_incompatible_baseline_is_ignored_with_a_warning(tmp_path, caplog):
+    """An unusable baseline only costs a comparison; it never fails a report."""
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(
+        json.dumps({"schema_version": 99, "scan_rows": []}), encoding="utf-8"
+    )
+    assert flakevuln_main._load_baseline_reporter(baseline) is None
+    assert "Ignoring invalid baseline findings" in caplog.text
+
+
+def test_oversized_baseline_is_ignored_with_a_warning(monkeypatch, tmp_path, caplog):
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(json.dumps({"scan_rows": []}), encoding="utf-8")
+    monkeypatch.setattr(evidence, "MAX_FINDINGS_FILE_BYTES", 2)
+    assert flakevuln_main._load_baseline_reporter(baseline) is None
+    assert "over the 2 byte limit" in caplog.text
+
+
+def test_evidence_included_requires_complete_evidence(monkeypatch, tmp_path):
+    """A row without evidence contradicts the file's own completeness claim."""
+    finding = tu.evidence_finding()
+    component = tu.evidence_component(finding)
+    scanner = _scanner_with(
+        monkeypatch, tmp_path, [finding], [component], [tu.triage_row(finding)]
+    )
+    data = scanner._findings_data()
+    data["evidence_findings"] = []
+    data["component_evidence"] = []
+    with pytest.raises(evidence.EvidenceError, match="do not cover"):
+        FlakeScanner.from_findings_data(data)
+
+
+def test_evidence_included_false_requires_empty_evidence(monkeypatch, tmp_path):
+    finding = tu.evidence_finding()
+    component = tu.evidence_component(finding)
+    scanner = _scanner_with(
+        monkeypatch, tmp_path, [finding], [component], [tu.triage_row(finding)]
+    )
+    data = scanner._findings_data()
+    data["evidence_included"] = False
+    with pytest.raises(evidence.EvidenceError, match="not empty"):
+        FlakeScanner.from_findings_data(data)
+
+
+def test_compact_baseline_omits_evidence_but_keeps_scan_rows(monkeypatch, tmp_path):
+    """The rolling cache stays aggregate-only and remains renderable."""
+    finding, components = tu.mixed_finding()
+    scanner = _scanner_with(
+        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+    )
+    published = tmp_path / "findings.json"
+    baseline = tmp_path / "cache" / "findings.json"
+    scanner.write_findings(published)
+    flakevuln_main._update_next_baseline_reporter(scanner, baseline)
+
+    cached = json.loads(baseline.read_text(encoding="utf-8"))
+    assert cached["schema_version"] == evidence.FINDINGS_SCHEMA_VERSION
+    assert cached["evidence_included"] is False
+    assert cached["evidence_findings"] == []
+    assert cached["component_evidence"] == []
+    assert cached["scan_rows"][0]["vuln_id"] == finding["vuln_id"]
+    assert json.loads(published.read_text(encoding="utf-8"))["evidence_findings"]
+
+    reloaded = flakevuln_main._load_baseline_reporter(baseline)
+    assert reloaded is not None
+    assert reloaded.evidence_findings == []
