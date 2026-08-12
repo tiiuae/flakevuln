@@ -150,6 +150,25 @@ fresh state for the next run. It persists:
   `nixtracker` lookups
 - the previous-run findings baseline used for "since last run" sections
 
+After cache restore and before the target scan, the action runs a best-effort
+`vulnix` preflight against a small `nixpkgs#hello` derivation when existing
+cache state is present. A cold cache skips the preflight and is initialized by
+the target scan, avoiding a duplicate database download. The preflight requires
+parseable JSON so a bad restored DB is noticed early. If existing `vulnix`
+cache files fail for a non-timeout reason, the action removes only
+`~/.cache/vulnix/Data.fs*` and `~/.cache/vulnix/lock`, then retries once.
+The original files are staged with same-filesystem hard links and restored if
+the clean-cache retry fails. A later invocation also restores a staged cache
+left behind by abrupt termination. Setup failures, timeouts, and retry failures
+warn and continue so the target scan can still refresh and save a usable cache.
+
+Advanced callers can tune the preflight with environment variables:
+
+- `VULNIX_PREFLIGHT_TIMEOUT_SECONDS` for existing cache state, defaulting to
+  the recovery timeout
+- `VULNIX_PREFLIGHT_RECOVERY_TIMEOUT_SECONDS` after resetting invalid cache
+  state, default `900`
+
 ## Local usage
 
 ### Prerequisites

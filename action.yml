@@ -158,6 +158,23 @@ runs:
         restore-keys: |
           ${{ steps.cache-meta.outputs.baseline_prefix }}
 
+    # Confirm a restored vulnix DB can produce parseable JSON before the
+    # expensive target scan. If it is unusable, reset only the vulnix cache
+    # files and retry once. The preflight is always non-fatal; a cold cache is
+    # left for the target scan to initialize.
+    - name: Vulnix DB preflight
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        FLAKEVULN_BIN: ${{ steps.build.outputs.bin }}
+      run: |
+        set -euo pipefail
+        if ! bash "$ACTION_PATH/scripts/preflight-vulnix-cache.sh" \
+          "$FLAKEVULN_BIN" \
+          "$ACTION_PATH"; then
+          echo "vulnix DB preflight failed unexpectedly; continuing to the target scan" >&2
+        fi
+
     # Best-effort grype DB warm-up using the action's locked nixpkgs.
     - name: Grype DB update
       shell: bash

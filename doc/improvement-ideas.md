@@ -9,6 +9,10 @@ Short list of follow-up work.
   cache-backed previous-run baseline.
 - Add a shared cache for `--nixprs` enrichment if many repos start hitting
   GitHub API rate limits.
+- Consider an action-level `vulnix` mirror input after `sbomnix` can pass the
+  same mirror through its target scan. The preflight and scan must use one data
+  source, and the persisted cache key should include that source, rather than a
+  preflight-only override mixing mirror data with the scan's default NVD data.
 - Make `nix_unstable` and `upstream` version strings in report tables link to
   the relevant upstream repo or file when that source URL is available.
 - Consider broader flake coverage for repos that do not declare a re-lockable
