@@ -2900,7 +2900,7 @@ def test_evaluate_target_drv_passes_override_input(monkeypatch, tmp_path):
         return subprocess.CompletedProcess(
             args=cmd,
             returncode=0,
-            stdout=json.dumps({"/nix/store/abc.drv": {}}),
+            stdout=json.dumps({"/nix/store/abc.drv": {"system": "x86_64-linux"}}),
             stderr="",
         )
 
@@ -2919,6 +2919,7 @@ def test_evaluate_target_drv_passes_override_input(monkeypatch, tmp_path):
     assert cmd[idx + 1 : idx + 3] == ["nixpkgs", "github:NixOS/nixpkgs/nixos-unstable"]
     assert captured["cwd"] == scanner.repodir
     assert drv == Path("/nix/store/abc.drv")
+    assert scanner._target_system == "x86_64-linux"
 
 
 def test_evaluate_target_drv_no_override_by_default(monkeypatch, tmp_path):

@@ -49,6 +49,7 @@ EMPTY_SCAN_COLUMNS = [
     "nixpkgs_pr",
     "nixpkgs_issue",
     "nixpkgs_issue_status",
+    "flake_input",
     # vulnxscan patch-evidence aggregates. Empty for legacy findings written
     # before the evidence contract, which still render exactly as before. An
     # empty scan frame carries them too, so a clean scan with no triage rows is
@@ -108,6 +109,20 @@ _PARTIAL_PATCH_MARKER = "(*)"
 # Comment endings that already separate the marker from what precedes it.
 _MARKER_SEPARATORS = (",", ";", ":", ".", "!", "?")
 
+_FLAKE_INPUT_COLUMN = "flake_input"
+_INPUT_CONFIDENCE_EXACT = "exact"
+_INPUT_CONFIDENCE_CANDIDATE = "candidate"
+_INPUT_CONFIDENCE_AMBIGUOUS = "ambiguous"
+_INPUT_CONFIDENCE_UNKNOWN = "unknown"
+_FLAKE_INPUT_UNRESOLVED = "(unresolved)"
+_INPUT_CONFIDENCE_ORDER = (
+    _INPUT_CONFIDENCE_EXACT,
+    _INPUT_CONFIDENCE_CANDIDATE,
+    _INPUT_CONFIDENCE_AMBIGUOUS,
+    _INPUT_CONFIDENCE_UNKNOWN,
+)
+_FLAKE_INPUT_PACKAGE_CHUNK_SIZE = 256
+
 # Sentinel meaning "remove this variable from the child env".
 DROP_ENV_VAR = object()
 
@@ -161,8 +176,8 @@ def _normalize_nix_store_path(path, store_dir="/nix/store"):
     return str(Path(store_dir) / text)
 
 
-def _parse_nix_derivation_show_path(stdout):
-    """Return the first derivation path from `nix derivation show` JSON."""
+def _parse_nix_derivation_show(stdout):
+    """Return the first derivation path and its attributes from Nix JSON."""
     try:
         payload = json.loads(stdout)
     except json.JSONDecodeError as error:
@@ -176,12 +191,15 @@ def _parse_nix_derivation_show_path(stdout):
     derivations = payload.get("derivations", payload)
     if not isinstance(derivations, dict):
         raise ValueError("`nix derivation show` returned a non-object `derivations`")
-    for drv_path in derivations:
+    for drv_path, attributes in derivations.items():
         if not isinstance(drv_path, str) or not drv_path.strip():
             raise ValueError(
                 "`nix derivation show` returned a non-string derivation path"
             )
-        return Path(_normalize_nix_store_path(drv_path))
+        return (
+            Path(_normalize_nix_store_path(drv_path)),
+            attributes if isinstance(attributes, dict) else {},
+        )
     raise ValueError("`nix derivation show` returned no derivation paths")
 
 
@@ -2503,6 +2521,9 @@ class FlakeScanner:
                     "patch_evidence": _PATCH_EVIDENCE_LABELS.get(
                         state, _bounded_scalar(state)
                     ),
+                    "input": _format_flake_input_cell(
+                        _aggregate_flake_inputs([component])
+                    ),
                     "drv_path": _bounded_code(component["drv_path"]),
                     "matching_patch_paths": patches,
                 }
@@ -2673,6 +2694,9 @@ class FlakeScanner:
             df[ver_rename] = df["version_upstream"].str.slice(0, 16)
         # Add the 'comment' column
         df["comment"] = df.apply(_reformat_comment, axis=1)
+        if _FLAKE_INPUT_COLUMN in df.columns:
+            df["input"] = df[_FLAKE_INPUT_COLUMN].map(_format_flake_input_cell)
+            report_cols.append("input")
         report_cols.append("comment")
         # Convert vuln_id to a hyperlink
         df["vuln_id"] = df.apply(_reformat_vuln_id, axis=1)
@@ -2767,7 +2791,7 @@ class FlakeScanner:
             }
             return None
         try:
-            drv_path = _parse_nix_derivation_show_path(ret.stdout)
+            drv_path, attributes = _parse_nix_derivation_show(ret.stdout)
         except ValueError as error:
             LOG.warning(
                 "Error parsing `nix derivation show` for %s: %s", eval_target, error
@@ -2785,6 +2809,7 @@ class FlakeScanner:
                 "details": details,
             }
             return None
+        self._target_system = str(attributes.get("system", "")).strip()
         LOG.info("Target '%s' evaluates to derivation: %s", target, drv_path)
         return drv_path
 
@@ -2815,6 +2840,253 @@ class FlakeScanner:
         diffstr = filediff(str(self.lockfile_bak), str(self.lockfile))
         if diffstr:
             LOG.info("Updated lockfile:\n%s", diffstr)
+
+    def _annotate_flake_inputs(self, components, df, override=None):
+        """Add best-effort flake input matches to component and scan rows."""
+        components = [
+            {
+                field: value
+                for field, value in component.items()
+                if field not in evidence.COMPONENT_FLAKE_INPUT_FIELDS
+            }
+            for component in components
+        ]
+        if not components:
+            return components, df
+        system = getattr(self, "_target_system", "")
+        package_names = sorted(
+            {
+                str(component.get("pname", ""))
+                for component in components
+                if component.get("drv_path") and component.get("pname")
+            }
+        )
+        exact = {}
+        version_matches = {}
+        if system and package_names:
+            exact, version_matches = self._nixpkgs_input_matches(
+                system, package_names, override=override
+            )
+        by_finding = {}
+        enriched = []
+        for component in components:
+            pname = str(component.get("pname", ""))
+            exact_matches = exact.get((pname, str(component.get("drv_path", ""))), [])
+            candidates = exact_matches or version_matches.get(
+                (pname, str(component.get("version", ""))), []
+            )
+            annotated = dict(component)
+            if candidates:
+                paths = list(dict.fromkeys(row["input_path"] for row in candidates))
+                confidence = (
+                    _INPUT_CONFIDENCE_AMBIGUOUS
+                    if len(paths) > 1
+                    else (
+                        _INPUT_CONFIDENCE_EXACT
+                        if exact_matches
+                        else _INPUT_CONFIDENCE_CANDIDATE
+                    )
+                )
+                annotated.update(
+                    {
+                        "flake_input_paths": paths,
+                        "flake_input_locked_revs": [
+                            row["locked_rev"] for row in candidates
+                        ],
+                        "flake_input_confidence": confidence,
+                    }
+                )
+            enriched.append(annotated)
+            by_finding.setdefault(str(component.get("finding_id", "")), []).append(
+                annotated
+            )
+
+        if df is not None and not df.empty and "finding_id" in df.columns:
+            df = df.copy()
+            df[_FLAKE_INPUT_COLUMN] = df["finding_id"].map(
+                lambda finding_id: _aggregate_flake_inputs(
+                    by_finding.get(str(finding_id), [])
+                )
+            )
+        return enriched, df
+
+    def _nixpkgs_input_matches(self, system, package_names, *, override=None):
+        """Return candidate nixpkgs input matches keyed by package drv/version."""
+        exact = {}
+        version_matches = {}
+        for candidate in self._nixpkgs_input_candidates(override=override):
+            packages = self._eval_nixpkgs_candidate_packages(
+                candidate, system, package_names
+            )
+            for package, info in packages.items():
+                drv_path = str(info.get("drv_path", "")).strip()
+                version = str(info.get("version", "")).strip()
+                if drv_path:
+                    exact.setdefault((package, drv_path), []).append(candidate)
+                if version:
+                    version_matches.setdefault((package, version), []).append(candidate)
+        return exact, version_matches
+
+    def _eval_nixpkgs_candidate_packages(self, candidate, system, package_names):
+        """Evaluate package drv paths for one nixpkgs input in bounded chunks."""
+        package_names = tuple(str(name) for name in package_names if name)
+        cache = getattr(self, "_flake_input_eval_cache", {})
+        self._flake_input_eval_cache = cache
+        cache_key = (candidate["flake_ref"], system, package_names)
+        if cache_key in cache:
+            return cache[cache_key]
+        result = {}
+        for offset in range(0, len(package_names), _FLAKE_INPUT_PACKAGE_CHUNK_SIZE):
+            arguments = json.dumps(
+                {
+                    "flake_ref": candidate["flake_ref"],
+                    "system": system,
+                    "names": package_names[
+                        offset : offset + _FLAKE_INPUT_PACKAGE_CHUNK_SIZE
+                    ],
+                },
+                separators=(",", ":"),
+            )
+            arguments = json.dumps(arguments).replace("${", r"\${")
+            expr = f"""
+let
+  args = builtins.fromJSON {arguments};
+  flake = builtins.getFlake args.flake_ref;
+  pkgs = builtins.getAttr args.system flake.legacyPackages;
+  empty = {{ drv_path = ""; version = ""; }};
+  get = name:
+    if builtins.hasAttr name pkgs then
+      let
+        result =
+          let value = builtins.getAttr name pkgs;
+          in if builtins.isAttrs value && value ? drvPath
+             then {{
+               drv_path = value.drvPath;
+               version = value.version or "";
+             }}
+             else empty;
+        checked = builtins.tryEval (builtins.deepSeq result result);
+      in if checked.success then checked.value else empty
+    else empty;
+in builtins.listToAttrs (map (name: {{ inherit name; value = get name; }}) args.names)
+"""
+            try:
+                ret = exec_cmd(
+                    [
+                        "nix",
+                        "eval",
+                        *_nix_verbosity_flags(self.verbosity),
+                        "--json",
+                        "--expr",
+                        expr,
+                    ],
+                    raise_on_error=False,
+                    capture=True,
+                )
+            except OSError as error:
+                LOG.debug(
+                    "Could not launch flake input evaluation for %s: %s",
+                    candidate["input_path"],
+                    error,
+                )
+                continue
+            if ret.returncode != 0:
+                LOG.debug(
+                    "Could not evaluate flake input for %s: %s",
+                    candidate["input_path"],
+                    _tail_text(ret.stderr or ret.stdout),
+                )
+                continue
+            try:
+                data = json.loads(ret.stdout)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, dict):
+                result.update(
+                    {
+                        name: {
+                            "drv_path": str(value.get("drv_path", "")).strip(),
+                            "version": str(value.get("version", "")).strip(),
+                        }
+                        for name, value in data.items()
+                        if isinstance(name, str) and isinstance(value, dict)
+                    }
+                )
+        cache[cache_key] = result
+        return result
+
+    def _nixpkgs_input_candidates(self, *, override=None):
+        """Return reachable nixpkgs input paths from the current lock graph."""
+        data = _load_json_file(self.lockfile, what="flake.lock")
+        entries = _lock_graph_input_entries(data)
+        nodes = data.get("nodes", {}) if isinstance(data, dict) else {}
+        root = data.get("root", "") if isinstance(data, dict) else ""
+        override_node = _resolve_lock_input_path(
+            nodes, root, str(override[0]) if override else ""
+        )
+        override_values = {}
+        if override and override_node:
+            cache = getattr(self, "_override_metadata_cache", {})
+            self._override_metadata_cache = cache
+            metadata = cache.get(str(override[1]))
+            if metadata is None:
+                metadata = self._nix_flake_metadata(
+                    str(override[1]), exit_on_error=False
+                )
+                cache[str(override[1])] = metadata or {}
+            metadata = metadata if isinstance(metadata, dict) else {}
+            override_locked = metadata.get("locked", {})
+            locked_url = str(metadata.get("lockedUrl") or "")
+            if (
+                not locked_url
+                and isinstance(override_locked, dict)
+                and override_locked.get("type") == "github"
+                and override_locked.get("owner")
+                and override_locked.get("repo")
+                and override_locked.get("rev")
+            ):
+                locked_url = "github:{}/{}/{}".format(
+                    override_locked["owner"],
+                    override_locked["repo"],
+                    override_locked["rev"],
+                )
+            override_values = {
+                "lock_node": override_node,
+                "locked_rev": str(
+                    metadata.get("revision")
+                    or (
+                        override_locked.get("rev", "")
+                        if isinstance(override_locked, dict)
+                        else ""
+                    )
+                ).strip(),
+                "flake_ref": locked_url or str(override[1]),
+            }
+        candidates = []
+        for entry in entries:
+            locked = entry["node_data"].get("locked", {})
+            if (
+                not isinstance(locked, dict)
+                or locked.get("type") != "github"
+                or str(locked.get("owner", "")).casefold() != "nixos"
+                or str(locked.get("repo", "")).casefold() != "nixpkgs"
+            ):
+                continue
+            rev = str(locked.get("rev", "")).strip()
+            if not rev:
+                continue
+            candidate = {
+                "input_path": entry["input_path"],
+                "lock_node": entry["lock_node"],
+                "locked_rev": rev,
+                "flake_ref": "github:{}/{}/{}".format(
+                    locked["owner"], locked["repo"], rev
+                ),
+            }
+            if candidate["lock_node"] == override_values.get("lock_node"):
+                candidate.update(override_values)
+            candidates.append(candidate)
+        return candidates
 
     def _scan_output_paths(self, target, pintype):
         """Return fresh, scan-state specific vulnxscan output paths."""
@@ -2874,6 +3146,9 @@ class FlakeScanner:
             )
             return
         df = self._read_triage_rows(target, pintype, out_triage, findings)
+        if df is None:
+            return
+        components, df = self._annotate_flake_inputs(components, df, override=override)
         if df is None:
             return
         if not df.empty:
@@ -3527,6 +3802,113 @@ def _bounded_paths(paths):
     return rendered, omitted
 
 
+def _lock_graph_input_entries(data):
+    """Return one shortest reachable flake input path per lock node."""
+    if not isinstance(data, dict):
+        return []
+    nodes = data.get("nodes", {})
+    root = data.get("root", "")
+    if not isinstance(nodes, dict) or not isinstance(root, str) or root not in nodes:
+        return []
+    entries = []
+    queue = [(root, [])]
+    visited = {root}
+    queue_index = 0
+    while queue_index < len(queue):
+        node_name, path = queue[queue_index]
+        queue_index += 1
+        node = nodes.get(node_name, {})
+        inputs = node.get("inputs", {}) if isinstance(node, dict) else {}
+        if not isinstance(inputs, dict):
+            continue
+        for input_name, ref in sorted(inputs.items()):
+            child = _resolve_lock_input_ref(nodes, root, ref)
+            if not child or child not in nodes or child in visited:
+                continue
+            visited.add(child)
+            next_path = [*path, str(input_name)]
+            entries.append(
+                {
+                    "input_path": "/".join(next_path),
+                    "lock_node": child,
+                    "node_data": nodes[child],
+                }
+            )
+            queue.append((child, next_path))
+    return entries
+
+
+def _resolve_lock_input_ref(nodes, root, ref, *, depth=0):
+    """Resolve a string lock node or `follows` path to a lock node name."""
+    if depth > 20:
+        return ""
+    if isinstance(ref, str):
+        return ref
+    if not isinstance(ref, list):
+        return ""
+    node_name = root
+    for part in ref:
+        node = nodes.get(node_name, {})
+        inputs = node.get("inputs", {}) if isinstance(node, dict) else {}
+        if not isinstance(inputs, dict):
+            return ""
+        node_name = _resolve_lock_input_ref(
+            nodes, root, inputs.get(part), depth=depth + 1
+        )
+        if not node_name:
+            return ""
+    return node_name
+
+
+def _resolve_lock_input_path(nodes, root, input_path):
+    """Resolve a slash-separated flake input path to its lock node."""
+    node_name = root
+    for part in str(input_path).split("/"):
+        node = nodes.get(node_name, {})
+        inputs = node.get("inputs", {}) if isinstance(node, dict) else {}
+        if not part or not isinstance(inputs, dict):
+            return ""
+        node_name = _resolve_lock_input_ref(nodes, root, inputs.get(part))
+        if node_name not in nodes:
+            return ""
+    return node_name
+
+
+def _aggregate_flake_inputs(components):
+    paths = []
+    confidences = []
+    for component in components:
+        component_paths = component.get("flake_input_paths", [])
+        if not component_paths:
+            confidences.append(_INPUT_CONFIDENCE_UNKNOWN)
+            continue
+        confidence = component.get("flake_input_confidence", _INPUT_CONFIDENCE_UNKNOWN)
+        confidences.append(
+            confidence
+            if confidence in _INPUT_CONFIDENCE_ORDER
+            else _INPUT_CONFIDENCE_UNKNOWN
+        )
+        for path in component_paths:
+            if path not in paths:
+                paths.append(path)
+    if not paths:
+        return ""
+    confidence = max(
+        confidences,
+        key=_INPUT_CONFIDENCE_ORDER.index,
+        default=_INPUT_CONFIDENCE_UNKNOWN,
+    )
+    if len(paths) > 1 and confidence in (
+        _INPUT_CONFIDENCE_EXACT,
+        _INPUT_CONFIDENCE_CANDIDATE,
+    ):
+        confidence = _INPUT_CONFIDENCE_AMBIGUOUS
+    text = ", ".join(str(path) for path in paths)
+    if confidence != _INPUT_CONFIDENCE_EXACT:
+        text = f"{text} ({confidence})"
+    return text
+
+
 def _reformat_vuln_id(row):
     if not row.vuln_id:
         return ""
@@ -3582,6 +3964,49 @@ def _reformat_nixtracker(row):
             )
         )
     return _append_enrichment_links(comment, links)
+
+
+def _format_flake_input_cell(value):
+    value = str(value).strip()
+    if not value or value == _INPUT_CONFIDENCE_UNKNOWN:
+        return _FLAKE_INPUT_UNRESOLVED
+    confidence = next(
+        (
+            candidate
+            for candidate in _INPUT_CONFIDENCE_ORDER[1:]
+            if value.endswith(f" ({candidate})")
+        ),
+        "",
+    )
+    if confidence:
+        value = value[: -len(confidence) - 3]
+    paths = [path.strip() for path in value.split(",") if path.strip()]
+    if not paths:
+        return _FLAKE_INPUT_UNRESOLVED
+    rendered = []
+    for path in paths[: evidence.MAX_RENDERED_PATHS]:
+        display_path = re.sub(r"@[0-9A-Fa-f]{7,40}$", "", path)
+        if display_path != "nixpkgs" and display_path.endswith("/nixpkgs"):
+            display_path = display_path[: -len("/nixpkgs")]
+        rendered.append(_bounded_scalar(display_path))
+    omitted = len(paths) - len(rendered)
+    if omitted:
+        rendered.append(
+            f"({omitted} more {_plural(omitted, 'input', 'inputs')} not shown)"
+        )
+    text = "<br>".join(rendered)
+    if confidence:
+        if confidence == _INPUT_CONFIDENCE_AMBIGUOUS and len(paths) > 1:
+            return text
+        confidence = (
+            _FLAKE_INPUT_UNRESOLVED
+            if confidence == _INPUT_CONFIDENCE_UNKNOWN
+            else f"({confidence})"
+        )
+        if len(paths) > 1:
+            return f"{text}<br>{confidence}"
+        return f"{text} {confidence}"
+    return text
 
 
 def _append_partial_patch_marker(row, marks):

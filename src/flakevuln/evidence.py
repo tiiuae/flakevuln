@@ -113,6 +113,18 @@ _COMPONENT_STR_LIST_FIELDS = (
     "patches",
     "matching_patch_paths",
 )
+COMPONENT_FLAKE_INPUT_LIST_FIELDS = (
+    "flake_input_paths",
+    "flake_input_locked_revs",
+)
+COMPONENT_FLAKE_INPUT_FIELDS = (
+    *COMPONENT_FLAKE_INPUT_LIST_FIELDS,
+    "flake_input_confidence",
+    # Legacy annotations are no longer emitted, but remain reserved so an
+    # untrusted vulnxscan sidecar cannot smuggle them into persisted evidence.
+    "flake_input_top_levels",
+    "flake_input_lock_nodes",
+)
 
 # Scan-state annotations flakevuln adds to every imported evidence row. A
 # vulnxscan `finding_id` is only unique within one target and pin state, so the
@@ -361,6 +373,11 @@ def _validate_component(component, *, annotated):
     _require_pintype(component, "component evidence", annotated=annotated)
     for field in _COMPONENT_STR_LIST_FIELDS:
         _require_str_list(component, field, "component evidence")
+    for field in COMPONENT_FLAKE_INPUT_LIST_FIELDS:
+        if field in component:
+            _require_str_list(component, field, "component evidence")
+    if "flake_input_confidence" in component:
+        _require_str(component, "flake_input_confidence", "component evidence")
     suppressed = _require_bool(component, SUPPRESSED, "component evidence")
     state = component[PATCH_EVIDENCE_STATE]
     if state not in COMPONENT_STATES:

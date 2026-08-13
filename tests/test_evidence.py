@@ -2,6 +2,7 @@
 """Tests for vulnxscan component-evidence ingestion, storage, and rendering."""
 
 import json
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -107,6 +108,26 @@ def test_unknown_object_fields_are_accepted():
     )
     assert findings[0]["future_field"] == {"nested": [1]}
     assert components[0]["future_field"] == "ignored"
+
+
+def test_optional_component_flake_input_fields_are_validated():
+    """flakevuln annotations are optional, but typed when present."""
+    finding = tu.evidence_finding()
+    component = tu.evidence_component(
+        finding,
+        flake_input_paths=["sbomnix/nixpkgs"],
+        flake_input_locked_revs=["1234567890abcdef"],
+        flake_input_confidence="exact",
+    )
+
+    assert evidence.validate_document(tu.evidence_document([finding], [component])) == (
+        [finding],
+        [component],
+    )
+
+    component["flake_input_paths"] = "sbomnix/nixpkgs"
+    with pytest.raises(evidence.EvidenceError, match="flake_input_paths"):
+        evidence.validate_document(tu.evidence_document([finding], [component]))
 
 
 @pytest.mark.parametrize("field", ["observations", "findings", "components"])
@@ -1117,6 +1138,256 @@ def test_compact_baseline_omits_evidence_but_keeps_scan_rows(monkeypatch, tmp_pa
     assert reloaded.evidence_findings == []
 
 
+def _locked_input(rev, *, owner="NixOS", repo="nixpkgs", inputs=None):
+    node = {"locked": {"type": "github", "owner": owner, "repo": repo, "rev": rev}}
+    if inputs:
+        node["inputs"] = inputs
+    return node
+
+
+def _write_lock(scanner, inputs, nodes):
+    scanner.lockfile.write_text(
+        json.dumps({"root": "root", "nodes": {"root": {"inputs": inputs}, **nodes}}),
+        encoding="utf-8",
+    )
+
+
+def test_flake_input_prefers_exact_nested_nixpkgs_match(monkeypatch, tmp_path):
+    """The top-level input is inferred from the matching nixpkgs drv path."""
+    finding = tu.evidence_finding(package="pkg", version="1.0")
+    component = tu.evidence_component(
+        finding, component_id="/nix/store/vulnerable-pkg-1.0.drv"
+    )
+    scanner = tu.make_scanner(tmp_path)
+    _write_lock(
+        scanner,
+        {"nixpkgs": "nixpkgs", "sbomnix": "sbomnix"},
+        {
+            "nixpkgs": _locked_input("aaaaaaaaaaaaaaaa"),
+            "sbomnix": _locked_input(
+                "bbbbbbbbbbbbbbbb",
+                owner="tiiuae",
+                repo="sbomnix",
+                inputs={"nixpkgs": "nixpkgs_2"},
+            ),
+            "nixpkgs_2": _locked_input("1234567890abcdef"),
+        },
+    )
+    scanner._target_system = "x86_64-linux"
+
+    def fake_eval(candidate, system, package_names):
+        assert system == "x86_64-linux"
+        assert package_names == ["pkg"]
+        if candidate["input_path"] == "sbomnix/nixpkgs":
+            return {
+                "pkg": {
+                    "drv_path": "/nix/store/vulnerable-pkg-1.0.drv",
+                    "version": "1.0",
+                }
+            }
+        return {
+            "pkg": {
+                "drv_path": "/nix/store/root-pkg-1.0.drv",
+                "version": "1.0",
+            }
+        }
+
+    monkeypatch.setattr(scanner, "_eval_nixpkgs_candidate_packages", fake_eval)
+
+    components, rows = scanner._annotate_flake_inputs(
+        [component],
+        pd.DataFrame([tu.triage_row(finding)]),
+    )
+
+    assert components[0]["flake_input_paths"] == ["sbomnix/nixpkgs"]
+    assert components[0]["flake_input_locked_revs"] == ["1234567890abcdef"]
+    assert components[0]["flake_input_confidence"] == "exact"
+    assert rows.loc[0, "flake_input"] == "sbomnix/nixpkgs"
+    table = scanner._df_to_report_tbl(rows, up_ver=False)
+    assert "| input" in table
+    assert "sbomnix" in table
+    assert "sbomnix/nixpkgs" not in table
+    assert "INPUT:" not in table
+    assert "@1234567" not in table
+
+
+def test_flake_input_collapses_follows_aliases(monkeypatch, tmp_path):
+    """A followed nixpkgs node is one input source, not ambiguous aliases."""
+    scanner = tu.make_scanner(tmp_path)
+    _write_lock(
+        scanner,
+        {
+            "nixpkgs": "nixpkgs",
+            "flake-parts": "flake-parts",
+            "git-hooks-nix": "git-hooks-nix",
+        },
+        {
+            "nixpkgs": _locked_input("aaaaaaaaaaaaaaaa"),
+            "flake-parts": {"inputs": {"nixpkgs-lib": ["nixpkgs"]}},
+            "git-hooks-nix": {"inputs": {"nixpkgs": ["nixpkgs"]}},
+        },
+    )
+    metadata_calls = []
+
+    def fake_metadata(*_args, **_kwargs):
+        metadata_calls.append(1)
+        return {
+            "locked": {
+                "type": "github",
+                "owner": "NixOS",
+                "repo": "nixpkgs",
+                "rev": "bbbbbbbbbbbbbbbb",
+            }
+        }
+
+    monkeypatch.setattr(scanner, "_nix_flake_metadata", fake_metadata)
+    override = (
+        "git-hooks-nix/nixpkgs",
+        "github:NixOS/nixpkgs/nixos-unstable",
+    )
+    candidates = scanner._nixpkgs_input_candidates(override=override)
+    scanner._nixpkgs_input_candidates(override=override)
+
+    assert len(candidates) == 1
+    assert metadata_calls == [1]
+    assert candidates[0]["input_path"] == "nixpkgs"
+    assert candidates[0]["locked_rev"] == "bbbbbbbbbbbbbbbb"
+    assert candidates[0]["flake_ref"] == ("github:NixOS/nixpkgs/bbbbbbbbbbbbbbbb")
+
+
+def test_flake_input_strips_untrusted_sidecar_fields(monkeypatch, tmp_path):
+    """The sidecar cannot supply flake inputs when enrichment has no match."""
+    finding = tu.evidence_finding(package="pkg", version="1.0")
+    component = tu.evidence_component(
+        finding,
+        flake_input_paths=["forged/nixpkgs"],
+        flake_input_top_levels=["forged"],
+        flake_input_lock_nodes=["forged-node"],
+        flake_input_locked_revs=["aaaaaaaaaaaaaaaa"],
+        flake_input_confidence="exact",
+    )
+    scanner = tu.make_scanner(tmp_path)
+
+    components, rows = scanner._annotate_flake_inputs(
+        [component],
+        pd.DataFrame([tu.triage_row(finding)]),
+    )
+
+    assert not any(key.startswith("flake_input_") for key in components[0])
+    assert rows.loc[0, "flake_input"] == ""
+    table = scanner._df_to_report_tbl(rows, up_ver=False)
+    assert "(unresolved)" in table
+    assert "forged" not in table
+
+
+def test_flake_input_aggregate_tracks_unresolved_components(monkeypatch, tmp_path):
+    """A partial match should not render as an unqualified exact input."""
+    finding = tu.evidence_finding(package="pkg", version="1.0")
+    matched = tu.evidence_component(
+        finding, component_id="/nix/store/matched-pkg-1.0.drv"
+    )
+    unresolved = tu.evidence_component(
+        finding, component_id="/nix/store/unmatched-pkg-1.0.drv"
+    )
+    scanner = tu.make_scanner(tmp_path)
+    scanner._target_system = "x86_64-linux"
+    monkeypatch.setattr(
+        scanner,
+        "_nixpkgs_input_matches",
+        lambda *_args, **_kwargs: (
+            {
+                ("pkg", "/nix/store/matched-pkg-1.0.drv"): [
+                    {
+                        "input_path": "sbomnix/nixpkgs",
+                        "top_level_input": "sbomnix",
+                        "lock_node": "nixpkgs_2",
+                        "locked_rev": "1234567890abcdef",
+                    }
+                ]
+            },
+            {},
+        ),
+    )
+
+    components, rows = scanner._annotate_flake_inputs(
+        [matched, unresolved],
+        pd.DataFrame([tu.triage_row(finding)]),
+    )
+
+    assert components[0]["flake_input_confidence"] == "exact"
+    assert "flake_input_paths" not in components[1]
+    assert rows.loc[0, "flake_input"] == "sbomnix/nixpkgs (unknown)"
+    table = scanner._df_to_report_tbl(rows, up_ver=False)
+    assert "sbomnix (unresolved)" in table
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("", "(unresolved)"),
+        (
+            "nixpkgs, robot-framework/nixpkgs, sbomnix/nixpkgs (ambiguous)",
+            "nixpkgs<br>robot-framework<br>sbomnix",
+        ),
+    ],
+)
+def test_formats_flake_input_cells(value, expected):
+    assert flakevuln_main._format_flake_input_cell(value) == expected
+
+
+def test_flake_input_column_is_bounded(monkeypatch):
+    """A single flake input cell should obey report presentation limits."""
+    monkeypatch.setattr(evidence, "MAX_RENDERED_PATHS", 2)
+    monkeypatch.setattr(evidence, "MAX_RENDERED_SCALAR_CHARS", 8)
+    value = "abcdefghijklmnopqrstuvwxyz/nixpkgs, second/nixpkgs, third/nixpkgs"
+
+    assert flakevuln_main._format_flake_input_cell(value) == (
+        "abcdefgh<br>second<br>(1 more input not shown)"
+    )
+
+
+def test_flake_input_eval_chunks_package_names(monkeypatch, tmp_path):
+    scanner = tu.make_scanner(tmp_path)
+    candidate = {
+        "flake_ref": "github:NixOS/nixpkgs/aaaaaaaaaaaaaaaa",
+        "input_path": "nixpkgs",
+    }
+    package_names = [
+        f"pkg_{index:024d}"
+        for index in range(flakevuln_main._FLAKE_INPUT_PACKAGE_CHUNK_SIZE * 2 + 1)
+    ]
+    exprs = []
+    expr_lengths = []
+
+    def fake_exec(cmd, **_kwargs):
+        expr = cmd[-1]
+        exprs.append(expr)
+        expr_lengths.append(len(expr.encode("utf-8")))
+        if len(exprs) == 3:
+            raise OSError(7, "Argument list too long")
+        return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(flakevuln_main, "exec_cmd", fake_exec)
+
+    assert (
+        scanner._eval_nixpkgs_candidate_packages(
+            candidate, "x86_64-linux", package_names
+        )
+        == {}
+    )
+    assert (
+        scanner._eval_nixpkgs_candidate_packages(
+            candidate, "x86_64-linux", package_names
+        )
+        == {}
+    )
+    assert len(expr_lengths) == 3
+    assert max(expr_lengths) < 128 * 1024
+    assert all(
+        "builtins.tryEval (builtins.deepSeq result result)" in expr for expr in exprs
+    )
+
+
 # --- rendering -------------------------------------------------------------
 
 
@@ -1286,6 +1557,32 @@ def test_diagnostics_link_the_vulnerability_and_omit_output_paths(
     # The derivation and its matching patch are still there.
     assert "aaa-pkg-1.0.drv" in diagnostics
     assert "ccc-CVE-2026-1.patch" in diagnostics
+
+
+def test_component_diagnostics_include_flake_input(tmp_path):
+    finding, components = tu.mixed_finding()
+    components[0].update(
+        {
+            "flake_input_paths": ["sbomnix/nixpkgs"],
+            "flake_input_locked_revs": ["1234567890abcdef"],
+            "flake_input_confidence": "exact",
+        }
+    )
+    scanner = tu.make_scanner(tmp_path)
+    annotation = {
+        "flakeref": scanner.flakeref,
+        "scope_flakeref": scanner.scope_flakeref,
+        "target": TARGET,
+        "pintype": PIN_CURRENT,
+    }
+    scanner.evidence_findings = evidence.annotate([finding], **annotation)
+    scanner.component_evidence = evidence.annotate(components, **annotation)
+
+    diagnostics = scanner._component_evidence_tbl(scanner.flakeref, TARGET)
+
+    assert "sbomnix" in diagnostics
+    assert "sbomnix/nixpkgs" not in diagnostics
+    assert "1234567" not in diagnostics
 
 
 def test_partially_patched_findings_are_marked_and_linked(monkeypatch, tmp_path):
