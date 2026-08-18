@@ -17,12 +17,10 @@
     };
     sbomnix = {
       url = "github:tiiuae/sbomnix";
-      # NOTE: deliberately *not* following nixpkgs here. sbomnix pins its own
-      # nixpkgs that its Python dependency closure is tested against; forcing it
-      # onto ours rebuilds that closure and can break (e.g. pyrate-limiter).
       inputs = {
         flake-root.follows = "flake-root";
         flake-parts.follows = "flake-parts";
+        nixpkgs.follows = "nixpkgs";
       };
     };
   };
