@@ -299,6 +299,9 @@ def _add_report_parser(subparsers):
 def _add_scope_parser(subparsers):
     """Add a hidden helper parser for baseline scope-path resolution."""
     scope = subparsers.add_parser("scope", help=argparse.SUPPRESS)
+    choices = getattr(subparsers, "_choices_actions", None)
+    if choices is not None:
+        choices[:] = [choice for choice in choices if choice.dest != "scope"]
     scope.add_argument("-f", "--flakeref", required=True)
     scope.add_argument("-t", "--target", required=True, action="extend", nargs="+")
     scope.add_argument("--input-name", default="nixpkgs")

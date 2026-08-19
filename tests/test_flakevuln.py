@@ -46,6 +46,32 @@ def test_flakevuln_help():
     assert subprocess.run(cmd, check=True).returncode == 0
 
 
+def test_top_level_help_hides_scope_helper(capsys):
+    """The hidden baseline helper should not leak into top-level help."""
+    with pytest.raises(SystemExit) as excinfo:
+        flakevuln_main._getargs(["--help"])
+
+    assert excinfo.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "==SUPPRESS==" not in help_text
+    assert "scope" not in help_text
+    assert "scan" in help_text
+    assert "report" in help_text
+    assert "local" in help_text
+
+
+def test_scope_helper_still_parses():
+    """The hidden helper remains available for callers that know it exists."""
+    args = flakevuln_main._getargs(
+        ["scope", "-f", ".", "-t", "pkg-a", "pkg-b", "--input-name", "nixpkgs-alt"]
+    )
+
+    assert args.command == "scope"
+    assert args.flakeref == "."
+    assert args.target == ["pkg-a", "pkg-b"]
+    assert args.input_name == "nixpkgs-alt"
+
+
 def test_exec_cmd_treats_arguments_literally(tmp_path):
     """Arguments with shell metacharacters should not be interpreted."""
     marker = tmp_path / "marker"
