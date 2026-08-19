@@ -1043,6 +1043,54 @@ def test_diff_sections_do_not_treat_whitelisted_comparison_rows_as_fixed(tmp_pat
     assert sections["fixed_unstable"] == "```No vulnerabilities```"
 
 
+def test_current_report_prefers_evaluated_unstable_over_repology(tmp_path):
+    """The `nix_unstable` report column prefers the actual unstable scan."""
+    target = "packages.x86_64-linux.default"
+    scanner = _make_scanner(
+        tmp_path,
+        flakeref="flake",
+        unstable_ref="github:NixOS/nixpkgs/nixos-unstable",
+    )
+    scanner.scanned_targets = [("flake", target)]
+    scanner.df_scan = pd.DataFrame(
+        [
+            _scan_row(
+                target,
+                PIN_CURRENT,
+                "CVE-1",
+                "linux",
+                version_local="6.18.42",
+                version_nixpkgs="7.2",
+            ),
+            _scan_row(
+                target,
+                PIN_LOCK_UPDATED,
+                "CVE-1",
+                "linux",
+                version_local="6.18.44",
+                version_nixpkgs="7.2",
+            ),
+            _scan_row(
+                target,
+                PIN_NIX_UNSTABLE,
+                "CVE-1",
+                "linux",
+                version_local="6.18.44",
+                version_nixpkgs="7.2",
+            ),
+        ]
+    )
+
+    sections = scanner._target_report_sections("flake", target)
+
+    assert "| nix_unstable" in sections["current"]
+    assert "repology_nix_unstable" not in sections["current"]
+    assert "| 6.18.44" in sections["current"]
+    assert "7.2" not in sections["current"]
+    assert sections["fixed_upstream"] == "```No vulnerabilities```"
+    assert sections["fixed_unstable"] == "```No vulnerabilities```"
+
+
 def test_report_table_sorts_by_numeric_severity_rank(tmp_path):
     """Report tables should keep critical findings above lower severities."""
     scanner = _make_scanner(tmp_path, flakeref="flake")
@@ -1156,6 +1204,8 @@ def test_report_table_escapes_untrusted_markdown_cells(tmp_path):
 
     assert "evil \\| injected" in table
     assert "1\\`2" in table
+    assert "nix_unstable" in table
+    assert "repology_nix_unstable" not in table
     assert "2\\[3\\]" in table
     assert "3\\]4 \\*bold\\* \\_it\\_" in table
     assert "\\*bold\\*" in table
@@ -1395,6 +1445,7 @@ def test_report_detailed_summary_includes_report_layout(tmp_path, monkeypatch):
     assert "pkg-whitelisted" in summary_text
     assert "| version_local" in summary_text
     assert "| nix_unstable" in summary_text
+    assert "repology_nix_unstable" not in summary_text
     assert "| upstream" in summary_text
     assert "| pkg" in summary_text
     assert "| high" in summary_text

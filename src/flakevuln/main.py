@@ -1594,6 +1594,26 @@ class FlakeScanner:
             return set()
         return set(zip(sub["vuln_id"], sub["package"], strict=True))
 
+    def _pin_version_map(self, df_target, pintype):
+        """Map (vuln_id, package) to versions seen in one evaluated pin scan."""
+        sub = _normalize_scan_df(df_target)
+        sub = sub[sub["pintype"] == pintype]
+        if sub.empty or not {"vuln_id", "package", "version_local"}.issubset(
+            sub.columns
+        ):
+            return {}
+        versions = {}
+        for vuln_id, package, version in zip(
+            sub["vuln_id"], sub["package"], sub["version_local"], strict=True
+        ):
+            key = (vuln_id, package)
+            if not key[0] or not key[1] or not version:
+                continue
+            versions.setdefault(key, [])
+            if version not in versions[key]:
+                versions[key].append(version)
+        return {key: ", ".join(values) for key, values in versions.items()}
+
     def _aggregate_current(self, df_current):
         """Group current rows by (vuln_id, package), aggregating versions.
 
@@ -2196,6 +2216,13 @@ class FlakeScanner:
         """Render the per-target table sections shared by report and summary."""
         df_target = self._target_df(flakeref, target, active_only=True)
         df_current = df_target[df_target["pintype"] == PIN_CURRENT]
+        unstable_versions = None
+        if self._comparison_enabled(PIN_NIX_UNSTABLE) and not self._read_error(
+            flakeref, target, [PIN_NIX_UNSTABLE]
+        ):
+            unstable_versions = self._pin_version_map(
+                self._target_df(flakeref, target), PIN_NIX_UNSTABLE
+            )
         err = self._read_error(flakeref, target, [PIN_CURRENT])
         return {
             "fixed_upstream": self._diff_section(
@@ -2219,7 +2246,10 @@ class FlakeScanner:
             ),
             "current": _render_error(err)
             or self._df_to_report_tbl(
-                df_current, marks=self._evidence_marks(flakeref, target)
+                df_current,
+                marks=self._evidence_marks(flakeref, target),
+                comparison_versions=unstable_versions,
+                comparison_column=PIN_NIX_UNSTABLE,
             ),
             "whitelisted": self._whitelisted_tbl(flakeref, target),
             "component_evidence": _render_error(err)
@@ -2379,8 +2409,11 @@ class FlakeScanner:
         df_right = self._target_df(flakeref, target)
         df = self._diff_scans(df_target, left_pin, right_pin, df_right)
         err = self._read_error(flakeref, target, [left_pin, right_pin])
-        return _render_error(err) or self._df_to_report_tbl(
-            df, marks=self._evidence_marks(flakeref, target)
+        if err:
+            return _render_error(err)
+        return self._df_to_report_tbl(
+            df,
+            marks=self._evidence_marks(flakeref, target),
         )
 
     def _evidence_anchor(self, flakeref, target):
@@ -2660,7 +2693,14 @@ class FlakeScanner:
         df = df.astype(str)
         return df
 
-    def _df_to_report_tbl(self, df, up_ver=True, marks=None):
+    def _df_to_report_tbl(
+        self,
+        df,
+        up_ver=True,
+        marks=None,
+        comparison_versions=None,
+        comparison_column="",
+    ):
         LOG.debug("")
         if df.empty:
             return "```No vulnerabilities```"
@@ -2684,13 +2724,24 @@ class FlakeScanner:
         # Report table will have the following columns
         report_cols = ["vuln_id", "package", "severity", "version_local"]
         # Optionally add the following upstream versions
+        if up_ver and comparison_versions is not None and comparison_column:
+            report_cols.append(comparison_column)
+            df[comparison_column] = df.apply(
+                lambda row: comparison_versions.get(
+                    (row.get("vuln_id", ""), row.get("package", "")), ""
+                ),
+                axis=1,
+            )
         if up_ver and "version_nixpkgs" in df:
-            # `vulnxscan` provides `version_nixpkgs`; flakevuln renders that
-            # comparison column as `nix_unstable` because it comes from the
-            # `--unstable-ref` scan rather than the caller's pinned channel.
-            ver_rename = "nix_unstable"
-            report_cols.append(ver_rename)
-            df[ver_rename] = df["version_nixpkgs"].str.slice(0, 16)
+            # `vulnxscan --triage` gets this from Repology's `nix_unstable`
+            # repository metadata. Use it only when the evaluated comparison
+            # scan did not provide a row-local version for this finding.
+            ver_rename = PIN_NIX_UNSTABLE
+            if ver_rename not in report_cols:
+                report_cols.append(ver_rename)
+                df[ver_rename] = ""
+            fallback = df["version_nixpkgs"].str.slice(0, 16)
+            df[ver_rename] = df[ver_rename].where(df[ver_rename].ne(""), fallback)
         if up_ver and "version_upstream" in df:
             ver_rename = "upstream"
             report_cols.append(ver_rename)
