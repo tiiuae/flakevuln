@@ -289,6 +289,18 @@ def _add_report_parser(subparsers):
     )
     report.add_argument("--nixprs", help=helps, action="store_true")
     helps = (
+        "Package name to skip during --nixprs PR enrichment. Repeatable. "
+        "Skipped findings remain active in reports."
+    )
+    report.add_argument(
+        "--nixprs-exclude-package",
+        dest="nixprs_exclude_packages",
+        help=helps,
+        action="append",
+        default=[],
+        metavar="PACKAGE",
+    )
+    helps = (
         "Enable best-effort Nixpkgs security tracker enrichment. Runs once on "
         "the current findings set during report rendering, uses the public "
         "tracker API, and is non-fatal."
@@ -373,6 +385,14 @@ def _add_local_parser(subparsers, scan_parser, report_parser):
         "--nixprs",
         help=report_parser._option_string_actions["--nixprs"].help,
         action="store_true",
+    )
+    local.add_argument(
+        "--nixprs-exclude-package",
+        dest="nixprs_exclude_packages",
+        help=report_parser._option_string_actions["--nixprs-exclude-package"].help,
+        action="append",
+        default=[],
+        metavar="PACKAGE",
     )
     local.add_argument(
         "--nixtracker",
@@ -4306,6 +4326,7 @@ def _run_report(  # noqa: PLR0913
     findings,
     outdir=None,
     nixprs_enabled=False,
+    nixprs_exclude_packages=(),
     nixtracker_enabled=False,
     baseline_findings=None,
     update_baseline_findings=None,
@@ -4322,7 +4343,9 @@ def _run_report(  # noqa: PLR0913
     if nixprs_enabled:
         token = os.environ.get("GH_TOKEN", "") if token is None else token
         actionable = reporter.compute_actionable()
-        ok = nixprs.enrich_actionable(actionable, token)
+        ok = nixprs.enrich_actionable(
+            actionable, token, exclude_packages=nixprs_exclude_packages
+        )
         reporter.apply_nixprs(actionable)
         # Keep `report --findings=...` read-only; owned callers can persist the
         # enriched reporter state separately for future baselines or outputs.
@@ -4370,6 +4393,7 @@ def _cmd_report(args):
         findings=args.findings,
         outdir=args.outdir,
         nixprs_enabled=getattr(args, "nixprs", False),
+        nixprs_exclude_packages=getattr(args, "nixprs_exclude_packages", []),
         nixtracker_enabled=getattr(args, "nixtracker", False),
         baseline_findings=getattr(args, "baseline_findings", None),
         update_baseline_findings=getattr(args, "update_baseline_findings", None),
@@ -4441,6 +4465,7 @@ def _cmd_local(args):
             findings=findings,
             outdir=report_dir,
             nixprs_enabled=args.nixprs,
+            nixprs_exclude_packages=getattr(args, "nixprs_exclude_packages", []),
             nixtracker_enabled=getattr(args, "nixtracker", False),
             baseline_findings=baseline_findings,
             update_baseline_findings=None,

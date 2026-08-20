@@ -36,6 +36,30 @@ def test_enrich_annotates_non_whitelisted(monkeypatch):
     assert "nixpkgs_pr" not in findings[1]
 
 
+def test_enrich_skips_excluded_packages():
+    queried = []
+
+    def fake_fetcher(query, token, sleeper):
+        queried.append(query)
+        return ["https://github.com/NixOS/nixpkgs/pull/1"]
+
+    findings = [
+        {"vuln_id": "CVE-1", "package": "linux", "whitelist": False},
+        {"vuln_id": "CVE-2", "package": "openssl", "whitelist": False},
+    ]
+    ok = nixprs.enrich_actionable(
+        findings,
+        token="t",
+        exclude_packages=["linux"],
+        fetcher=fake_fetcher,
+    )
+
+    assert ok is True
+    assert queried == ["repo:NixOS/nixpkgs is:pr CVE-2"]
+    assert "nixpkgs_pr" not in findings[0]
+    assert findings[1]["nixpkgs_pr"].endswith("/pull/1")
+
+
 def test_enrich_is_non_fatal_on_error():
     def boom(query, token, sleeper):
         raise RuntimeError("rate limited")

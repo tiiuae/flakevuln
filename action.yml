@@ -12,6 +12,7 @@ inputs:
   unstable-ref:    { default: '' }        # empty skips the third scan
   whitelist:       { default: '' }
   nixprs:          { default: 'false' }   # opt-in PR enrichment; best-effort only
+  nixprs-exclude-packages: { default: '' } # whitespace-separated packages skipped by nixprs
   nixtracker:      { default: 'false' }   # opt-in Nixpkgs security tracker enrichment; best-effort only
   token:           { default: '' }        # optional auth for --nixprs; empty falls back to github.token in the trusted report step
   cachix-caches:   { default: '' }        # space-separated cachix cache names (read-only substituters)
@@ -222,6 +223,7 @@ runs:
         FLAKEVULN_BIN: ${{ steps.build.outputs.bin }}
         FINDINGS: ${{ steps.scan.outputs.findings }}
         NIXPRS: ${{ inputs.nixprs }}
+        NIXPRS_EXCLUDE_PACKAGES: ${{ inputs.nixprs-exclude-packages }}
         NIXTRACKER: ${{ inputs.nixtracker }}
         BASELINE_FINDINGS: ${{ steps.baseline-scope.outputs.baseline_path }}
         # Composite actions do not auto-inherit github.token.
@@ -230,6 +232,9 @@ runs:
         set -euo pipefail
         args=( report --findings="$FINDINGS" )
         if [ "$NIXPRS" = "true" ]; then args+=( --nixprs ); fi
+        for package in $NIXPRS_EXCLUDE_PACKAGES; do
+          args+=( "--nixprs-exclude-package=$package" )
+        done
         if [ "$NIXTRACKER" = "true" ]; then args+=( --nixtracker ); fi
         args+=( --baseline-findings="$BASELINE_FINDINGS" )
         args+=( --update-baseline-findings="$BASELINE_FINDINGS" )

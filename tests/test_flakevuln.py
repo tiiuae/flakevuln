@@ -72,6 +72,26 @@ def test_scope_helper_still_parses():
     assert args.input_name == "nixpkgs-alt"
 
 
+def test_report_parser_accepts_nixprs_excluded_packages():
+    """The report CLI accepts repeatable nixprs package exclusions."""
+    args = flakevuln_main._getargs(
+        [
+            "report",
+            "--findings",
+            "findings.json",
+            "--nixprs",
+            "--nixprs-exclude-package",
+            "linux",
+            "--nixprs-exclude-package",
+            "openssl",
+        ]
+    )
+
+    assert args.command == "report"
+    assert args.nixprs is True
+    assert args.nixprs_exclude_packages == ["linux", "openssl"]
+
+
 def test_exec_cmd_treats_arguments_literally(tmp_path):
     """Arguments with shell metacharacters should not be interpreted."""
     marker = tmp_path / "marker"
@@ -216,6 +236,7 @@ def _local_args(tmp_path, **overrides):
         "project_url": "",
         "whitelist": None,
         "nixprs": False,
+        "nixprs_exclude_packages": [],
         "nixtracker": False,
         "outdir": tmp_path / "local-out",
         "verbose": 1,
@@ -246,6 +267,7 @@ def test_local_subcommand_runs_scan_then_report(monkeypatch, tmp_path):
         project_url="https://example.test/proj",
         whitelist=tmp_path / "wl.csv",
         nixprs=True,
+        nixprs_exclude_packages=["linux"],
         nixtracker=True,
         outdir=outdir,
         verbose=2,
@@ -271,6 +293,7 @@ def test_local_subcommand_runs_scan_then_report(monkeypatch, tmp_path):
     )
     assert report_kwargs["findings"] == scan_kwargs["findings"]
     assert report_kwargs["nixprs_enabled"] is True
+    assert report_kwargs["nixprs_exclude_packages"] == ["linux"]
     assert report_kwargs["nixtracker_enabled"] is True
     assert report_kwargs["outdir"].name == "report"
     expected_baseline = flakevuln_main._baseline_findings_path(
@@ -1514,8 +1537,9 @@ def test_report_runs_nixprs_only_in_report_phase(monkeypatch, tmp_path):
 
     seen = {}
 
-    def fake_enrich(actionable, token, **_kwargs):
+    def fake_enrich(actionable, token, **kwargs):
         seen["token"] = token
+        seen["exclude_packages"] = kwargs["exclude_packages"]
         for finding in actionable:
             finding["nixpkgs_pr"] = "https://github.com/NixOS/nixpkgs/pull/9"
         return True
@@ -1528,6 +1552,7 @@ def test_report_runs_nixprs_only_in_report_phase(monkeypatch, tmp_path):
         findings=findings,
         outdir=None,
         nixprs=True,
+        nixprs_exclude_packages=["linux"],
         baseline_findings=None,
         update_baseline_findings=next_baseline,
         verbose=1,
@@ -1538,6 +1563,7 @@ def test_report_runs_nixprs_only_in_report_phase(monkeypatch, tmp_path):
     flakevuln_main.main()
 
     assert seen["token"] == "secret-token"
+    assert seen["exclude_packages"] == ["linux"]
     summary_text = (tmp_path / "summary.md").read_text(encoding="utf-8")
     assert "nixpkgs PR link lookup: complete for actionable findings" in summary_text
     assert findings.read_text(encoding="utf-8") == original_findings

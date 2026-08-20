@@ -80,6 +80,7 @@ jobs:
           unstable-ref: github:NixOS/nixpkgs/nixos-unstable
           whitelist: .github/flakevuln/manual_analysis.csv
           nixprs: true
+          nixprs-exclude-packages: linux
           nixtracker: true
           cachix-caches: nix-community my-org
 ```
@@ -120,6 +121,7 @@ see [example-scan.yml](.github/workflows/example-scan.yml).
 | `unstable-ref` | no | `""` | Optional third scan target, typically `github:NixOS/nixpkgs/nixos-unstable`. |
 | `whitelist` | no | `""` | Path to a suppressions CSV in the caller repository. |
 | `nixprs` | no | `false` | Enable best-effort nixpkgs PR enrichment during report rendering. |
+| `nixprs-exclude-packages` | no | `""` | Whitespace-delimited package names to skip during `nixprs` enrichment. Findings remain active. |
 | `nixtracker` | no | `false` | Enable best-effort Nixpkgs security tracker enrichment during report rendering. |
 | `token` | no | `""` | Optional token for `nixprs`; when empty, the trusted report step falls back to `github.token`. |
 | `cachix-caches` | no | `""` | Space-delimited Cachix cache names to add as read-only substituters. |
@@ -250,6 +252,15 @@ Enable best-effort `nixprs` enrichment:
 ```bash
 nix run .#flakevuln -- local \
   --nixprs \
+  packages.x86_64-linux.default
+```
+
+Skip selected packages during `nixprs` enrichment:
+
+```bash
+nix run .#flakevuln -- local \
+  --nixprs \
+  --nixprs-exclude-package linux \
   packages.x86_64-linux.default
 ```
 

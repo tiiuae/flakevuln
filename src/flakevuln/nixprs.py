@@ -114,13 +114,20 @@ def _default_fetcher(
             session.close()
 
 
-def enrich_actionable(actionable, token="", *, sleeper=None, fetcher=None):
+def enrich_actionable(
+    actionable, token="", *, exclude_packages=(), sleeper=None, fetcher=None
+):
     """Annotate each non-whitelisted finding with a `nixpkgs_pr` field.
 
     Returns True if every queried finding was enriched without error, False if
     any query failed. `fetcher` is injectable for testing; by default it
     queries the live GitHub search API.
     """
+    excluded_packages = {
+        str(package).strip()
+        for package in (exclude_packages or ())
+        if str(package).strip()
+    }
     sleeper = time.sleep if sleeper is None else sleeper
     use_default_fetcher = fetcher is None
     fetcher = _default_fetcher if fetcher is None else fetcher
@@ -131,6 +138,9 @@ def enrich_actionable(actionable, token="", *, sleeper=None, fetcher=None):
     try:
         for finding in actionable:
             if finding.get("whitelist"):
+                continue
+            package = str(finding.get("package", "")).strip()
+            if package in excluded_packages:
                 continue
             vuln_id = finding.get("vuln_id", "")
             if not vuln_id:
