@@ -3,19 +3,39 @@
 
 name: flakevuln
 description: Flake-agnostic vulnerability scanning via the three-way re-lock diff
-branding: { icon: shield, color: purple }   # required only for Marketplace listing
+branding: {icon: shield, color: purple} # required only for Marketplace listing
 
 inputs:
-  flakeref:        { default: '.' }       # local path in the checked-out workspace: repo root or subdir
-  targets:         { required: true }     # newline list
-  input-name:      { default: nixpkgs }
-  unstable-ref:    { default: '' }        # empty skips the third scan
-  whitelist:       { default: '' }
-  nixprs:          { default: 'false' }   # opt-in PR enrichment; best-effort only
-  nixprs-exclude-packages: { default: '' } # whitespace-separated packages skipped by nixprs
-  nixtracker:      { default: 'false' }   # opt-in Nixpkgs security tracker enrichment; best-effort only
-  token:           { default: '' }        # optional auth for --nixprs; empty falls back to github.token in the trusted report step
-  cachix-caches:   { default: '' }        # space-separated cachix cache names (read-only substituters)
+  flakeref:
+    description: Local path in the checked-out workspace, either the repository root or a subdirectory
+    default: '.'
+  targets:
+    description: Newline-separated list of flake outputs to scan
+    required: true
+  input-name:
+    description: Name of the re-lockable flake input to diff against
+    default: nixpkgs
+  unstable-ref:
+    description: Flake reference for the unstable scan; empty skips the third scan
+    default: ''
+  whitelist:
+    description: Path to the vulnerability whitelist file; empty disables whitelisting
+    default: ''
+  nixprs:
+    description: Enable best-effort Nixpkgs pull request enrichment
+    default: 'false'
+  nixprs-exclude-packages:
+    description: Whitespace-separated packages to exclude from Nixpkgs pull request enrichment
+    default: ''
+  nixtracker:
+    description: Enable best-effort Nixpkgs security tracker enrichment
+    default: 'false'
+  token:
+    description: Optional token for Nixpkgs pull request enrichment; empty uses github.token in the trusted report step
+    default: ''
+  cachix-caches:
+    description: Space-separated Cachix cache names to use as read-only substituters
+    default: ''
 
 runs:
   using: composite

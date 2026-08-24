@@ -38,7 +38,19 @@
               "\\.csv$"
             ];
           };
+          yamlfmt = {
+            enable = true;
+            args = [
+              "-formatter"
+              "retain_line_breaks_single=true"
+            ];
+            settings.lint-only = false;
+          };
           actionlint.enable = true;
+          action-validator = {
+            enable = true;
+            files = "^action\\.ya?ml$";
+          };
           deadnix.enable = true;
           nixfmt.enable = true;
           pyright = {
