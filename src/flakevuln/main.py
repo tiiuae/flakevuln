@@ -340,6 +340,42 @@ def _add_scan_parser(subparsers):
     scan.add_argument("--project-url", help=helps, default="")
     helps = "Path to the findings file this scan materializes (json)."
     scan.add_argument("--findings", help=helps, type=Path, required=True)
+    helps = "Optional path for native vulnxscan SARIF output. Requires one target."
+    scan.add_argument("--sarif", help=helps, type=Path)
+    helps = "Repository-relative file responsible for the scanned closure."
+    scan.add_argument("--sarif-location", help=helps)
+    _add_verbose_arg(scan)
+    return scan
+
+
+def _add_scan_sarif_parser(subparsers):
+    """Add the one-shot pre-built output SARIF scanner."""
+    scan = subparsers.add_parser(
+        "scan-sarif", help="Scan a pre-built Nix output and render a SARIF diff"
+    )
+    scan.add_argument(
+        "target", help="Pre-built Nix output or result symlink", type=Path
+    )
+    scan.add_argument(
+        "--sarif", help="Current SARIF output path", type=Path, required=True
+    )
+    scan.add_argument(
+        "--sarif-location",
+        help="Repository-relative file responsible for the scanned closure",
+        required=True,
+    )
+    scan.add_argument(
+        "--previous-sarif",
+        help="Optional previous SARIF file to compare against",
+        type=Path,
+    )
+    scan.add_argument(
+        "--markdown",
+        help="Markdown vulnerability diff output path",
+        type=Path,
+        required=True,
+    )
+    scan.add_argument("--whitelist", help="Optional vulnerability whitelist", type=Path)
     _add_verbose_arg(scan)
     return scan
 
@@ -492,6 +528,7 @@ def _getargs(argv=None):
     sub = parser.add_subparsers(dest="command", required=True, metavar="<command>")
 
     _scan = _add_scan_parser(sub)
+    _add_scan_sarif_parser(sub)
     _report = _add_report_parser(sub)
     _add_scope_parser(sub)
     _add_local_parser(sub, _scan, _report)
@@ -1060,6 +1097,202 @@ def _load_json_file(path, *, what, missing_ok=False):
         sys.exit(1)
 
 
+def _sarif_results(document):
+    """Return validated result objects from all SARIF runs."""
+    if not isinstance(document, dict) or not isinstance(document.get("runs"), list):
+        raise ValueError("SARIF must contain a runs array")
+    results = []
+    for run in document["runs"]:
+        if not isinstance(run, dict) or not isinstance(run.get("results", []), list):
+            raise ValueError("each SARIF run must contain a results array")
+        if not all(isinstance(result, dict) for result in run.get("results", [])):
+            raise ValueError("each SARIF result must be an object")
+        results.extend(run.get("results", []))
+    return results
+
+
+def _sarif_message(result):
+    message = result.get("message")
+    text = message.get("text") if isinstance(message, dict) else None
+    if not isinstance(text, str):
+        raise ValueError("each SARIF result must contain message.text")
+    return text
+
+
+def _sarif_rule_id(result):
+    rule_id = result.get("ruleId")
+    if not isinstance(rule_id, str) or not rule_id:
+        raise ValueError("each SARIF result must contain ruleId")
+    return rule_id
+
+
+def _sarif_level(result):
+    level = result.get("level", "")
+    if not isinstance(level, str):
+        raise ValueError("SARIF result level must be a string")
+    return level
+
+
+def _sarif_semantic_properties(result, *, ignore_version=False):
+    properties = result.get("properties")
+    if not isinstance(properties, dict):
+        return None
+    if not all(
+        isinstance(properties.get(name), str) for name in ("package", "version")
+    ):
+        return None
+    properties = {
+        key: value
+        for key, value in properties.items()
+        if not str(key).startswith("github/")
+    }
+    properties.pop("drvPaths", None)
+    properties.pop("storePaths", None)
+    if ignore_version:
+        properties.pop("version", None)
+    return properties
+
+
+def _keyed_sarif_results(document):
+    keyed = {}
+    for result in _sarif_results(document):
+        fingerprints = result.get("partialFingerprints")
+        fingerprint = (
+            fingerprints.get("primaryLocationLineHash")
+            if isinstance(fingerprints, dict)
+            else None
+        )
+        if not isinstance(fingerprint, str) or not fingerprint:
+            raise ValueError(
+                f"missing primaryLocationLineHash for {_sarif_rule_id(result)}"
+            )
+        _sarif_message(result)
+        _sarif_level(result)
+        keyed[fingerprint] = result
+    return keyed
+
+
+def _sarif_semantic_message(result):
+    return re.sub(r" Derivations:.*$", "", _sarif_message(result))
+
+
+def _sarif_replacement_key(result, *, use_properties):
+    if use_properties:
+        details = json.dumps(
+            _sarif_semantic_properties(result, ignore_version=True),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return _sarif_rule_id(result), _sarif_level(result), details
+    match = re.match(r"^\S+ affects (\S+)(?: \S+)?\.(.*)$", _sarif_message(result))
+    if match is None:
+        raise ValueError(
+            f"unexpected SARIF message for {_sarif_rule_id(result)}: "
+            f"{_sarif_message(result)}"
+        )
+    package_name, details = match.groups()
+    details = re.sub(r" Derivations:.*$", "", details)
+    return _sarif_rule_id(result), package_name, _sarif_level(result), details
+
+
+def _sarif_semantic_key(result, *, use_properties):
+    details = (
+        _sarif_semantic_properties(result)
+        if use_properties
+        else _sarif_semantic_message(result)
+    )
+    return _sarif_level(result), details
+
+
+def _render_sarif_diff(current_document, previous_document=None):
+    """Render a PR-comment-ready markdown diff between two SARIF documents."""
+    current = _keyed_sarif_results(current_document)
+    if previous_document is None:
+        detail = f"No previous SARIF baseline available ({len(current)} current)."
+        return f"## Vulnerability Changes\n\n{detail}\n"
+
+    previous = _keyed_sarif_results(previous_document)
+    # GitHub's SARIF download strips producer properties from accepted analyses.
+    use_properties = all(
+        _sarif_semantic_properties(result) is not None
+        for result in (*current.values(), *previous.values())
+    )
+    exact_added = [result for key, result in current.items() if key not in previous]
+    resolved_candidates = [
+        result for key, result in previous.items() if key not in current
+    ]
+    resolved_by_replacement = {}
+    for index, result in enumerate(resolved_candidates):
+        key = _sarif_replacement_key(result, use_properties=use_properties)
+        resolved_by_replacement.setdefault(key, []).append(index)
+    carried_indices = set()
+    added = []
+    for result in exact_added:
+        key = _sarif_replacement_key(result, use_properties=use_properties)
+        candidates = resolved_by_replacement.get(key, [])
+        if candidates:
+            carried_indices.add(candidates.pop())
+        else:
+            added.append(result)
+    resolved = [
+        result
+        for index, result in enumerate(resolved_candidates)
+        if index not in carried_indices
+    ]
+    changed = [
+        (previous[key], result)
+        for key, result in current.items()
+        if key in previous
+        and _sarif_semantic_key(result, use_properties=use_properties)
+        != _sarif_semantic_key(previous[key], use_properties=use_properties)
+    ]
+
+    carried_note = (
+        f"; {len(carried_indices)} persisted across package version updates"
+        if carried_indices
+        else ""
+    )
+    if not (added or resolved or changed):
+        detail = (
+            "No finding additions, resolutions, or detail changes "
+            f"({len(current)} current{carried_note})."
+        )
+        return f"## Vulnerability Changes\n\n{detail}\n"
+
+    lines = [
+        "## Vulnerability Changes",
+        "",
+        f"{len(current)} current, {len(added)} added, {len(resolved)} resolved, "
+        f"{len(changed)} changed{carried_note}.",
+    ]
+
+    def format_finding(result):
+        summary = re.split(
+            r" (?:Detected by|Fixed versions reported by scanners|Scanner fix state|Nix patch evidence|Derivations):",
+            _sarif_message(result),
+            maxsplit=1,
+        )[0]
+        return f"- {_safe_markdown_text(summary)}"
+
+    if added:
+        lines.extend(("", "### Added", "", *(format_finding(item) for item in added)))
+    if resolved:
+        lines.extend(
+            ("", "### Resolved", "", *(format_finding(item) for item in resolved))
+        )
+    if changed:
+        lines.extend(("", "### Changed", ""))
+        for before, after in changed:
+            lines.append(
+                f"- **{_safe_markdown_text(_sarif_rule_id(after))}**: "
+                f"[{_safe_markdown_text(_sarif_level(before))}] "
+                f"{_safe_markdown_text(_sarif_semantic_message(before))} => "
+                f"[{_safe_markdown_text(_sarif_level(after))}] "
+                f"{_safe_markdown_text(_sarif_semantic_message(after))}"
+            )
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def _findings_file_size_ok(path, *, what):
     """True when `path` is small enough to ingest.
 
@@ -1103,6 +1336,8 @@ class FlakeScanner:
         project_name="",
         project_url="",
         verbosity=1,
+        sarif_out=None,
+        sarif_location=None,
         excluded_paths=(),
     ):
         self.df_scan = _empty_scan_df()
@@ -1115,6 +1350,8 @@ class FlakeScanner:
         self.input_name = input_name
         self.unstable_ref = unstable_ref
         self.verbosity = _normalize_verbosity(verbosity)
+        self.sarif_out = Path(sarif_out).resolve() if sarif_out is not None else None
+        self.sarif_location = sarif_location
         self.excluded_paths = tuple(
             Path(path).resolve() for path in excluded_paths if path is not None
         )
@@ -3844,8 +4081,18 @@ in builtins.listToAttrs (map (name: {{ inherit name; value = get name; }}) args.
         if drv_path is None:
             return
         out, out_triage, out_evidence = self._scan_output_paths(target, pintype)
+        if self.sarif_out is not None and pintype == PIN_CURRENT:
+            out = self.sarif_out
+            out_triage = out.with_name(f"{out.stem}.triage.csv")
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.unlink(missing_ok=True)
+            out_triage.unlink(missing_ok=True)
+            cmd = [*cmd, "--format=sarif"]
+            if self.sarif_location:
+                cmd.append(f"--sarif-location={self.sarif_location}")
         cmd = [
             *cmd,
+            "--require-cpe-dictionary",
             f"--out={out}",
             f"--evidence-out={out_evidence}",
             str(drv_path),
@@ -3854,7 +4101,13 @@ in builtins.listToAttrs (map (name: {{ inherit name; value = get name; }}) args.
         # df_vulnix.csv/df_grype.csv/df_osv.csv/df_report_raw.csv/meta.csv
         # relative to cwd, and we never want those in the user's worktree.
         started = time.monotonic()
-        ret = exec_cmd(cmd, raise_on_error=False, capture=True, cwd=self.tmpdir)
+        ret = exec_cmd(
+            cmd,
+            raise_on_error=False,
+            evars={"GRYPE_DB_REQUIRE_UPDATE_CHECK": "true"},
+            capture=True,
+            cwd=self.tmpdir,
+        )
         _log_scan_timing(f"vulnxscan '{target}' on {pintype}", started)
         LOG.debug("vulnxscan ==>\n\n%s\n\n<== vulnxscan\n", ret.stderr)
         if ret.returncode != 0:
@@ -4962,6 +5215,8 @@ def _cmd_scan(args):
         findings=args.findings,
         verbosity=args.verbose,
         whitelist=args.whitelist,
+        sarif=getattr(args, "sarif", None),
+        sarif_location=getattr(args, "sarif_location", None),
         excluded_paths=getattr(args, "excluded_paths", ()),
     )
 
@@ -5220,6 +5475,72 @@ def _usable_whitelist_path(whitelist):
     return None
 
 
+def _run_sarif_scan(  # noqa: PLR0913
+    *,
+    target,
+    sarif,
+    sarif_location,
+    markdown,
+    previous_sarif=None,
+    whitelist=None,
+    verbosity=1,
+):
+    """Scan one pre-built Nix output and write current SARIF plus its diff."""
+    sarif = Path(sarif).resolve()
+    markdown = Path(markdown).resolve()
+    previous_document = None
+    try:
+        if previous_sarif is not None:
+            previous_document = _load_json_file(
+                Path(previous_sarif).resolve(), what="previous SARIF"
+            )
+    finally:
+        sarif.parent.mkdir(parents=True, exist_ok=True)
+        markdown.parent.mkdir(parents=True, exist_ok=True)
+        sarif.unlink(missing_ok=True)
+        markdown.unlink(missing_ok=True)
+    exit_unless_command_exists("nix")
+    exit_unless_command_exists("vulnxscan")
+    target = Path(target)
+    if not target.exists():
+        LOG.fatal("Missing pre-built Nix output: %s", target.resolve().as_posix())
+        sys.exit(1)
+    target = target.resolve()
+    whitelist = _usable_whitelist_path(whitelist)
+    cmd = [
+        "vulnxscan",
+        f"--verbose={_normalize_verbosity(verbosity)}",
+        "--require-cpe-dictionary",
+        "--format=sarif",
+        f"--sarif-location={sarif_location}",
+        f"--out={sarif}",
+    ]
+    if whitelist is not None:
+        cmd.append(f"--whitelist={whitelist.resolve()}")
+    cmd.append(str(target))
+    with tempfile.TemporaryDirectory(prefix="flakevuln-sarif-") as tmpdir:
+        ret = exec_cmd(
+            cmd,
+            raise_on_error=False,
+            evars={"GRYPE_DB_REQUIRE_UPDATE_CHECK": "true"},
+            capture=True,
+            cwd=tmpdir,
+        )
+    LOG.debug("vulnxscan ==>\n\n%s\n\n<== vulnxscan", ret.stderr)
+    if ret.returncode != 0:
+        LOG.fatal("Pre-built output scan failed:\n%s", ret.stderr or ret.stdout)
+        sys.exit(ret.returncode or 1)
+    current_document = _load_json_file(sarif, what="current SARIF")
+    try:
+        report = _render_sarif_diff(current_document, previous_document)
+    except ValueError as error:
+        LOG.fatal("Could not compare SARIF: %s", error)
+        sys.exit(1)
+    markdown.write_text(report, encoding="utf-8")
+    LOG.info("Wrote: %s", sarif)
+    LOG.info("Wrote: %s", markdown)
+
+
 def _run_scan(  # noqa: PLR0913
     *,
     flakeref,
@@ -5231,6 +5552,8 @@ def _run_scan(  # noqa: PLR0913
     findings,
     verbosity=1,
     whitelist=None,
+    sarif=None,
+    sarif_location=None,
     excluded_paths=(),
 ):
     """Run a scan and materialize findings."""
@@ -5239,6 +5562,10 @@ def _run_scan(  # noqa: PLR0913
     started = time.monotonic()
     exit_unless_command_exists("nix")
     exit_unless_command_exists("vulnxscan")
+    targets = _deduplicated_targets(targets)
+    if sarif is not None and len(targets) != 1:
+        LOG.fatal("SARIF output requires exactly one target")
+        sys.exit(1)
     _log_scan_timing("preflight", started)
     started = time.monotonic()
     scanner = FlakeScanner(
@@ -5248,12 +5575,13 @@ def _run_scan(  # noqa: PLR0913
         project_name=project_name,
         project_url=project_url,
         verbosity=verbosity,
+        sarif_out=sarif,
+        sarif_location=sarif_location,
         excluded_paths=excluded_paths,
     )
     _log_scan_timing("initialize scanner", started)
     started = time.monotonic()
     whitelist = _usable_whitelist_path(whitelist)
-    targets = _deduplicated_targets(targets)
     _log_scan_timing("prepare inputs", started, f"targets={len(targets)}")
     for target in targets:
         scanner.scan_target(target, whitelist=whitelist)
@@ -5428,6 +5756,19 @@ def _cmd_report(args):
     )
 
 
+def _cmd_scan_sarif(args):
+    """`scan-sarif` subcommand: scan a pre-built output and compare SARIF."""
+    _run_sarif_scan(
+        target=args.target,
+        sarif=args.sarif,
+        sarif_location=args.sarif_location,
+        markdown=args.markdown,
+        previous_sarif=args.previous_sarif,
+        whitelist=args.whitelist,
+        verbosity=args.verbose,
+    )
+
+
 def _cmd_scope(args):
     """Hidden helper: print the scope-specific baseline findings path."""
     path = _baseline_findings_path(args.flakeref, args.target, args.input_name)
@@ -5518,6 +5859,8 @@ def main():
     _init_logging(getattr(args, "verbose", 1))
     if args.command == "scan":
         _cmd_scan(args)
+    elif args.command == "scan-sarif":
+        _cmd_scan_sarif(args)
     elif args.command == "report":
         _cmd_report(args)
     elif args.command == "scope":

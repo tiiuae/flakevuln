@@ -569,6 +569,38 @@ def test_malformed_triage_csv_fails(monkeypatch, tmp_path):
     assert _has_error(scanner)
 
 
+def test_current_scan_requests_native_sarif(monkeypatch, tmp_path):
+    finding = tu.evidence_finding()
+    component = tu.evidence_component(finding)
+    scanner = tu.make_scanner(tmp_path)
+    scanner.evidence_included = True
+    scanner.sarif_out = tmp_path / "vulns.sarif"
+    scanner.sarif_location = "flake.nix"
+    captured = []
+    fake = tu.fake_vulnxscan(
+        document=tu.evidence_document([finding], [component]),
+        triage_rows=[tu.triage_row(finding)],
+    )
+
+    monkeypatch.setattr(
+        scanner, "_evaluate_target_drv", lambda *_a, **_k: "/nix/store/x.drv"
+    )
+
+    def _fake(cmd, *args, **kwargs):
+        captured.extend(cmd)
+        return fake(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(flakevuln_main, "exec_cmd", _fake)
+
+    scanner._read_scan_results(["vulnxscan"], TARGET, PIN_CURRENT)
+
+    assert "--format=sarif" in captured
+    assert "--sarif-location=flake.nix" in captured
+    assert f"--out={scanner.sarif_out}" in captured
+    assert not _has_error(scanner)
+    assert (scanner.scope_flakeref, TARGET, PIN_CURRENT) in scanner.completed_scans
+
+
 def test_triage_csv_without_finding_id_column_fails(monkeypatch, tmp_path):
     """An aggregate row that cannot be joined to evidence is not accepted."""
     finding = tu.evidence_finding()

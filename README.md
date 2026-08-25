@@ -21,6 +21,7 @@ fits into an end-to-end vulnerability-management process, see the
 - Optionally adds a third scan against an explicit unstable input such as
   `github:NixOS/nixpkgs/nixos-unstable`.
 - Writes machine-readable findings plus markdown reports.
+- Optionally produces SARIF for GitHub Code Scanning.
 - Explains each finding with per-derivation patch evidence from `vulnxscan`.
 - Reuses the same engine locally and in GitHub Actions.
 - Persists `grype`, `vulnix`, `sbomnix` HTTP cache data, and prior-run baseline
@@ -129,11 +130,86 @@ jobs:
 For an in-repository example that uses the checked-out action source directly,
 see [example-scan.yml](.github/workflows/example-scan.yml).
 
+### Example: scan a pre-built Nix output
+
+When an earlier step already installed Nix and built an output, pass its result
+symlink as the only `targets` entry. The action detects the existing path, runs
+one scan, and skips Nix installation and flake re-locking. It writes SARIF plus
+a fingerprint-aware markdown diff when the caller downloads the base branch's
+previous SARIF first.
+
+```yaml
+- name: Download previous SARIF
+  id: previous-sarif
+  if: github.event_name == 'pull_request'
+  env:
+    GH_TOKEN: ${{ github.token }}
+    BASE_REF: ${{ github.base_ref }}
+  shell: bash
+  run: |
+    analysis_id="$(
+      gh api --method GET \
+        "repos/$GITHUB_REPOSITORY/code-scanning/analyses" \
+        -f ref="refs/heads/$BASE_REF" \
+        -f tool_name=vulnxscan \
+        -F per_page=100 \
+        --jq 'map(select(
+          (.category == "flakevuln" or .category == "vulnxscan")
+          and (.error == null or .error == "")
+        ))[0].id // empty'
+    )"
+    if [[ -n "$analysis_id" ]]; then
+      path="$RUNNER_TEMP/previous-vulns.sarif"
+      gh api \
+        -H "Accept: application/sarif+json" \
+        "repos/$GITHUB_REPOSITORY/code-scanning/analyses/$analysis_id" \
+        > "$path"
+      echo "path=$path" >> "$GITHUB_OUTPUT"
+    fi
+- name: Build system
+  run: nix build .#nixosConfigurations.qnas.config.system.build.toplevel -o result-current
+- id: flakevuln
+  uses: tiiuae/flakevuln@<commit-sha>
+  with:
+    targets: result-current
+    sarif-location: machines/qnas.nix
+    previous-sarif: ${{ steps.previous-sarif.outputs.path }}
+- name: Upload SARIF
+  if: ${{ always() && steps.flakevuln.outputs.sarif != '' }}
+  uses: github/codeql-action/upload-sarif@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+  with:
+    sarif_file: ${{ steps.flakevuln.outputs.sarif }}
+    category: vulnxscan
+```
+
+The `markdown` output points to a ready-to-publish `.md` file containing the
+vulnerability changes. A later workflow step can use the whole file as a PR
+comment or include it alongside other sections. For example, an existing
+PR-comment step can append it to closure and flake-input information:
+
+```yaml
+env:
+  VULNERABILITY_DIFF_PATH: ${{ steps.flakevuln.outputs.markdown }}
+with:
+  script: |
+    const vulnerabilityDiff = fs.readFileSync(
+      process.env.VULNERABILITY_DIFF_PATH,
+      'utf8',
+    ).trim();
+    const body = [
+      marker,
+      // Existing closure and flake-input sections.
+      vulnerabilityDiff,
+    ].join('\n');
+```
+
+The current SARIF path is available at `${{ steps.flakevuln.outputs.sarif }}`.
+
 ### Inputs
 
 | Input | Required | Default | Description |
 | --- | --- | --- | --- |
-| `targets` | yes | - | Newline-delimited flake outputs to scan. |
+| `targets` | yes | - | Newline-delimited flake outputs to scan. One existing path selects pre-built output mode and requires `sarif-location`. |
 | `flakeref` | no | `.` | Flake to scan. `.` means the checked-out workspace root; a subdirectory also works. |
 | `input-name` | no | `nixpkgs` | Re-lockable input to diff against. |
 | `unstable-ref` | no | `""` | Optional third scan target, typically `github:NixOS/nixpkgs/nixos-unstable`. |
@@ -145,6 +221,8 @@ see [example-scan.yml](.github/workflows/example-scan.yml).
 | `cachix-caches` | no | `""` | Space-delimited Cachix cache names to add as read-only substituters. |
 | `upload-report` | no | `true` | Upload the findings and rendered report as an artifact. With `false` the Step Summary is still trimmed, so publish `report-path` yourself or the omitted tables are unreachable. |
 | `report-retention-days` | no | `30` | Number of days to retain the uploaded report artifact. |
+| `sarif-location` | no | `""` | Repository-relative file responsible for the scanned closure. Enables SARIF output for a single target. |
+| `previous-sarif` | no | `""` | Previous SARIF file used to render the pre-built output vulnerability diff. |
 
 ### Outputs
 
@@ -154,14 +232,18 @@ see [example-scan.yml](.github/workflows/example-scan.yml).
 | `report-path` | Path to the rendered markdown report directory. |
 | `report-artifact-name` | Name of the report artifact when `upload-report` is `true`. |
 | `report-artifact-url` | URL for the uploaded report artifact when `upload-report` is `true`. |
+| `sarif` | Path to the current SARIF file when `sarif-location` is set. |
+| `markdown` | Path to the vulnerability diff markdown in pre-built output mode. |
 
 ### Behavior
 
 - Supported runners: Linux runners. The action is designed around
   [`cachix/install-nix-action`](https://github.com/cachix/install-nix-action),
   so macOS may work, but this repository currently validates releases on Linux.
-- Required workflow permissions: `contents: read` is sufficient for the normal
-  checkout-and-scan flow.
+- Required workflow permissions: `contents: read` is sufficient for the action.
+  Downloading previous SARIF additionally needs `security-events: read`; upload
+  needs `security-events: write`. Private and internal repositories also need
+  GitHub Code Security enabled and `actions: read` for upload.
 - Security model: the untrusted `scan` phase runs without `GH_TOKEN`; optional
   GitHub-authenticated enrichment happens later in the trusted `report` phase.
 - Report publication: the action uploads a report artifact containing
@@ -192,6 +274,8 @@ see [example-scan.yml](.github/workflows/example-scan.yml).
 - The primary findings path is the `findings-path` output. For compatibility,
   the action also writes a copy to `${{ runner.temp }}/flakevuln/findings.json`,
   but callers should migrate to the output path for multi-invocation jobs.
+- SARIF outputs: setting `sarif-location` exposes `sarif` after a valid file is
+  generated. Pre-built output mode additionally exposes `markdown`.
 - Baseline diffing: the action persists a prior findings set keyed by flakeref,
   targets, and `input-name`, then reports what changed since the last
   successful run for that same scope.
@@ -356,6 +440,17 @@ nix run .#flakevuln -- report \
   --findings findings.json \
   --outdir report \
   --nixprs
+```
+
+Scan one pre-built Nix output without re-lock comparisons and optionally compare
+it with an earlier SARIF file:
+
+```bash
+nix run .#flakevuln -- scan-sarif result-current \
+  --sarif vulns.sarif \
+  --sarif-location machines/qnas.nix \
+  --previous-sarif previous-vulns.sarif \
+  --markdown vulnerability-diff.md
 ```
 
 ### Patch evidence

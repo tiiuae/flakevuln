@@ -1,8 +1,7 @@
-# Composite action for scanning a checked-out flake in two phases:
-# untrusted `scan`, then trusted `report`.
+# Composite action for scanning a checked-out flake or pre-built Nix output.
 
 name: flakevuln
-description: Flake-agnostic vulnerability scanning via the three-way re-lock diff
+description: Vulnerability scanning for Nix flakes and pre-built outputs
 branding: {icon: shield, color: purple} # required only for Marketplace listing
 
 inputs:
@@ -10,7 +9,7 @@ inputs:
     description: Local path in the checked-out workspace, either the repository root or a subdirectory
     default: '.'
   targets:
-    description: Newline-separated list of flake outputs to scan
+    description: Newline-separated flake outputs, or one existing pre-built Nix output path, to scan
     required: true
   input-name:
     description: Name of the re-lockable flake input to diff against
@@ -42,6 +41,12 @@ inputs:
   report-retention-days:
     description: Number of days to retain the uploaded report artifact
     default: '30'
+  sarif-location:
+    description: Repository-relative file responsible for the scanned closure; empty disables SARIF output
+    default: ''
+  previous-sarif:
+    description: Previous SARIF file for pre-built output comparison; empty renders a no-baseline report
+    default: ''
 
 outputs:
   findings-path:
@@ -56,12 +61,45 @@ outputs:
   report-artifact-url:
     description: URL for the uploaded report artifact when upload-report is true.
     value: ${{ steps.upload-report.outputs.artifact-url }}
+  sarif:
+    description: Current SARIF file produced when sarif-location is set
+    value: ${{ steps.output-paths.outputs.sarif }}
+  markdown:
+    description: Vulnerability diff markdown produced in pre-built output mode
+    value: ${{ steps.output-paths.outputs.markdown }}
 
 runs:
   using: composite
   steps:
+    - name: Detect pre-built target
+      id: scan-mode
+      shell: bash
+      env:
+        SARIF_LOCATION: ${{ inputs.sarif-location }}
+        TARGETS: ${{ inputs.targets }}
+      run: |
+        set -euo pipefail
+        count=0
+        target=''
+        while IFS= read -r value; do
+          if [ -n "$value" ]; then
+            count=$((count + 1))
+            target="$value"
+          fi
+        done <<< "$TARGETS"
+        prebuilt=false
+        if [ "$count" -eq 1 ] && [ -e "$target" ]; then
+          if [ -z "$SARIF_LOCATION" ]; then
+            echo "sarif-location is required when targets names a pre-built output" >&2
+            exit 1
+          fi
+          prebuilt=true
+        fi
+        echo "prebuilt=$prebuilt" >> "$GITHUB_OUTPUT"
+
     # Nix CLI version follows the pinned install-nix-action release.
     - name: Install Nix
+      if: ${{ steps.scan-mode.outputs.prebuilt != 'true' }}
       uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
       with:
         extra_nix_config: |
@@ -101,6 +139,7 @@ runs:
 
     - name: Resolve flakevuln baseline scope
       id: baseline-scope
+      if: ${{ steps.scan-mode.outputs.prebuilt != 'true' }}
       shell: bash
       env:
         FLAKEVULN_BIN: ${{ steps.build.outputs.bin }}
@@ -154,7 +193,7 @@ runs:
       shell: bash
       env:
         ACTION_PATH: ${{ github.action_path }}
-        BASELINE_PATH: ${{ steps.baseline-scope.outputs.baseline_path }}
+        BASELINE_PATH: ${{ steps.baseline-scope.outputs.baseline_path || format('{0}/flakevuln/no-baseline', runner.temp) }}
       run: |
         set -euo pipefail
         "$ACTION_PATH/scripts/probe-cache-state.sh" "$GITHUB_OUTPUT" "$BASELINE_PATH"
@@ -198,7 +237,7 @@ runs:
           ${{ steps.cache-meta.outputs.sbomnix_prefix }}
 
     - name: Restore flakevuln previous-run baseline
-      if: ${{ steps.cache-restore-probe.outputs.baseline_present != 'true' }}
+      if: ${{ steps.scan-mode.outputs.prebuilt != 'true' && steps.cache-restore-probe.outputs.baseline_present != 'true' }}
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
@@ -234,6 +273,7 @@ runs:
     # Phase 1: scan without GH_TOKEN and write findings.
     - name: Scan (untrusted)
       id: scan
+      if: ${{ steps.scan-mode.outputs.prebuilt != 'true' }}
       shell: bash
       env:
         FLAKEVULN_BIN: ${{ steps.build.outputs.bin }}
@@ -241,9 +281,12 @@ runs:
         INPUT_NAME: ${{ inputs.input-name }}
         UNSTABLE_REF: ${{ inputs.unstable-ref }}
         WHITELIST: ${{ inputs.whitelist }}
+        SARIF_LOCATION: ${{ inputs.sarif-location }}
         TARGETS: ${{ inputs.targets }}
         OUTDIR: ${{ steps.cache-meta.outputs.outdir }}
         LEGACY_OUTDIR: ${{ runner.temp }}/flakevuln
+        GH_TOKEN: ''
+        GITHUB_TOKEN: ''
       run: |
         set -euo pipefail
         # Clear prior output for this invocation.
@@ -254,11 +297,15 @@ runs:
         done <<< "$TARGETS"
         wl=()
         if [ -n "$WHITELIST" ]; then wl+=( "--whitelist=$WHITELIST" ); fi
+        sarif=()
+        if [ -n "$SARIF_LOCATION" ]; then
+          sarif+=( "--sarif=$OUTDIR/vulns.sarif" "--sarif-location=$SARIF_LOCATION" )
+        fi
         "$FLAKEVULN_BIN" scan \
           --flakeref="$FLAKEREF" \
           --input-name="$INPUT_NAME" \
           --unstable-ref="$UNSTABLE_REF" \
-          "${wl[@]}" "${targets[@]}" \
+          "${wl[@]}" "${sarif[@]}" "${targets[@]}" \
           --findings="$OUTDIR/findings.json"
         # Compatibility for callers that uploaded the historical path directly.
         rm -rf "$LEGACY_OUTDIR"
@@ -267,11 +314,61 @@ runs:
         {
           echo "findings=$OUTDIR/findings.json"
         } >> "$GITHUB_OUTPUT"
-      # NOTE: no `env: GH_TOKEN` here.
+    - name: Scan pre-built target (untrusted)
+      id: prebuilt-scan
+      if: ${{ steps.scan-mode.outputs.prebuilt == 'true' }}
+      shell: bash
+      env:
+        FLAKEVULN_BIN: ${{ steps.build.outputs.bin }}
+        PREVIOUS_SARIF: ${{ inputs.previous-sarif }}
+        SARIF_LOCATION: ${{ inputs.sarif-location }}
+        TARGETS: ${{ inputs.targets }}
+        WHITELIST: ${{ inputs.whitelist }}
+        OUTDIR: ${{ runner.temp }}/flakevuln
+        GH_TOKEN: ''
+        GITHUB_TOKEN: ''
+      run: |
+        set -euo pipefail
+        target=''
+        while IFS= read -r value; do
+          if [ -n "$value" ]; then target="$value"; fi
+        done <<< "$TARGETS"
+        rm -rf "$OUTDIR"
+        mkdir -p "$OUTDIR"
+        args=( scan-sarif "$target" )
+        args+=( "--sarif=$OUTDIR/vulns.sarif" )
+        args+=( "--sarif-location=$SARIF_LOCATION" )
+        args+=( "--markdown=$OUTDIR/vulnerability-diff.md" )
+        if [ -n "$PREVIOUS_SARIF" ]; then
+          args+=( "--previous-sarif=$PREVIOUS_SARIF" )
+        fi
+        if [ -n "$WHITELIST" ]; then args+=( "--whitelist=$WHITELIST" ); fi
+        "$FLAKEVULN_BIN" "${args[@]}"
+
+    - name: Set output paths
+      id: output-paths
+      if: ${{ inputs.sarif-location != '' }}
+      shell: bash
+      env:
+        NORMAL_OUTDIR: ${{ steps.cache-meta.outputs.outdir }}
+        PREBUILT_OUTDIR: ${{ runner.temp }}/flakevuln
+      run: |
+        OUTDIR="$NORMAL_OUTDIR"
+        if [ "${{ steps.scan-mode.outputs.prebuilt }}" = "true" ]; then
+          OUTDIR="$PREBUILT_OUTDIR"
+        fi
+        if [ -s "$OUTDIR/vulns.sarif" ]; then
+          echo "sarif=$OUTDIR/vulns.sarif" >> "$GITHUB_OUTPUT"
+        fi
+        if [ "${{ steps.scan-mode.outputs.prebuilt }}" = "true" ] \
+          && [ -s "$OUTDIR/vulnerability-diff.md" ]; then
+          echo "markdown=$OUTDIR/vulnerability-diff.md" >> "$GITHUB_OUTPUT"
+        fi
 
     # Phase 2: render the Step Summary from the materialized findings.
     - name: Report (trusted)
       id: report
+      if: ${{ steps.scan-mode.outputs.prebuilt != 'true' }}
       shell: bash
       env:
         FLAKEVULN_BIN: ${{ steps.build.outputs.bin }}
@@ -315,7 +412,7 @@ runs:
       shell: bash
       env:
         ACTION_PATH: ${{ github.action_path }}
-        BASELINE_PATH: ${{ steps.baseline-scope.outputs.baseline_path }}
+        BASELINE_PATH: ${{ steps.baseline-scope.outputs.baseline_path || format('{0}/flakevuln/no-baseline', runner.temp) }}
       run: |
         set -euo pipefail
         "$ACTION_PATH/scripts/probe-cache-state.sh" "$GITHUB_OUTPUT" "$BASELINE_PATH"
@@ -349,7 +446,7 @@ runs:
         key: ${{ steps.cache-meta.outputs.sbomnix_key }}
 
     - name: Save flakevuln previous-run baseline
-      if: ${{ steps.cache-save-probe.outputs.baseline_present == 'true' }}
+      if: ${{ steps.scan-mode.outputs.prebuilt != 'true' && steps.cache-save-probe.outputs.baseline_present == 'true' }}
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |

@@ -31,6 +31,8 @@ def make_scanner(tmp_path, flakeref="github:example/flake", unstable_ref=""):
     # Tests that exercise component evidence opt in explicitly; the synthetic
     # scan rows built by most tests carry no vulnxscan evidence.
     scanner.evidence_included = False
+    scanner.sarif_out = None
+    scanner.sarif_location = None
     scanner.errors = {}
     scanner.flakeref = flakeref
     scanner.scope_flakeref = flakevuln_main._canonical_scope_flakeref(flakeref)
@@ -228,7 +230,8 @@ def triage_row(finding, **overrides):
 def triage_path(out):
     """Return the triage CSV path vulnxscan derives from `--out`."""
     out = Path(out)
-    return out.with_name(f"{out.stem}.triage{out.suffix}")
+    suffix = ".csv" if out.suffix == ".sarif" else out.suffix
+    return out.with_name(f"{out.stem}.triage{suffix}")
 
 
 def arg_value(cmd, prefix):
