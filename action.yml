@@ -134,7 +134,7 @@ runs:
     # Honor XDG_CACHE_HOME when the caller sets it.
     - name: Restore grype DB
       if: ${{ steps.cache-restore-probe.outputs.grype_present != 'true' }}
-      uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
           ${{ env.XDG_CACHE_HOME != '' && format('{0}/grype/db', env.XDG_CACHE_HOME) || '~/.cache/grype/db' }}
@@ -145,7 +145,7 @@ runs:
     # Restore vulnix's durable local NVD data files across runs.
     - name: Restore vulnix DB
       if: ${{ steps.cache-restore-probe.outputs.vulnix_present != 'true' }}
-      uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
           ~/.cache/vulnix/Data.fs
@@ -160,7 +160,7 @@ runs:
     # Honor XDG_CACHE_HOME when the caller sets it.
     - name: Restore sbomnix HTTP responses
       if: ${{ steps.cache-restore-probe.outputs.sbomnix_present != 'true' }}
-      uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
           ${{ env.XDG_CACHE_HOME != '' && format('{0}/sbomnix/http_cache.sqlite*', env.XDG_CACHE_HOME) || '~/.cache/sbomnix/http_cache.sqlite*' }}
@@ -170,7 +170,7 @@ runs:
 
     - name: Restore flakevuln previous-run baseline
       if: ${{ steps.cache-restore-probe.outputs.baseline_present != 'true' }}
-      uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
           ${{ steps.baseline-scope.outputs.baseline_path }}
@@ -274,7 +274,7 @@ runs:
     # state, such as a pre-warmed cache or an earlier invocation in the same job.
     - name: Save grype DB
       if: ${{ steps.cache-save-probe.outputs.grype_present == 'true' }}
-      uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
           ${{ env.XDG_CACHE_HOME != '' && format('{0}/grype/db', env.XDG_CACHE_HOME) || '~/.cache/grype/db' }}
@@ -282,7 +282,7 @@ runs:
 
     - name: Save vulnix DB
       if: ${{ steps.cache-save-probe.outputs.vulnix_present == 'true' }}
-      uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
           ~/.cache/vulnix/Data.fs
@@ -291,7 +291,7 @@ runs:
 
     - name: Save sbomnix HTTP responses
       if: ${{ steps.cache-save-probe.outputs.sbomnix_present == 'true' }}
-      uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
           ${{ env.XDG_CACHE_HOME != '' && format('{0}/sbomnix/http_cache.sqlite*', env.XDG_CACHE_HOME) || '~/.cache/sbomnix/http_cache.sqlite*' }}
@@ -299,7 +299,7 @@ runs:
 
     - name: Save flakevuln previous-run baseline
       if: ${{ steps.cache-save-probe.outputs.baseline_present == 'true' }}
-      uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
           ${{ steps.baseline-scope.outputs.baseline_path }}
