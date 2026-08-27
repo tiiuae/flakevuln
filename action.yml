@@ -36,6 +36,26 @@ inputs:
   cachix-caches:
     description: Space-separated Cachix cache names to use as read-only substituters
     default: ''
+  upload-report:
+    description: Upload the findings and rendered markdown report as a GitHub Actions artifact
+    default: 'true'
+  report-retention-days:
+    description: Number of days to retain the uploaded report artifact
+    default: '30'
+
+outputs:
+  findings-path:
+    description: Path to the complete machine-readable findings JSON.
+    value: ${{ steps.scan.outputs.findings }}
+  report-path:
+    description: Path to the rendered markdown report directory.
+    value: ${{ steps.report.outputs.report }}
+  report-artifact-name:
+    description: Name of the report artifact, empty when upload-report is false.
+    value: ${{ inputs.upload-report == 'true' && steps.cache-meta.outputs.report_artifact_name || '' }}
+  report-artifact-url:
+    description: URL for the uploaded report artifact when upload-report is true.
+    value: ${{ steps.upload-report.outputs.artifact-url }}
 
 runs:
   using: composite
@@ -111,6 +131,13 @@ runs:
         set -euo pipefail
         nonce="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
         suffix="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${nonce}"
+        # Cache keys are matched by prefix and never read by a person, so they
+        # keep the full nonce. The artifact name is read by a person, on the
+        # run page and again as a downloaded file among others, so a UTC
+        # timestamp leads it. The timestamp alone is not unique: artifact
+        # names must be unique across a workflow run, and matrix jobs start
+        # together, so a short nonce follows it.
+        stamp="$(date -u +%Y%m%d-%H%M%SZ)"
         echo "grype_prefix=flakevuln-grype-db-v1-${RUNNER_OS}-" >> "$GITHUB_OUTPUT"
         echo "grype_key=flakevuln-grype-db-v1-${RUNNER_OS}-${suffix}" >> "$GITHUB_OUTPUT"
         echo "vulnix_prefix=flakevuln-vulnix-db-v1-${RUNNER_OS}-" >> "$GITHUB_OUTPUT"
@@ -119,6 +146,8 @@ runs:
         echo "sbomnix_key=flakevuln-sbomnix-http-v1-${RUNNER_OS}-${suffix}" >> "$GITHUB_OUTPUT"
         echo "baseline_prefix=flakevuln-last-run-v1-${RUNNER_OS}-${{ steps.baseline-scope.outputs.scope_hash }}-" >> "$GITHUB_OUTPUT"
         echo "baseline_key=flakevuln-last-run-v1-${RUNNER_OS}-${{ steps.baseline-scope.outputs.scope_hash }}-${suffix}" >> "$GITHUB_OUTPUT"
+        echo "report_artifact_name=flakevuln-report-${stamp}-${nonce:0:8}" >> "$GITHUB_OUTPUT"
+        echo "outdir=${RUNNER_TEMP}/flakevuln-${suffix}" >> "$GITHUB_OUTPUT"
 
     - name: Probe local tool caches for restore
       id: cache-restore-probe
@@ -213,7 +242,8 @@ runs:
         UNSTABLE_REF: ${{ inputs.unstable-ref }}
         WHITELIST: ${{ inputs.whitelist }}
         TARGETS: ${{ inputs.targets }}
-        OUTDIR: ${{ runner.temp }}/flakevuln
+        OUTDIR: ${{ steps.cache-meta.outputs.outdir }}
+        LEGACY_OUTDIR: ${{ runner.temp }}/flakevuln
       run: |
         set -euo pipefail
         # Clear prior output for this invocation.
@@ -230,6 +260,10 @@ runs:
           --unstable-ref="$UNSTABLE_REF" \
           "${wl[@]}" "${targets[@]}" \
           --findings="$OUTDIR/findings.json"
+        # Compatibility for callers that uploaded the historical path directly.
+        rm -rf "$LEGACY_OUTDIR"
+        mkdir -p "$LEGACY_OUTDIR"
+        cp "$OUTDIR/findings.json" "$LEGACY_OUTDIR/findings.json"
         {
           echo "findings=$OUTDIR/findings.json"
         } >> "$GITHUB_OUTPUT"
@@ -237,19 +271,23 @@ runs:
 
     # Phase 2: render the Step Summary from the materialized findings.
     - name: Report (trusted)
+      id: report
       shell: bash
       env:
         FLAKEVULN_BIN: ${{ steps.build.outputs.bin }}
         FINDINGS: ${{ steps.scan.outputs.findings }}
+        OUTDIR: ${{ steps.cache-meta.outputs.outdir }}
         NIXPRS: ${{ inputs.nixprs }}
         NIXPRS_EXCLUDE_PACKAGES: ${{ inputs.nixprs-exclude-packages }}
         NIXTRACKER: ${{ inputs.nixtracker }}
         BASELINE_FINDINGS: ${{ steps.baseline-scope.outputs.baseline_path }}
+        FLAKEVULN_REPORT_ARTIFACT_NAME: ${{ inputs.upload-report == 'true' && steps.cache-meta.outputs.report_artifact_name || '' }}
+        FLAKEVULN_REPORT_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         # Composite actions do not auto-inherit github.token.
         GH_TOKEN: ${{ inputs.token || github.token }}
       run: |
         set -euo pipefail
-        args=( report --findings="$FINDINGS" )
+        args=( report --findings="$FINDINGS" --outdir="$OUTDIR/report" )
         if [ "$NIXPRS" = "true" ]; then args+=( --nixprs ); fi
         for package in $NIXPRS_EXCLUDE_PACKAGES; do
           args+=( "--nixprs-exclude-package=$package" )
@@ -258,6 +296,19 @@ runs:
         args+=( --baseline-findings="$BASELINE_FINDINGS" )
         args+=( --update-baseline-findings="$BASELINE_FINDINGS" )
         "$FLAKEVULN_BIN" "${args[@]}"
+        {
+          echo "report=$OUTDIR/report"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Upload flakevuln report artifact
+      id: upload-report
+      if: ${{ !cancelled() && inputs.upload-report == 'true' && steps.scan.outputs.findings != '' }}
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: ${{ steps.cache-meta.outputs.report_artifact_name }}
+        path: ${{ steps.cache-meta.outputs.outdir }}
+        if-no-files-found: error
+        retention-days: ${{ inputs.report-retention-days }}
 
     - name: Probe local tool caches for save
       id: cache-save-probe

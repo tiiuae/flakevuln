@@ -296,6 +296,8 @@ def test_local_subcommand_runs_scan_then_report(monkeypatch, tmp_path):
     assert report_kwargs["nixprs_exclude_packages"] == ["linux"]
     assert report_kwargs["nixtracker_enabled"] is True
     assert report_kwargs["outdir"].name == "report"
+    assert report_kwargs["index_outdir"] == outdir / "report"
+    assert report_kwargs["index_findings"] == outdir / "findings.json"
     expected_baseline = flakevuln_main._baseline_findings_path(
         ".", ["pkgA", "pkgB"], "nixpkgs"
     )
@@ -618,11 +620,14 @@ def test_report_subcommand_reads_findings_without_flake_eval(monkeypatch, tmp_pa
         scanned_targets = []
         errors = {}
 
-        def render_detailed_summary(self):
+        def render_detailed_summary(self, *, full=True, artifact_run_url=""):
             return "summary"
 
-        def report(self, outdir):
+        def report(self, outdir, notes=()):
             reports.append(outdir)
+
+        def _report_target_entries(self):
+            return []
 
     findings = tmp_path / "findings.json"
     findings.write_text("{}", encoding="utf-8")
@@ -940,7 +945,6 @@ def test_report_writes_step_summary_without_outdir(monkeypatch, tmp_path):
 
     summary_text = summary_file.read_text(encoding="utf-8")
     assert "Flakevuln Scan Summary" in summary_text
-    assert "## Detailed Vulnerability Report" in summary_text
     # No --outdir: no markdown report was written.
     assert not (tmp_path / "README.md").exists()
 
@@ -1628,7 +1632,6 @@ def test_report_detailed_summary_includes_report_layout(tmp_path, monkeypatch):
     summary_text = (tmp_path / "summary.md").read_text(encoding="utf-8")
     assert "Flakevuln Scan Summary" in summary_text
     assert "Skipped nixpkgs unstable comparison" in summary_text
-    assert "## Detailed Vulnerability Report" in summary_text
     assert "### Targets" not in summary_text
     assert "| target | status | current |" not in summary_text
     assert (
@@ -1641,27 +1644,27 @@ def test_report_detailed_summary_includes_report_layout(tmp_path, monkeypatch):
     assert "<summary>New Vulnerabilities Since Last Run</summary>" in summary_text
     assert (
         "<summary>Vulnerabilities No Longer Active Since Last Run</summary>"
-        in summary_text
+        not in summary_text
     )
-    assert "<summary>Currently Active Vulnerabilities</summary>" in summary_text
-    assert WHITELISTED_COLLAPSED_SECTION in summary_text
+    assert "<summary>Currently Active Vulnerabilities (" in summary_text
+    # The Step Summary drops the whitelisted and patch-evidence tables; the
+    # rendered report keeps them.
+    assert WHITELISTED_COLLAPSED_SECTION not in summary_text
     assert "These active findings disappear when <code>nixpkgs</code>" in summary_text
     assert "These findings are present after the in-channel comparison" in summary_text
     assert "These active findings are present in this run" in summary_text
-    assert "These findings were active in the previous baseline" in summary_text
+    assert "These findings were active in the previous baseline" not in summary_text
     assert (
         "The following table lists all non-whitelisted vulnerabilities" in summary_text
     )
-    assert "These rows matched the whitelist input" in summary_text
+    assert "These rows matched the whitelist input" not in summary_text
     assert "No previous run baseline available" in summary_text
-    assert (
-        "<summary><code>flake#packages.x86_64-linux.default</code></summary>"
-        in summary_text
-    )
-    assert WHITELISTED_COLLAPSED_SECTION in summary_text
+    assert "<summary><h2>flake#packages.x86_64-linux.default (" in summary_text
     assert "[CVE-1](https://example.test/CVE-1)" in summary_text
-    assert "CVE-2" in summary_text
-    assert "pkg-whitelisted" in summary_text
+    # CVE-2 is the whitelisted row, and the whitelisted table is not rendered
+    # into the Step Summary.
+    assert "CVE-2" not in summary_text
+    assert "pkg-whitelisted" not in summary_text
     assert "| version_local" in summary_text
     assert "| nix_unstable" in summary_text
     assert "repology_nix_unstable" not in summary_text
@@ -1705,13 +1708,9 @@ def test_report_summary_works_without_extra_notes(tmp_path, monkeypatch):
 
     summary_text = (tmp_path / "summary.md").read_text(encoding="utf-8")
     assert "Flakevuln Scan Summary" in summary_text
-    assert "## Detailed Vulnerability Report" in summary_text
     assert "### Targets" not in summary_text
     assert "| target | status | current |" not in summary_text
-    assert (
-        "<summary><code>flake#packages.x86_64-linux.default</code></summary>"
-        in summary_text
-    )
+    assert "<summary><h2>flake#packages.x86_64-linux.default (" in summary_text
     assert (
         "<summary>Vulnerabilities Fixed by Updating Pinned nixpkgs</summary>"
         in summary_text
@@ -1719,10 +1718,10 @@ def test_report_summary_works_without_extra_notes(tmp_path, monkeypatch):
     assert "<summary>New Vulnerabilities Since Last Run</summary>" in summary_text
     assert (
         "<summary>Vulnerabilities No Longer Active Since Last Run</summary>"
-        in summary_text
+        not in summary_text
     )
-    assert "<summary>Currently Active Vulnerabilities</summary>" in summary_text
-    assert WHITELISTED_COLLAPSED_SECTION in summary_text
+    assert "<summary>Currently Active Vulnerabilities (" in summary_text
+    assert WHITELISTED_COLLAPSED_SECTION not in summary_text
     assert (
         "The following table lists all non-whitelisted vulnerabilities" in summary_text
     )
@@ -1758,15 +1757,11 @@ def test_report_summary_groups_multiple_targets_in_collapsible_blocks(
     summary_text = (tmp_path / "summary.md").read_text(encoding="utf-8")
     assert "### Targets" not in summary_text
     assert "<ul>" not in summary_text
-    assert (
-        "<summary><code>flake#packages.x86_64-linux.default</code></summary>"
-        in summary_text
-    )
-    assert (
-        "<summary><code>flake#packages.x86_64-linux.flakevuln</code></summary>"
-        in summary_text
-    )
-    assert summary_text.count("No previous run baseline available") == 4
+    assert "<summary><h2>flake#packages.x86_64-linux.default (" in summary_text
+    assert "<summary><h2>flake#packages.x86_64-linux.flakevuln (" in summary_text
+    # One previous-run section per target now, not two: the no-longer-active
+    # table is rendered only into the complete report.
+    assert summary_text.count("No previous run baseline available") == 2
     assert "pkg-a" in summary_text
     assert "pkg-b" in summary_text
 
@@ -1803,10 +1798,10 @@ def test_report_summary_escapes_html_in_target_headers(tmp_path, monkeypatch):
 
     summary_text = (tmp_path / "summary.md").read_text(encoding="utf-8")
     assert (
-        "<summary><code>"
+        "<summary><h2>"
         "github:acme/widget?dir=sub&amp;narHash=&lt;test&gt;"
         "#packages.x86_64-linux.default"
-        "</code></summary>"
+        " ("
     ) in summary_text
     assert "github:acme/widget?dir=sub&narHash=<test>" not in summary_text
 
@@ -1845,10 +1840,10 @@ def test_report_summary_escapes_markdown_sensitive_target_index_input(
 
     summary_text = (tmp_path / "summary.md").read_text(encoding="utf-8")
     assert (
-        "<summary><code>flake`name spoof#packages.x86_64-linux.default</code></summary>"
+        "<summary><h2>flake`name spoof#packages.x86_64-linux.default ("
     ) in summary_text
     assert "* `flake`name" not in summary_text
-    assert "spoof#packages.x86_64-linux.default</code></summary>" in summary_text
+    assert "spoof#packages.x86_64-linux.default (" in summary_text
 
 
 def test_baseline_findings_path_collapses_equivalent_local_spellings(
@@ -1935,7 +1930,7 @@ def test_report_uses_previous_run_baseline_across_equivalent_local_flakeref_spel
     summary_text = (tmp_path / "summary.md").read_text(encoding="utf-8")
     assert "No previous run baseline available" not in summary_text
     assert "CVE-NEW" in summary_text
-    assert "CVE-OLD" in summary_text
+    assert "CVE-OLD" not in summary_text
 
 
 def test_report_summary_renders_previous_run_sections_and_validated_link(
@@ -1996,10 +1991,12 @@ def test_report_summary_renders_previous_run_sections_and_validated_link(
     assert "<summary>New Vulnerabilities Since Last Run</summary>" in summary_text
     assert (
         "<summary>Vulnerabilities No Longer Active Since Last Run</summary>"
-        in summary_text
+        not in summary_text
     )
     assert "CVE-NEW" in summary_text
-    assert "CVE-OLD" in summary_text
+    # CVE-OLD appears only in the no-longer-active table, which the Step
+    # Summary does not render; the report below still has it.
+    assert "CVE-OLD" not in summary_text
     assert r"Last run: 2026\-06\-16T05:04:03Z, nixpkgs rev rev\-prev" in summary_text
     assert link in summary_text
     assert "<summary>New Vulnerabilities Since Last Run</summary>" in report_text
@@ -2014,7 +2011,8 @@ def test_report_summary_renders_previous_run_sections_and_validated_link(
         "The following table lists all non-whitelisted vulnerabilities" in report_text
     )
     assert link in report_text
-    assert "[PR](https://github.com/NixOS/nixpkgs/pull/42)" in summary_text
+    # The PR link is on the CVE-OLD row, so it travels with that table.
+    assert "[PR](https://github.com/NixOS/nixpkgs/pull/42)" not in summary_text
     assert "[PR](https://github.com/NixOS/nixpkgs/pull/42)" in report_text
 
 
@@ -2257,6 +2255,25 @@ def test_report_target_filename_sanitizes_path_separators(tmp_path):
     assert target_report.name.startswith("packages.x86_64-linux._foo_bar.")
     assert target_report.suffix == ".md"
     assert "CVE-1" in target_report.read_text(encoding="utf-8")
+
+
+def test_report_target_filename_avoids_generated_report_file(tmp_path):
+    target = "README"
+    scanner = _make_scanner(tmp_path, flakeref="flake")
+    scanner.scanned_targets = [("flake", target)]
+    scanner.df_scan = pd.DataFrame([_scan_row(target, PIN_CURRENT, "CVE-1", "pkg")])
+
+    report_dir = tmp_path / "custom-report"
+    scanner.report(report_dir)
+
+    target_reports = [
+        path
+        for path in report_dir.glob("*.md")
+        if path.name not in flakevuln_main.REPORT_RESERVED_FILENAMES
+    ]
+    assert len(target_reports) == 1
+    assert "CVE-1" in target_reports[0].read_text(encoding="utf-8")
+    assert (report_dir / "README.md").exists()
 
 
 def test_init_flakefiles_friendly_fatal_on_missing_lock(tmp_path, caplog):
@@ -2712,7 +2729,9 @@ def test_report_scopes_whitelisted_findings_to_target(monkeypatch, tmp_path):
         scanner, "_diff_scans", lambda *_args, **_kwargs: pd.DataFrame()
     )
 
-    report_path = scanner._report_target(tmp_path, scanner.flakeref, target)
+    report_path = scanner._report_target(
+        tmp_path, scanner.flakeref, target, "report.md"
+    )
     report_text = report_path.read_text(encoding="utf-8")
 
     assert "target-only" in report_text
@@ -2733,9 +2752,9 @@ def test_report_treats_missing_whitelist_as_active(monkeypatch, tmp_path):
         scanner, "_diff_scans", lambda *_args, **_kwargs: pd.DataFrame()
     )
 
-    report_text = scanner._report_target(tmp_path, scanner.flakeref, target).read_text(
-        encoding="utf-8"
-    )
+    report_text = scanner._report_target(
+        tmp_path, scanner.flakeref, target, "report.md"
+    ).read_text(encoding="utf-8")
 
     assert "active-only" in report_text
     assert report_text.count("active-only") == 1
@@ -2762,9 +2781,9 @@ def test_report_target_is_brand_free_and_parameterized(monkeypatch, tmp_path):
 
     monkeypatch.setattr(scanner, "_diff_scans", lambda *_a, **_k: pd.DataFrame())
 
-    report_text = scanner._report_target(tmp_path, scanner.flakeref, target).read_text(
-        encoding="utf-8"
-    )
+    report_text = scanner._report_target(
+        tmp_path, scanner.flakeref, target, "report.md"
+    ).read_text(encoding="utf-8")
 
     assert "Widget" in report_text
     assert "https://acme.example/widget" in report_text
@@ -2785,9 +2804,9 @@ def test_report_target_sanitizes_untrusted_branding_and_identifiers(
 
     monkeypatch.setattr(scanner, "_diff_scans", lambda *_a, **_k: pd.DataFrame())
 
-    report_text = scanner._report_target(tmp_path, scanner.flakeref, target).read_text(
-        encoding="utf-8"
-    )
+    report_text = scanner._report_target(
+        tmp_path, scanner.flakeref, target, "report.md"
+    ).read_text(encoding="utf-8")
 
     assert "javascript:alert(1)" not in report_text
     assert "\n# injected" not in report_text
@@ -2803,9 +2822,9 @@ def test_report_target_unstable_section_conditional(monkeypatch, tmp_path):
         scanner = _make_scanner(tmp_path, unstable_ref=unstable_ref)
         scanner.scanned_targets = [(scanner.flakeref, target)]
         monkeypatch.setattr(scanner, "_diff_scans", lambda *_a, **_k: pd.DataFrame())
-        return scanner._report_target(tmp_path, scanner.flakeref, target).read_text(
-            encoding="utf-8"
-        )
+        return scanner._report_target(
+            tmp_path, scanner.flakeref, target, "report.md"
+        ).read_text(encoding="utf-8")
 
     assert "Fixed in nixpkgs Unstable" in _render("github:NixOS/nixpkgs/nixos-unstable")
     assert "Fixed in nixpkgs Unstable" not in _render("")
@@ -2824,9 +2843,9 @@ def test_report_target_unstable_section_explains_redundant_skip(monkeypatch, tmp
     )
     monkeypatch.setattr(scanner, "_diff_scans", lambda *_a, **_k: pd.DataFrame())
 
-    report_text = scanner._report_target(tmp_path, scanner.flakeref, target).read_text(
-        encoding="utf-8"
-    )
+    report_text = scanner._report_target(
+        tmp_path, scanner.flakeref, target, "report.md"
+    ).read_text(encoding="utf-8")
 
     assert "Fixed in nixpkgs Unstable" in report_text
     assert "equivalent to the main input" in report_text
@@ -2844,9 +2863,9 @@ def test_report_target_current_failure_masks_later_diff_sections(monkeypatch, tm
         [_scan_row(target, PIN_LOCK_UPDATED, "CVE-1", "pkgA")]
     )
 
-    report_text = scanner._report_target(tmp_path, scanner.flakeref, target).read_text(
-        encoding="utf-8"
-    )
+    report_text = scanner._report_target(
+        tmp_path, scanner.flakeref, target, "report.md"
+    ).read_text(encoding="utf-8")
 
     assert "boom" in report_text
     assert "CVE-1" not in report_text
@@ -3603,7 +3622,7 @@ def test_run_report_sanitizes_comparison_notes_in_summary(monkeypatch, tmp_path)
         def apply_nixprs(self, _actionable):
             return None
 
-        def render_detailed_summary(self):
+        def render_detailed_summary(self, *, full=True, artifact_run_url=""):
             return "details"
 
         def report(self, _outdir):
@@ -3623,7 +3642,9 @@ def test_run_report_sanitizes_comparison_notes_in_summary(monkeypatch, tmp_path)
     )
     monkeypatch.setattr(flakevuln_main, "_load_baseline_reporter", lambda _path: None)
     monkeypatch.setattr(
-        flakevuln_main, "_write_summary", lambda text: captured.setdefault("text", text)
+        flakevuln_main,
+        "_write_summary",
+        lambda text, **_kwargs: captured.setdefault("text", text),
     )
 
     flakevuln_main._run_report(findings=tmp_path / "findings.json")
@@ -3680,6 +3701,542 @@ def test_dev_version_format_matches_git_state():
         ).stdout.strip()
     )
     assert bool(m.group("dirty")) == is_dirty
+
+
+def test_write_summary_keeps_a_fitting_report_byte_for_byte(tmp_path, monkeypatch):
+    """A report inside the limit must reach the Step Summary unchanged."""
+    summary = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    text = "# Flakevuln Scan Summary\n\n<details open>\nrow\n</details>"
+
+    flakevuln_main._write_summary(text)
+
+    assert summary.read_text(encoding="utf-8") == text + "\n"
+
+
+def test_write_summary_replaces_an_oversized_report_with_artifact_index(
+    tmp_path, monkeypatch
+):
+    """An oversized report should become a compact artifact index, not a
+    fragile partial markdown prefix."""
+    summary = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    monkeypatch.setattr(flakevuln_main, "_STEP_SUMMARY_MAX_BYTES", 512)
+    text = "# Flakevuln Scan Summary\n\n" + "| CVE-2026-0001 |\n" * 100
+    fallback = (
+        "# Flakevuln Scan Summary\n\n"
+        "> [!WARNING]\n"
+        "> Download the report artifact.\n\n"
+        "## Target Reports\n\n"
+        "- `flake#pkg`: `report/pkg.md`"
+    )
+
+    flakevuln_main._write_summary(
+        text,
+        fallback=flakevuln_main._StepSummaryFallback(
+            fallback,
+            fallback,
+            "report artifact index",
+        ),
+    )
+
+    written = summary.read_bytes()
+    assert len(written) <= flakevuln_main._STEP_SUMMARY_MAX_BYTES
+    body = written.decode("utf-8")
+    assert body == fallback + "\n"
+    assert "CVE-2026-0001" not in body
+    assert "report/pkg.md" in body
+
+
+def test_write_summary_counts_content_already_in_the_file(tmp_path, monkeypatch):
+    """The limit applies to the whole file, and the summary is opened for
+    append, so an earlier write has to count against the budget."""
+    summary = tmp_path / "summary.md"
+    monkeypatch.setattr(flakevuln_main, "_STEP_SUMMARY_MAX_BYTES", 512)
+    filler_bytes = 320
+    summary.write_bytes(b"x" * filler_bytes)
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+    text = "# Flakevuln Scan Summary\n\n" + "| CVE-2026-0001 |\n" * 20
+    fallback = "# Flakevuln Scan Summary\n\nArtifact: `flakevuln-report`"
+
+    flakevuln_main._write_summary(
+        text,
+        fallback=flakevuln_main._StepSummaryFallback(
+            fallback,
+            fallback,
+            "report artifact index",
+        ),
+    )
+
+    assert len(summary.read_bytes()) <= flakevuln_main._STEP_SUMMARY_MAX_BYTES
+    assert summary.read_text(encoding="utf-8").endswith(fallback + "\n")
+
+
+def test_run_report_writes_oversize_artifact_index_and_passes_notes(
+    tmp_path, monkeypatch
+):
+    class FakeReporter:
+        def _comparison_notes(self):
+            return ["comparison note"]
+
+        def render_detailed_summary(self, *, full=True, artifact_run_url=""):
+            return "full detail line\n" * 200
+
+        def report(self, outdir, notes=()):
+            outdir.mkdir(parents=True)
+            (outdir / "README.md").write_text("\n".join(notes), encoding="utf-8")
+            (outdir / "pkg.md").write_text("target report", encoding="utf-8")
+
+        def _report_target_entries(self):
+            return [
+                flakevuln_main._ReportTargetEntry(
+                    "flake",
+                    "pkg",
+                    "flake#pkg",
+                    "pkg.md",
+                )
+            ]
+
+        def _target_report_counts(self, _flakeref, _target):
+            return flakevuln_main._TargetReportCounts(1, 1, 0, 0, 0)
+
+        def has_current_scan_failures(self):
+            return False
+
+    summary_path = tmp_path / "summary.md"
+    findings = tmp_path / "evidence" / "results.json"
+    report_dir = tmp_path / "custom-report"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_path))
+    monkeypatch.setenv("FLAKEVULN_REPORT_ARTIFACT_NAME", "flakevuln-report-test")
+    monkeypatch.setenv(
+        "FLAKEVULN_REPORT_RUN_URL",
+        "https://github.com/acme/widget/actions/runs/123",
+    )
+    monkeypatch.setattr(flakevuln_main, "_STEP_SUMMARY_MAX_BYTES", 1600)
+    monkeypatch.setattr(
+        flakevuln_main.FlakeScanner,
+        "from_findings",
+        classmethod(lambda _cls, _findings: FakeReporter()),
+    )
+
+    flakevuln_main._run_report(findings=findings, outdir=report_dir)
+
+    step_summary = summary_path.read_text(encoding="utf-8")
+    landing = (report_dir / "README.md").read_text(encoding="utf-8")
+    assert "comparison note" in landing
+    assert "comparison note" in step_summary
+    assert "full detail line" not in step_summary
+    assert "Full Report Artifact" in step_summary
+    assert "`flakevuln-report-test`" in step_summary
+    assert (
+        "[view workflow run](https://github.com/acme/widget/actions/runs/123)"
+        in step_summary
+    )
+    assert "custom-report/pkg.md" in step_summary
+    assert "evidence/results.json" in step_summary
+    assert len(step_summary.encode("utf-8")) <= flakevuln_main._STEP_SUMMARY_MAX_BYTES
+
+
+def test_report_output_index_uses_collision_safe_local_target_paths(
+    tmp_path, monkeypatch
+):
+    target = "packages.x86_64-linux.default"
+    scanner = _make_scanner(tmp_path, flakeref="flake-a")
+    scanner.scanned_targets = [("flake-a", target), ("flake-b", target)]
+    scanner.df_scan = pd.DataFrame(
+        [
+            _scan_row(target, PIN_CURRENT, "CVE-A", "pkg-a", flakeref="flake-a"),
+            _scan_row(target, PIN_CURRENT, "CVE-B", "pkg-b", flakeref="flake-b"),
+        ]
+    )
+    report_dir = tmp_path / "custom-report"
+    findings = tmp_path / "findings.json"
+    monkeypatch.delenv("FLAKEVULN_REPORT_ARTIFACT_NAME", raising=False)
+    monkeypatch.delenv("FLAKEVULN_REPORT_RUN_URL", raising=False)
+
+    fallback = flakevuln_main._render_report_output_fallback(
+        scanner, [], outdir=report_dir, findings=findings
+    )
+    index = fallback.text
+
+    assert "Full Report Directory" in index
+    assert "Full Report Artifact" not in index
+    assert report_dir.as_posix() in index
+    assert findings.as_posix() in index
+    for entry in scanner._report_target_entries():
+        assert (report_dir / entry.filename).as_posix() in index
+        assert entry.label in index
+
+
+def _index_row(index, target):
+    """Return the index table row for `target`, split into cells."""
+    for line in index.splitlines():
+        if line.startswith("|") and target in line:
+            return [cell.strip() for cell in line.strip("|").split("|")]
+    raise AssertionError(f"no index row for {target}:\n{index}")
+
+
+def test_report_output_index_counts_active_findings_per_target(tmp_path, monkeypatch):
+    """The index is the whole page when a report overflows, so it has to
+    answer "did anything change" without a download."""
+    target = "packages.x86_64-linux.default"
+    scanner = _make_scanner(tmp_path, flakeref="flake")
+    scanner.scanned_targets = [("flake", target)]
+    scanner.df_scan = pd.DataFrame(
+        [
+            _scan_row(target, PIN_CURRENT, "CVE-A", "pkg-a"),
+            _scan_row(target, PIN_CURRENT, "CVE-B", "pkg-b"),
+        ]
+    )
+    monkeypatch.delenv("FLAKEVULN_REPORT_ARTIFACT_NAME", raising=False)
+
+    index = flakevuln_main._render_report_output_fallback(
+        scanner, [], outdir=tmp_path / "report", findings=tmp_path / "findings.json"
+    ).text
+
+    cells = _index_row(index, target)
+    # target | new | no longer active | active | fixed by re-lock | ...
+    assert cells[3] == "2"
+
+
+def test_report_output_index_marks_unknown_counts_rather_than_zero(
+    tmp_path, monkeypatch
+):
+    """With no previous run there is nothing to diff against. Rendering that
+    as 0 would report "nothing changed" for a comparison nobody made."""
+    target = "packages.x86_64-linux.default"
+    scanner = _make_scanner(tmp_path, flakeref="flake")
+    scanner.scanned_targets = [("flake", target)]
+    scanner.df_scan = pd.DataFrame([_scan_row(target, PIN_CURRENT, "CVE-A", "pkg-a")])
+    monkeypatch.delenv("FLAKEVULN_REPORT_ARTIFACT_NAME", raising=False)
+
+    index = flakevuln_main._render_report_output_fallback(
+        scanner, [], outdir=tmp_path / "report", findings=tmp_path / "findings.json"
+    ).text
+
+    cells = _index_row(index, target)
+    assert cells[1] == "-"
+    assert cells[2] == "-"
+
+
+def _summary_fixture(tmp_path):
+    """A scanner with one active and one whitelisted finding."""
+    target = "packages.x86_64-linux.default"
+    scanner = _make_scanner(tmp_path, flakeref="flake")
+    scanner.scanned_targets = [("flake", target)]
+    scanner.df_scan = pd.DataFrame(
+        [
+            _scan_row(target, PIN_CURRENT, "CVE-ACTIVE", "pkg-active"),
+            _scan_row(
+                target,
+                PIN_CURRENT,
+                "CVE-LISTED",
+                "pkg-whitelisted",
+                whitelist="True",
+                whitelist_comment="false positive",
+            ),
+        ]
+    )
+    return scanner
+
+
+def test_step_summary_drops_the_bulk_tables(tmp_path):
+    """They are the bulk of a large report and the least useful part to read
+    inline, and the complete report is published beside it."""
+    scanner = _summary_fixture(tmp_path)
+
+    trimmed = scanner.render_detailed_summary(full=False)
+    complete = scanner.render_detailed_summary()
+
+    no_longer_active = "<summary>Vulnerabilities No Longer Active Since Last Run"
+    assert no_longer_active not in trimmed
+    assert no_longer_active in complete
+    assert WHITELISTED_COLLAPSED_SECTION not in trimmed
+    assert "pkg-whitelisted" not in trimmed
+    assert WHITELISTED_COLLAPSED_SECTION in complete
+    assert "pkg-whitelisted" in complete
+    # What the reader came for is still there.
+    assert "pkg-active" in trimmed
+    assert "<summary>Currently Active Vulnerabilities (" in trimmed
+
+
+def test_no_report_links_within_itself(tmp_path):
+    """In-document links only resolve where a reader views the rendered
+    markdown, and a trimmed rendering can drop the section one points at. The
+    sections are named in the prose instead."""
+    scanner = _summary_fixture(tmp_path)
+
+    for rendering in (
+        scanner.render_detailed_summary(),
+        scanner.render_detailed_summary(full=False),
+    ):
+        assert "](#" not in rendering
+        assert "<a id=" not in rendering
+
+
+def _split_reporter():
+    """A reporter whose two summary variants are told apart by their text."""
+
+    class FakeReporter:
+        def _comparison_notes(self):
+            return []
+
+        def render_detailed_summary(self, *, full=True, artifact_run_url=""):
+            return "COMPLETE-SUMMARY" if full else "TRIMMED-SUMMARY"
+
+        def report(self, outdir, notes=()):
+            outdir.mkdir(parents=True, exist_ok=True)
+            (outdir / "README.md").write_text("index", encoding="utf-8")
+
+        def _report_target_entries(self):
+            return []
+
+        def has_current_scan_failures(self):
+            return False
+
+    return FakeReporter()
+
+
+def test_run_report_trims_the_step_summary_and_publishes_reports(tmp_path, monkeypatch):
+    """The GitHub summary is trimmed while complete reports publish separately."""
+    summary_path = tmp_path / "summary.md"
+    outdir = tmp_path / "out"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_path))
+    monkeypatch.setattr(
+        flakevuln_main.FlakeScanner,
+        "from_findings",
+        classmethod(lambda _cls, _findings: _split_reporter()),
+    )
+
+    flakevuln_main._run_report(findings=tmp_path / "findings.json", outdir=outdir)
+
+    assert "TRIMMED-SUMMARY" in summary_path.read_text(encoding="utf-8")
+    assert "COMPLETE-SUMMARY" not in summary_path.read_text(encoding="utf-8")
+    assert (outdir / "README.md").exists()
+
+
+def test_a_local_run_logs_the_complete_summary(tmp_path, monkeypatch):
+    """A local run has no artifact to read the dropped tables from, so
+    trimming its output would just lose them."""
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    logged = []
+    monkeypatch.setattr(
+        flakevuln_main.LOG, "info", lambda fmt, *args: logged.extend(args)
+    )
+    monkeypatch.setattr(
+        flakevuln_main.FlakeScanner,
+        "from_findings",
+        classmethod(lambda _cls, _findings: _split_reporter()),
+    )
+
+    flakevuln_main._run_report(findings=tmp_path / "findings.json", outdir=None)
+
+    assert any("COMPLETE-SUMMARY" in str(arg) for arg in logged)
+    assert not any("TRIMMED-SUMMARY" in str(arg) for arg in logged)
+
+
+def _scanner_with_active(tmp_path, count, targets=("packages.x86_64-linux.default",)):
+    """A scanner holding `count` active findings under each of `targets`."""
+    scanner = _make_scanner(tmp_path, flakeref="flake")
+    scanner.scanned_targets = [("flake", t) for t in targets]
+    scanner.df_scan = pd.DataFrame(
+        [
+            _scan_row(t, PIN_CURRENT, f"CVE-{t}{i}", f"pkg-{i}")
+            for t in targets
+            for i in range(count)
+        ]
+    )
+    return scanner
+
+
+def test_the_active_section_is_open_and_counted(tmp_path):
+    """The table a reader came for should not need a click, and the count in
+    the heading says how long it is before they scroll it."""
+    scanner = _scanner_with_active(tmp_path, 12)
+
+    summary = scanner.render_detailed_summary()
+
+    assert "<summary>Currently Active Vulnerabilities (12)</summary>" in summary
+    heading_at = summary.index("<summary>Currently Active Vulnerabilities (12)")
+    assert summary[:heading_at].rstrip().endswith("<details open>")
+
+
+@pytest.mark.parametrize(
+    ("count", "expected"),
+    [
+        (12, "Found 12 active vulnerabilities, listed below under"),
+        (1, "Found 1 active vulnerability, listed below under"),
+        # "listed below" would point at an empty table.
+        (0, "Found no active vulnerabilities."),
+    ],
+)
+def test_each_target_leads_with_what_the_scan_found(tmp_path, count, expected):
+    """A reader arriving at the Step Summary sees collapsed targets; this says
+    what the scan found, and where the rest of the report is."""
+    scanner = _scanner_with_active(tmp_path, count)
+
+    summary = scanner.render_detailed_summary(
+        full=False, artifact_run_url="https://github.test/acme/w/actions/runs/1"
+    )
+
+    assert expected in summary
+    assert (
+        "see [the run artifacts](https://github.test/acme/w/actions/runs/1)" in summary
+    )
+    # Naming what is missing belongs in this branch too, not only where there
+    # is no artifact to point at.
+    assert (
+        "leaves out the no-longer-active, whitelisted, and patch-evidence tables"
+        in summary
+    )
+    if not count:
+        assert "listed below" not in summary
+
+
+def test_the_full_report_does_not_point_at_itself(tmp_path):
+    """The complete report is what the artifact holds, so telling its reader
+    to go and find it is a loop."""
+    scanner = _scanner_with_active(tmp_path, 3)
+
+    summary = scanner.render_detailed_summary()
+
+    assert "Found 3 active vulnerabilities, listed" in summary
+    assert "the run artifacts" not in summary
+
+
+def test_no_artifact_means_no_pointer(tmp_path):
+    """With the upload disabled there is nowhere durable to send a reader:
+    the report directory does not outlive the job, so naming it would be
+    worse than saying nothing."""
+    scanner = _scanner_with_active(tmp_path, 3)
+
+    summary = scanner.render_detailed_summary(full=False, artifact_run_url="")
+
+    headline = next(
+        line for line in summary.splitlines() if line.startswith(("Found ", "The scan"))
+    )
+    assert headline.endswith(
+        "This rendering leaves out the no-longer-active, whitelisted, and "
+        "patch-evidence tables."
+    )
+    assert "artifacts" not in headline
+
+
+def test_a_lone_target_is_not_folded(tmp_path):
+    """Folding is for choosing between targets; with one there is nothing to
+    choose and the fold is only a click."""
+    scanner = _scanner_with_active(tmp_path, 3, ["only"])
+
+    summary = scanner.render_detailed_summary()
+
+    assert "<details open>\n<summary><h2>flake#only (3 active)" in summary
+
+
+def test_several_targets_are_folded(tmp_path):
+    """Folded, the headings are the whole page, which is what makes it
+    scannable."""
+    scanner = _scanner_with_active(tmp_path, 3, ["one", "two"])
+
+    summary = scanner.render_detailed_summary()
+
+    assert "<details>\n<summary><h2>flake#one (3 active)" in summary
+    assert "<details>\n<summary><h2>flake#two (3 active)" in summary
+
+
+def test_a_failed_scan_is_not_reported_as_clean(tmp_path):
+    """Zero findings and an unknown number are different answers. Rendering a
+    failed scan as clean tells a reader a host is fine when nothing looked."""
+    target = "packages.x86_64-linux.default"
+    scanner = _scanner_with_active(tmp_path, 1)
+    scanner.errors[scanner._error_key("flake", target, PIN_CURRENT)] = {
+        "message": "Error evaluating",
+        "details": "boom",
+    }
+
+    summary = scanner.render_detailed_summary(full=False, artifact_run_url="")
+
+    assert "(scan failed)" in summary
+    assert "active)" not in summary
+    assert "Found no active vulnerabilities" not in summary
+    assert "The scan of this target failed" in summary
+    # And every index count is unknown, not zero, which is the point of one
+    # shared definition of an active finding.
+    assert scanner._target_report_counts(
+        "flake", target
+    ) == flakevuln_main._TargetReportCounts(None, None, None, None, None)
+
+
+def test_index_counts_findings_not_rows(tmp_path):
+    """One finding commonly carries several version rows. Counting rows would
+    print a different number from the active count beside it, which
+    aggregates by finding."""
+    target = "packages.x86_64-linux.default"
+    two_versions = [
+        _scan_row(target, pin, vuln, "pkg", version_local=version)
+        for pin, vuln in (
+            # Current only: the re-lock resolves it.
+            (PIN_CURRENT, "CVE-HERE"),
+            # Present under every pin: nothing resolves it.
+            (PIN_CURRENT, "CVE-STAYS"),
+            (PIN_LOCK_UPDATED, "CVE-STAYS"),
+            (PIN_NIX_UNSTABLE, "CVE-STAYS"),
+            # Survives the re-lock, gone in unstable.
+            (PIN_CURRENT, "CVE-LOCKONLY"),
+            (PIN_LOCK_UPDATED, "CVE-LOCKONLY"),
+        )
+        for version in ("1.0", "2.0")
+    ]
+    scanner = _make_scanner(
+        tmp_path, flakeref="flake", unstable_ref="github:NixOS/nixpkgs/nixos-unstable"
+    )
+    scanner.scanned_targets = [("flake", target)]
+    scanner.df_scan = pd.DataFrame(two_versions)
+
+    # A previous run that held one finding this one no longer has, and did not
+    # hold CVE-HERE, both on two versions.
+    baseline = _make_scanner(tmp_path, flakeref="flake")
+    baseline.scanned_targets = [("flake", target)]
+    baseline.df_scan = pd.DataFrame(
+        [
+            _scan_row(target, PIN_CURRENT, vuln, "pkg", version_local=version)
+            for vuln in ("CVE-STAYS", "CVE-GONE")
+            for version in ("1.0", "2.0")
+        ]
+    )
+    scanner.baseline = baseline
+
+    counts = scanner._target_report_counts("flake", target)
+
+    # Every one of these would double if rows were counted.
+    assert counts.active == 3
+    assert counts.new == 2
+    assert counts.resolved == 1
+    assert counts.fixed_by_relock == 1
+    assert counts.fixed_in_unstable == 1
+
+
+def test_the_landing_page_carries_the_run_notes(tmp_path):
+    """The notes qualify every report below them, saying which enrichment ran
+    and which comparisons were skipped. Nothing else published records them."""
+    scanner = _scanner_with_active(tmp_path, 1)
+    outdir = tmp_path / "out"
+
+    scanner.report(outdir, notes=["nixpkgs PR link lookup: partial"])
+
+    landing = (outdir / "README.md").read_text(encoding="utf-8")
+    assert "nixpkgs PR link lookup: partial" in landing
+
+
+def test_the_landing_page_omits_an_empty_note_block(tmp_path):
+    """No notes should leave no gap where they would have been."""
+    scanner = _scanner_with_active(tmp_path, 1)
+    outdir = tmp_path / "out"
+
+    scanner.report(outdir)
+
+    landing = (outdir / "README.md").read_text(encoding="utf-8")
+    assert "RUN_NOTES" not in landing
+    assert "\n\n\n" not in landing
 
 
 if __name__ == "__main__":

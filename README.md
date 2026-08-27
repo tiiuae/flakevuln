@@ -141,6 +141,17 @@ see [example-scan.yml](.github/workflows/example-scan.yml).
 | `nixtracker` | no | `false` | Enable best-effort Nixpkgs security tracker enrichment during report rendering. |
 | `token` | no | `""` | Optional token for `nixprs`; when empty, the trusted report step falls back to `github.token`. |
 | `cachix-caches` | no | `""` | Space-delimited Cachix cache names to add as read-only substituters. |
+| `upload-report` | no | `true` | Upload the findings and rendered report as an artifact. With `false` the Step Summary is still trimmed, so publish `report-path` yourself or the omitted tables are unreachable. |
+| `report-retention-days` | no | `30` | Number of days to retain the uploaded report artifact. |
+
+### Outputs
+
+| Output | Description |
+| --- | --- |
+| `findings-path` | Path to the complete machine-readable findings JSON. |
+| `report-path` | Path to the rendered markdown report directory. |
+| `report-artifact-name` | Name of the report artifact when `upload-report` is `true`. |
+| `report-artifact-url` | URL for the uploaded report artifact when `upload-report` is `true`. |
 
 ### Behavior
 
@@ -151,8 +162,34 @@ see [example-scan.yml](.github/workflows/example-scan.yml).
   checkout-and-scan flow.
 - Security model: the untrusted `scan` phase runs without `GH_TOKEN`; optional
   GitHub-authenticated enrichment happens later in the trusted `report` phase.
-- Action outputs: none. The action writes its operator-facing result to the
-  GitHub Step Summary.
+- Report publication: the action uploads a report artifact containing
+  `findings.json`, `report/README.md`, and each per-target markdown report.
+  The landing page carries the run notes saying which enrichment ran and which
+  comparisons were skipped. The artifact is named
+  `flakevuln-report-<UTC timestamp>-<nonce>`: the timestamp sorts once
+  downloaded, and the nonce keeps the name unique across a workflow run, as
+  artifact names must be. `report-artifact-name` gives the exact name to
+  callers that need it.
+- Step Summary: each target is a heading carrying its active finding count,
+  folded when a scan covers more than one target. A target whose scan failed
+  reads `(scan failed)` rather than a count, since zero would report it clean.
+  The summary omits the no-longer-active, whitelisted, and patch-evidence
+  tables, which are the bulk of a large report and the least useful part to
+  read inline, along with the cross-references into them. Each target says
+  what was omitted, and links to the run artifacts when one was uploaded. The
+  published report and a local run's output keep everything.
+- Oversized reports: should the trimmed summary still exceed GitHub's 1MiB
+  per-step limit, a compact index replaces it, with per-target counts of new,
+  no longer active, and active findings so the page says whether anything
+  changed without a download. A count renders as `-` when it is not knowable
+  rather than zero: the scan failed, the comparison did not run, or there is
+  no previous run.
+- Artifact upload still runs after a successful scan if the trusted report step
+  fails, so `findings.json` remains available for diagnosis. Set
+  `upload-report: false` to disable the action-managed artifact.
+- The primary findings path is the `findings-path` output. For compatibility,
+  the action also writes a copy to `${{ runner.temp }}/flakevuln/findings.json`,
+  but callers should migrate to the output path for multi-invocation jobs.
 - Baseline diffing: the action persists a prior findings set keyed by flakeref,
   targets, and `input-name`, then reports what changed since the last
   successful run for that same scope.
@@ -322,21 +359,25 @@ nix run .#flakevuln -- report \
 ### Patch evidence
 
 Reports explain why a finding survived filtering, as an exception rather than
-as a column on every row. Every target report and Step Summary includes a
-collapsed **Patched and Partially Patched Findings** section listing the
-derivations behind a finding and any patches whose file names mention the
-vulnerability ID. It holds only the findings the active tables cannot explain
-by themselves: those hidden because every derivation is patch-matched, and
-those whose derivations disagree, whose patch metadata could not be read, or
-whose derivation could not be identified at all.
+as a column on every row. Every target report carries a collapsed **Patched
+and Partially Patched Findings** section listing the derivations behind a
+finding and any patches whose file names mention the vulnerability ID. It
+holds only the findings the active tables cannot explain by themselves: those
+hidden because every derivation is patch-matched, and those whose derivations
+disagree, whose patch metadata could not be read, or whose derivation could
+not be identified at all. The Step Summary leaves that section out and names
+the omission instead, so the evidence lives in the complete report.
 
 Findings whose derivations all carry a matching vulnerability-ID patch are
 hidden from the active tables and listed only in that section. The active
 section note reports how many were hidden, so the report itself records the
 omission even after the findings artifact has expired. Findings whose patch
 evidence needs review stay in the active tables with a `(*)` in the comment
-column, linking to their per-derivation detail: either the matched derivations
-disagree, or their patch evidence could not be established.
+column: either the matched derivations disagree, or their patch evidence could
+not be established. The note beside the table says how many and where their
+per-derivation detail is; reports carry no links within themselves, since a
+link resolves only where the rendered markdown is viewed and the Step Summary
+does not render every section it would point at.
 
 A matching patch file name is evidence that a fix was applied, not proof, and
 an absent one is not proof of exposure: a patch named `fix-build.patch` can

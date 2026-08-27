@@ -93,18 +93,42 @@ _SECTION_COMPONENT_EVIDENCE = "Patched and Partially Patched Findings"
 _SECTION_COMPONENT_EVIDENCE_COLLAPSED = (
     f"{_SECTION_COMPONENT_EVIDENCE} (press to expand)"
 )
-# Anchor base for in-document links to the section above. A Step Summary holds
-# one section per target, so the anchor is suffixed per target to stay unique.
-_COMPONENT_EVIDENCE_ANCHOR = "patched-and-partially-patched-findings"
-# GitHub's markdown sanitizer rewrites every `id` to `user-content-<id>` but
-# leaves `href="#..."` untouched, so an unprefixed pair resolves to nothing on
-# the Actions run page. Writing the prefix on both sides keeps them matched.
-# The rewrite is idempotent, so GitHub leaves an already-prefixed id alone, and
-# renderers that do not rewrite ids see a pair that agrees with itself. This
-# only fixes clicking a link in the rendered report. A fragment in the run
-# page's URL still cannot work, because that page injects the Step Summary
-# after the browser has resolved the fragment against a document without it.
-_ANCHOR_PREFIX = "user-content-"
+
+# GitHub aborts the upload of a Step Summary larger than 1MiB and renders
+# nothing at all for that step, so an oversized report loses the whole report
+# rather than its tail. Fall back to a compact output index instead of writing a
+# partial report.
+_STEP_SUMMARY_MAX_BYTES = 1024 * 1024
+_STEP_SUMMARY_OVERSIZED_ARTIFACT_WARNING = (
+    "> [!WARNING]\n"
+    "> The full Flakevuln report exceeded GitHub's 1MiB per-step Step Summary\n"
+    "> limit. Download the report artifact for the complete Markdown reports\n"
+    "> and machine-readable findings.\n"
+)
+_STEP_SUMMARY_OVERSIZED_OUTPUT_WARNING = (
+    "> [!WARNING]\n"
+    "> The full Flakevuln report exceeded GitHub's 1MiB per-step Step Summary\n"
+    "> limit. The complete Markdown reports were written to the report output\n"
+    "> directory.\n"
+)
+_STEP_SUMMARY_MINIMAL_ARTIFACT_WARNING = (
+    "# Flakevuln Scan Summary\n\n"
+    "> [!WARNING]\n"
+    "> The full Flakevuln report exceeded GitHub's Step Summary limit. "
+    "Download the report artifact for the complete reports.\n"
+)
+_STEP_SUMMARY_MINIMAL_OUTPUT_WARNING = (
+    "# Flakevuln Scan Summary\n\n"
+    "> [!WARNING]\n"
+    "> The full Flakevuln report exceeded GitHub's Step Summary limit. "
+    "See the report output directory for the complete reports.\n"
+)
+_STEP_SUMMARY_MINIMAL_NO_OUTPUT_WARNING = (
+    "# Flakevuln Scan Summary\n\n"
+    "> [!WARNING]\n"
+    "> The full Flakevuln report exceeded GitHub's Step Summary limit. "
+    "Run `flakevuln report --outdir` to render the complete reports.\n"
+)
 # Marks an active finding whose patch evidence needs a look, in the comment
 # column of every table.
 _PARTIAL_PATCH_MARKER = "(*)"
@@ -142,6 +166,7 @@ LOCAL_OUTPUT_ARTIFACTS = ("findings.json", "report")
 LOCAL_OUTDIR_MARKER = ".flakevuln-local-output"
 LOCAL_OUTDIR_MARKER_TEXT = "flakevuln local output v1\n"
 TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
+REPORT_RESERVED_FILENAMES = frozenset({"README.md"})
 
 _SEVERITY_SCORE = {
     "critical": 9.5,
@@ -163,6 +188,42 @@ class _TargetReportContext:
     all_rows: pd.DataFrame
     active_rows: pd.DataFrame
     unstable_versions: dict[tuple[str, str], tuple[str, ...]] | None
+
+
+@dataclass(frozen=True)
+class _ReportTargetEntry:
+    """Complete report-routing metadata for one scanned target."""
+
+    flakeref: str
+    target: str
+    label: str
+    filename: str
+
+
+@dataclass(frozen=True)
+class _TargetReportCounts:
+    """Per-target finding counts for the compact Step Summary index.
+
+    A count is None when the number is not knowable rather than zero: the
+    scan failed, the comparison did not run, or there is no previous run to
+    diff against. Rendering those as 0 would report "nothing changed" for a
+    target nobody actually looked at.
+    """
+
+    active: int | None
+    new: int | None
+    resolved: int | None
+    fixed_by_relock: int | None
+    fixed_in_unstable: int | None
+
+
+@dataclass(frozen=True)
+class _StepSummaryFallback:
+    """Compact replacement for an oversized Step Summary."""
+
+    text: str
+    minimal_warning: str
+    kind: str
 
 
 def _severity_score(severity):
@@ -438,8 +499,16 @@ def _normalize_verbosity(verbosity):
 
 
 def _summary_target_label(flakeref, target):
-    """Return a single-line, HTML-safe target label for the Step Summary."""
-    return _safe_inline_text(f"{flakeref}#{target}")
+    """Return a single-line, HTML-safe target label for the Step Summary.
+
+    A local flakeref renders as a bare `.#`, which is the same on every line
+    and says nothing. A named one is kept, since it is what tells two
+    same-named targets apart.
+    """
+    label = f"{flakeref}#{target}"
+    if label.startswith(".#"):
+        label = label[2:]
+    return _safe_inline_text(label)
 
 
 def _single_line_text(text):
@@ -2127,8 +2196,13 @@ class FlakeScanner:
     def _report_target_filename(flakeref, target, target_counts):
         """Return a collision-free markdown filename for `(flakeref, target)`."""
         safe_target = _safe_report_filename_component(target)
-        if target_counts.get(target, 0) <= 1 and safe_target == target:
-            return f"{safe_target}.md"
+        candidate = f"{safe_target}.md"
+        if (
+            target_counts.get(target, 0) <= 1
+            and safe_target == target
+            and candidate not in REPORT_RESERVED_FILENAMES
+        ):
+            return candidate
         digest = hashlib.sha256(f"{flakeref}\0{target}".encode("utf-8")).hexdigest()
         return f"{safe_target}.{digest[:12]}.md"
 
@@ -2147,27 +2221,36 @@ class FlakeScanner:
             return pd.DataFrame(columns=pd.Index(["flakeref", "target"]))
         return pd.concat(frames, ignore_index=True).drop_duplicates()
 
-    def report(self, outdir):
+    def _report_target_entries(self):
+        """Return report labels and filenames for every scanned target."""
+        df_targets = self._report_targets_df()
+        target_counts = df_targets["target"].value_counts().to_dict()
+        entries = []
+        for flakeref, target in zip(
+            df_targets["flakeref"], df_targets["target"], strict=True
+        ):
+            label = (
+                target if target_counts.get(target, 0) <= 1 else f"{flakeref}#{target}"
+            )
+            filename = self._report_target_filename(flakeref, target, target_counts)
+            entries.append(_ReportTargetEntry(flakeref, target, label, filename))
+        return entries
+
+    def report(self, outdir, notes=()):
         """Report scan results to console and `outdir`"""
         assert self.scanned_targets or not self.df_scan.empty, (
             "no scan targets; call scan_target() first"
         )
         outdir.mkdir(parents=True, exist_ok=True)
-        df_targets = self._report_targets_df()
-        target_counts = df_targets["target"].value_counts().to_dict()
+        entries = self._report_target_entries()
         newstr = ""
-        for flakeref, target in zip(
-            df_targets["flakeref"], df_targets["target"], strict=True
-        ):
+        for entry in entries:
             target_path = self._report_target(
-                outdir, flakeref, target, target_counts=target_counts
+                outdir, entry.flakeref, entry.target, entry.filename
             )
             relative_target_path = os.path.relpath(target_path, outdir)
-            label = (
-                target if target_counts.get(target, 0) <= 1 else f"{flakeref}#{target}"
-            )
             newstr += (
-                f"* [Vulnerability Report: '{_safe_markdown_text(label)}']"
+                f"* [Vulnerability Report: '{_safe_markdown_text(entry.label)}']"
                 f"({relative_target_path})\n"
             )
         template = TEMPLATE_DIR / "landing.md"
@@ -2180,18 +2263,25 @@ class FlakeScanner:
             "PROJECT_TITLE", _safe_markdown_text(self.project_name)
         )
         landing_str = landing_str.replace("TARGET_REPORTS", newstr)
+        # These qualify every report below them: which enrichment ran, and
+        # which comparisons were skipped. Nothing else published here records
+        # them.
+        run_notes = "\n".join(notes)
+        landing_str = landing_str.replace(
+            "RUN_NOTES", f"{run_notes}\n\n" if run_notes else ""
+        )
         readme_target = outdir / "README.md"
         readme_target.write_text(landing_str)
 
-    def _report_target(self, outdir, flakeref, target, *, target_counts=None):
+    def _report_target(self, outdir, flakeref, target, filename):
         LOG.debug("%s#%s", flakeref, target)
         template = TEMPLATE_DIR / "target.md"
         if not template.exists():
             LOG.fatal("Missing report template '%s'", template.resolve().as_posix())
             sys.exit(1)
-        target_report = outdir / self._report_target_filename(
-            flakeref, target, target_counts or {target: 1}
-        )
+        # The name comes from the caller's report entry, so the index and the
+        # file on disk cannot disagree about where a target's report lives.
+        target_report = outdir / filename
         report_str = template.read_text(encoding="utf-8")
         # Keep the unstable section only when the unstable scan was configured;
         # otherwise drop it entirely rather than leaving it empty.
@@ -2267,26 +2357,30 @@ class FlakeScanner:
         )
         report_str = report_str.replace(
             "COMPONENT_EVIDENCE_SECTION",
-            _anchored(
-                self._evidence_anchor(flakeref, target),
-                _render_collapsible_block(
-                    _SECTION_COMPONENT_EVIDENCE_COLLAPSED,
-                    notes["component_evidence"],
-                    sections["component_evidence"],
-                    open_by_default=False,
-                ),
+            _render_collapsible_block(
+                _SECTION_COMPONENT_EVIDENCE_COLLAPSED,
+                notes["component_evidence"],
+                sections["component_evidence"],
+                open_by_default=False,
             ),
         )
         # Write the target report
         target_report.write_text(report_str)
         return target_report
 
-    def _target_report_sections(self, flakeref, target):
-        """Render the per-target table sections shared by report and summary."""
+    def _target_report_sections(self, flakeref, target, *, full=True):
+        """Render the per-target table sections shared by report and summary.
+
+        `full` is False for the Step Summary, which drops the no-longer-active,
+        whitelisted, and patch-evidence tables. They are the bulk of a large
+        report and the least useful part of it to read inline, and the
+        complete report is published alongside. Dropping them also drops every
+        link into them, which would otherwise resolve to nothing.
+        """
         context = self._target_report_context(flakeref, target)
         df_current = context.active_rows[context.active_rows["pintype"] == PIN_CURRENT]
         err = self._read_error(flakeref, target, [PIN_CURRENT])
-        return {
+        sections = {
             "fixed_upstream": self._diff_section(
                 context,
                 flakeref,
@@ -2305,9 +2399,6 @@ class FlakeScanner:
             "new_since_last_run": self._since_last_run_section(
                 context, flakeref, target
             ),
-            "fixed_since_last_run": self._since_last_run_section(
-                context, flakeref, target, removed=True
-            ),
             "current": _render_error(err)
             or self._df_to_report_tbl(
                 df_current,
@@ -2315,16 +2406,118 @@ class FlakeScanner:
                 comparison_versions=context.unstable_versions,
                 comparison_column=PIN_NIX_UNSTABLE,
             ),
-            "whitelisted": self._whitelisted_tbl(flakeref, target),
-            "component_evidence": _render_error(err)
-            or self._component_evidence_tbl(flakeref, target),
         }
+        if full:
+            sections["fixed_since_last_run"] = self._since_last_run_section(
+                context, flakeref, target, removed=True
+            )
+            sections["whitelisted"] = self._whitelisted_tbl(flakeref, target)
+            sections["component_evidence"] = _render_error(
+                err
+            ) or self._component_evidence_tbl(flakeref, target)
+        return sections
 
-    def _target_report_notes(self, flakeref, target):
+    def _target_headline(self, flakeref, target, *, full, artifact_run_url):
+        """Return the orientation line under one target's heading.
+
+        A reader arriving at the Step Summary sees a stack of collapsed
+        targets. This says what the scan found before any is opened, and where
+        to read the parts the summary leaves out.
+
+        `artifact_run_url` is the run whose artifacts carry the complete
+        report, empty when none was published. Empty means no pointer at all:
+        the alternative is naming a runner directory that does not outlive the
+        job.
+        """
+        count = self._active_finding_count(flakeref, target)
+        if count is None:
+            found = "The scan of this target failed, so its findings are unknown."
+        elif count:
+            found = (
+                f"Found {count} active "
+                f"{_plural(count, 'vulnerability', 'vulnerabilities')}, listed "
+                f"below under {_SECTION_CURRENTLY_ACTIVE}."
+            )
+        else:
+            # "listed below" would point at an empty table.
+            found = "Found no active vulnerabilities."
+        if full:
+            return found
+        omitted = (
+            "This rendering leaves out the no-longer-active, whitelisted, and "
+            "patch-evidence tables."
+        )
+        if not artifact_run_url:
+            return f"{found} {omitted}"
+        # Naming what is missing belongs in both branches: a pointer says
+        # where the rest is, not what the rest is. No apostrophe in the label,
+        # which would be escaped to an entity in the raw markdown for no gain.
+        where = _markdown_link("the run artifacts", artifact_run_url)
+        return f"{found} {omitted} For the full report, see {where}."
+
+    def _active_finding_count(self, flakeref, target):
+        """Return one target's active finding count for the current scan.
+
+        None where the scan failed and the number is unknowable. Reporting
+        zero there would tell a reader the target is clean when nothing
+        actually looked at it. Shared with `_target_report_counts` so every
+        rendering of the number agrees.
+        """
+        if self._read_error(flakeref, target, [PIN_CURRENT]):
+            return None
+        context = self._target_report_context(flakeref, target)
+        df_current = context.active_rows[context.active_rows["pintype"] == PIN_CURRENT]
+        return len(self._aggregate_current(df_current))
+
+    def _target_report_counts(self, flakeref, target):
+        """Return the counts behind one target's report sections.
+
+        Derived from the same frames and diff helpers the tables use, so the
+        index cannot disagree with the report it points at.
+        """
+        if self._read_error(flakeref, target, [PIN_CURRENT]):
+            return _TargetReportCounts(None, None, None, None, None)
+        context = self._target_report_context(flakeref, target)
+        df_current = context.active_rows[context.active_rows["pintype"] == PIN_CURRENT]
+
+        def diff_len(left, right):
+            return _finding_count(self._diff_left_only_df(left, right))
+
+        baseline_current = self._baseline_target_current(flakeref, target)
+        if baseline_current is None:
+            new = resolved = None
+        else:
+            new = diff_len(df_current, baseline_current)
+            resolved = diff_len(baseline_current, df_current)
+
+        def fixed_by(left_pin, right_pin):
+            if self._read_error(flakeref, target, [left_pin, right_pin]):
+                return None
+            if not self._comparison_enabled(right_pin):
+                return None
+            if left_pin == PIN_LOCK_UPDATED and not self._comparison_enabled(
+                PIN_LOCK_UPDATED
+            ):
+                left_pin = PIN_CURRENT
+            return _finding_count(
+                self._diff_scans(
+                    context.active_rows, left_pin, right_pin, context.all_rows
+                )
+            )
+
+        return _TargetReportCounts(
+            active=self._active_finding_count(flakeref, target),
+            new=new,
+            resolved=resolved,
+            fixed_by_relock=fixed_by(PIN_CURRENT, PIN_LOCK_UPDATED),
+            fixed_in_unstable=fixed_by(PIN_LOCK_UPDATED, PIN_NIX_UNSTABLE),
+        )
+
+    def _target_report_notes(self, flakeref, target, *, full=True):
         """Return section explanations for one rendered target report."""
         input_name = _safe_markdown_code(self.input_name or "nixpkgs")
         target_ref = _safe_markdown_code(f"{flakeref}#{target}")
-        return {
+        notes = {
             "fixed_upstream": (
                 f"These active findings disappear when {input_name} is re-locked "
                 "to the latest revision allowed by the flake input. Updating "
@@ -2369,20 +2562,52 @@ class FlakeScanner:
                 "other sections:"
             ),
         }
+        if not full:
+            for dropped in (
+                "component_evidence",
+                "whitelisted",
+                "fixed_since_last_run",
+            ):
+                del notes[dropped]
+        return notes
 
-    def render_detailed_summary(self):
-        """Render the Step Summary using the same layout as the local report."""
+    def render_detailed_summary(self, *, full=True, artifact_run_url=""):
+        """Render the Step Summary using the same layout as the local report.
+
+        `full` is False for the copy written to the Step Summary, which drops
+        the no-longer-active, whitelisted, and patch-evidence tables. See
+        `_target_report_sections` for why.
+        """
         df_targets = self._report_targets_df()
         target_pairs = list(
             zip(df_targets["flakeref"], df_targets["target"], strict=True)
         )
-        blocks = ["## Detailed Vulnerability Report", ""]
+        # No section heading above the targets: it partitioned nothing, since
+        # every target sat under it, and at h2 it was a sibling of the
+        # headings it contained rather than their parent.
+        blocks = []
+        # Folding is for choosing between targets. With one there is nothing
+        # to choose, so folding it only costs a click.
+        fold_targets = len(target_pairs) > 1
         for flakeref, target in target_pairs:
-            sections = self._target_report_sections(flakeref, target)
-            notes = self._target_report_notes(flakeref, target)
+            sections = self._target_report_sections(flakeref, target, full=full)
+            notes = self._target_report_notes(flakeref, target, full=full)
             summary_target = _summary_target_label(flakeref, target)
-            blocks.append("<details open>")
-            blocks.append(f"<summary><code>{summary_target}</code></summary>")
+            active_count = self._active_finding_count(flakeref, target)
+            blocks.append("<details>" if fold_targets else "<details open>")
+            # h2 for weight: the target name is what a reader scans for, and
+            # the headings are the whole page while the targets are folded, so
+            # the count rides along rather than sitting behind the fold.
+            counted = (
+                "scan failed" if active_count is None else f"{active_count} active"
+            )
+            blocks.append(f"<summary><h2>{summary_target} ({counted})</h2></summary>")
+            blocks.append("")
+            blocks.append(
+                self._target_headline(
+                    flakeref, target, full=full, artifact_run_url=artifact_run_url
+                )
+            )
             blocks.append("")
             blocks.append(
                 _render_collapsible_block(
@@ -2410,41 +2635,41 @@ class FlakeScanner:
                 )
             )
             blocks.append("")
-            blocks.append(
-                _render_collapsible_block(
-                    _SECTION_NO_LONGER_ACTIVE,
-                    notes["fixed_since_last_run"],
-                    sections["fixed_since_last_run"],
+            if full:
+                blocks.append(
+                    _render_collapsible_block(
+                        _SECTION_NO_LONGER_ACTIVE,
+                        notes["fixed_since_last_run"],
+                        sections["fixed_since_last_run"],
+                    )
                 )
-            )
-            blocks.append("")
+                blocks.append("")
             blocks.append(
                 _render_collapsible_block(
-                    _SECTION_CURRENTLY_ACTIVE,
+                    f"{_SECTION_CURRENTLY_ACTIVE} "
+                    f"({active_count if active_count is not None else 'scan failed'})",
                     notes["current"],
                     sections["current"],
                 )
             )
             blocks.append("")
-            blocks.append(
-                _render_collapsible_block(
-                    _SECTION_WHITELISTED_COLLAPSED,
-                    notes["whitelisted"],
-                    sections["whitelisted"],
-                    open_by_default=False,
-                )
-            )
-            blocks.append("")
-            if self.evidence_findings:
+            if full:
                 blocks.append(
-                    _anchored(
-                        self._evidence_anchor(flakeref, target),
-                        _render_collapsible_block(
-                            _SECTION_COMPONENT_EVIDENCE_COLLAPSED,
-                            notes["component_evidence"],
-                            sections["component_evidence"],
-                            open_by_default=False,
-                        ),
+                    _render_collapsible_block(
+                        _SECTION_WHITELISTED_COLLAPSED,
+                        notes["whitelisted"],
+                        sections["whitelisted"],
+                        open_by_default=False,
+                    )
+                )
+                blocks.append("")
+            if full and self.evidence_findings:
+                blocks.append(
+                    _render_collapsible_block(
+                        _SECTION_COMPONENT_EVIDENCE_COLLAPSED,
+                        notes["component_evidence"],
+                        sections["component_evidence"],
+                        open_by_default=False,
                     )
                 )
                 blocks.append("")
@@ -2492,16 +2717,6 @@ class FlakeScanner:
             comparison_column=PIN_NIX_UNSTABLE,
         )
 
-    def _evidence_anchor(self, flakeref, target):
-        """Return this target's anchor for the patched-findings section.
-
-        Suffixed per target because a Step Summary renders one section per
-        scanned target into a single document, and `_ANCHOR_PREFIX`-ed so that
-        the id this names survives GitHub's sanitizer as written.
-        """
-        digest = hashlib.sha256(f"{flakeref}\0{target}".encode("utf-8")).hexdigest()
-        return f"{_ANCHOR_PREFIX}{_COMPONENT_EVIDENCE_ANCHOR}-{digest[:12]}"
-
     def _current_scan_key(self, flakeref, target):
         """Return the evidence scan key of the current pin for `target`."""
         return (self._scope_target_flakeref(flakeref), str(target), PIN_CURRENT)
@@ -2526,29 +2741,26 @@ class FlakeScanner:
         count = sum(1 for finding in findings.values() if finding[evidence.SUPPRESSED])
         if not count:
             return ""
-        anchor = self._evidence_anchor(flakeref, target)
         return (
             f" A further {count} "
             f"{_plural(count, 'finding is', 'findings are')} omitted here "
             "because every matched derivation carries a patch naming the "
-            f"vulnerability; see [{_SECTION_COMPONENT_EVIDENCE}](#{anchor})."
+            f"vulnerability; see {_SECTION_COMPONENT_EVIDENCE} in the full "
+            "report."
         )
 
     def _evidence_marks(self, flakeref, target):
-        """Return `(anchor, finding_ids)` for the rows this run may mark.
+        """Return the finding IDs whose rows this run marks with `(*)`.
 
         The IDs come from this run's current-pin evidence, so a row can only be
-        marked when the section it links to actually explains it.
+        marked when the section that explains it describes the same run.
         """
         findings = self._current_scan_findings(flakeref, target)
-        return (
-            self._evidence_anchor(flakeref, target),
-            {
-                fid
-                for fid, finding in findings.items()
-                if finding[evidence.PATCH_STATE] in _AMBIGUOUS_PATCH_STATES
-            },
-        )
+        return {
+            fid
+            for fid, finding in findings.items()
+            if finding[evidence.PATCH_STATE] in _AMBIGUOUS_PATCH_STATES
+        }
 
     def _partial_patch_note(self, flakeref, target):
         """Return the sentence explaining the `(*)` marker, when one is used.
@@ -2566,14 +2778,14 @@ class FlakeScanner:
         )
         if not count:
             return ""
-        anchor = self._evidence_anchor(flakeref, target)
+        # The count is scan-wide, so where tables are dropped it can exceed
+        # the markers on show. The wording says where the rest of them are.
         return (
             f" A {_PARTIAL_PATCH_MARKER} marks the {count} "
-            f"{_plural(count, 'finding', 'findings')} in this report whose "
+            f"{_plural(count, 'finding', 'findings')} in this scan whose "
             "patch evidence needs review: the matched derivations disagree, "
-            "or the evidence could not be established. Marked findings appear "
-            "in whichever tables list them, including the whitelisted one. "
-            f"See [{_SECTION_COMPONENT_EVIDENCE}](#{anchor})."
+            "or the evidence could not be established. The full report lists "
+            f"the evidence for each under {_SECTION_COMPONENT_EVIDENCE}."
         )
 
     def _component_evidence_rows(self, flakeref, target):
@@ -2852,7 +3064,7 @@ class FlakeScanner:
         if "nixpkgs_issue" in df.columns:
             df["comment"] = df.apply(_reformat_nixtracker, axis=1)
         # Flag the findings of this run whose patch evidence is worth a look
-        if marks and marks[1] and "finding_id" in df.columns:
+        if marks and "finding_id" in df.columns:
             df["comment"] = df.apply(
                 lambda row: _append_partial_patch_marker(row, marks), axis=1
             )
@@ -3847,16 +4059,6 @@ def _render_section(text, name, keep):
     return pattern.sub((lambda m: m.group("body")) if keep else "", text)
 
 
-def _anchored(anchor, block):
-    """Prefix `block` with a link target so tables can point at it.
-
-    A `<summary>` produces no heading anchor of its own, so the section needs
-    an explicit one for the `(*)` markers to link to. `anchor` must already
-    carry `_ANCHOR_PREFIX`, since the links that point here cannot add it.
-    """
-    return f'<a id="{anchor}"></a>\n\n{block}'
-
-
 def _render_collapsible_block(summary, *parts, open_by_default=True):
     """Render a `<details>` block with markdown body content."""
     open_attr = " open" if open_by_default else ""
@@ -4167,12 +4369,9 @@ def _append_partial_patch_marker(row, marks):
     finding both marked and unmarked.
     """
     comment = row.comment if hasattr(row, "comment") else ""
-    anchor, finding_ids = marks
-    if str(getattr(row, "finding_id", "")) not in finding_ids:
+    if str(getattr(row, "finding_id", "")) not in marks:
         return comment
-    marker = (
-        f"[{_PARTIAL_PATCH_MARKER}](#{anchor})" if anchor else _PARTIAL_PATCH_MARKER
-    )
+    marker = _PARTIAL_PATCH_MARKER
     if not comment:
         return marker
     # The marker is one more fragment in a cell that already lists them comma
@@ -4266,15 +4465,203 @@ def _update_next_baseline_reporter(reporter, next_baseline):
         )
 
 
-def _write_summary(text):
-    """Write the Step Summary to $GITHUB_STEP_SUMMARY, or log it locally."""
+def _report_index_path(path):
+    """Return a markdown-safe code span for a report index path."""
+    return _safe_markdown_code_span(Path(path).as_posix())
+
+
+def _artifact_relative_path(path, artifact_root):
+    """Return `path` relative to an uploaded artifact root when possible."""
+    path = Path(path)
+    try:
+        return path.relative_to(artifact_root)
+    except ValueError:
+        return Path(path.name)
+
+
+def _published_artifact_run_url():
+    """Return the run URL when this run publishes a report artifact.
+
+    Empty when it does not, which is what tells the renderer there is nowhere
+    durable to send a reader. The caller that opted out of the upload owns
+    publication and has the report path.
+    """
+    if not os.environ.get("FLAKEVULN_REPORT_ARTIFACT_NAME"):
+        return ""
+    return os.environ.get("FLAKEVULN_REPORT_RUN_URL", "")
+
+
+def _finding_count(df):
+    """Return the number of distinct findings in `df`.
+
+    The diff helpers return rows, and one finding commonly carries several
+    version rows, so counting rows would report a different number from the
+    active count beside it, which aggregates by finding.
+    """
+    uids = ["vuln_id", "package"]
+    if df is None or df.empty or not set(uids).issubset(df.columns):
+        return 0
+    return len(df[uids].drop_duplicates())
+
+
+def _count_cell(value):
+    """Render one index count, or `-` when the number is not knowable."""
+    return "-" if value is None else str(value)
+
+
+def _render_report_output_fallback(reporter, notes, *, outdir, findings):
+    """Render compact Step Summary fallback metadata for complete outputs."""
+    artifact_name = os.environ.get("FLAKEVULN_REPORT_ARTIFACT_NAME")
+    report_root = Path(outdir)
+    findings_path = Path(findings)
+    if artifact_name:
+        artifact_root = report_root.parent
+        report_root = _artifact_relative_path(outdir, artifact_root)
+        findings_path = _artifact_relative_path(findings, artifact_root)
+    # Both branches name these, and hoisting them keeps each branch's lines
+    # short enough to read.
+    report_index_path = _report_index_path(report_root / "README.md")
+    lines = ["# Flakevuln Scan Summary", ""]
+    if notes:
+        lines.extend(notes)
+        lines.append("")
+    if artifact_name:
+        lines.append(_STEP_SUMMARY_OVERSIZED_ARTIFACT_WARNING.rstrip())
+        lines.extend(
+            [
+                "",
+                "## Full Report Artifact",
+                "",
+                f"- Artifact: {_safe_markdown_code_span(artifact_name)}",
+            ]
+        )
+        run_link = _markdown_link(
+            "view workflow run", os.environ.get("FLAKEVULN_REPORT_RUN_URL", "")
+        )
+        if run_link:
+            lines.append(f"- Workflow run: {run_link}")
+        lines.append(f"- Report index: {report_index_path}")
+        lines.append(f"- Findings JSON: {_report_index_path(findings_path)}")
+        minimal_warning = _STEP_SUMMARY_MINIMAL_ARTIFACT_WARNING
+        kind = "report artifact index"
+    else:
+        lines.append(_STEP_SUMMARY_OVERSIZED_OUTPUT_WARNING.rstrip())
+        lines.extend(
+            [
+                "",
+                "## Full Report Directory",
+                "",
+                f"- Report directory: {_report_index_path(outdir)}",
+                f"- Report index: {report_index_path}",
+                f"- Findings JSON: {_report_index_path(findings)}",
+            ]
+        )
+        minimal_warning = _STEP_SUMMARY_MINIMAL_OUTPUT_WARNING
+        kind = "report output index"
+    lines.extend(["", "## Target Reports", ""])
+    entries = reporter._report_target_entries()
+    if not entries:
+        lines.append("- No scan targets were recorded.")
+    else:
+        # Counts first, so the page answers "did anything change" without a
+        # download. `-` marks a number that is not knowable rather than zero:
+        # a failed scan, a comparison that did not run, or no previous run.
+        lines.extend(
+            [
+                "| Target | New | No longer active | Active |"
+                " Fixed by re-lock | Fixed in unstable | Report |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | --- |",
+            ]
+        )
+        for entry in entries:
+            counts = reporter._target_report_counts(entry.flakeref, entry.target)
+            cells = [
+                _count_cell(counts.new),
+                _count_cell(counts.resolved),
+                _count_cell(counts.active),
+                _count_cell(counts.fixed_by_relock),
+                _count_cell(counts.fixed_in_unstable),
+            ]
+            lines.append(
+                f"| {_safe_markdown_code_span(entry.label)} | "
+                + " | ".join(cells)
+                + f" | {_report_index_path(report_root / entry.filename)} |"
+            )
+    return _StepSummaryFallback(
+        text="\n".join(lines).rstrip(),
+        minimal_warning=minimal_warning,
+        kind=kind,
+    )
+
+
+def _write_summary(text, fallback=None, *, local_text=None):
+    """Write the Step Summary to $GITHUB_STEP_SUMMARY, or log it locally.
+
+    `local_text` is what the local log shows when there is no Step Summary to
+    write. It defaults to `text`, and differs where `text` has been trimmed
+    for GitHub: a local run has no artifact to read the rest from.
+    """
     dest = os.environ.get("GITHUB_STEP_SUMMARY")
     if dest:
+        # The summary file is opened for append, and GitHub applies its limit
+        # to the whole file, so anything already written counts against it.
+        try:
+            written = os.path.getsize(dest)
+        except OSError:
+            written = 0
+        # One byte for the newline this call appends.
+        budget = _STEP_SUMMARY_MAX_BYTES - written - 1
+        if budget <= 0:
+            complete_output = (
+                " Complete report outputs were already written."
+                if fallback is not None
+                else ""
+            )
+            LOG.warning(
+                "Step summary already at GitHub's %d byte limit; skipping this "
+                "report.%s",
+                _STEP_SUMMARY_MAX_BYTES,
+                complete_output,
+            )
+            return
+        if len(text.encode("utf-8")) <= budget:
+            output = text
+        elif fallback is not None and len(fallback.text.encode("utf-8")) <= budget:
+            output = fallback.text
+            LOG.warning(
+                "Step summary exceeds GitHub's %d byte limit; writing a "
+                "compact %s instead.",
+                _STEP_SUMMARY_MAX_BYTES,
+                fallback.kind,
+            )
+        else:
+            output = (
+                fallback.minimal_warning
+                if fallback is not None
+                else _STEP_SUMMARY_MINIMAL_NO_OUTPUT_WARNING
+            )
+            if len(output.encode("utf-8")) > budget:
+                LOG.warning(
+                    "Step summary has no room left for even an oversized-report "
+                    "notice; skipping this report."
+                )
+                return
+            fallback_state = (
+                f"the {fallback.kind} does not fit"
+                if fallback is not None
+                else "no report output is available"
+            )
+            LOG.warning(
+                "Step summary exceeds GitHub's %d byte limit and %s; writing a "
+                "minimal notice instead.",
+                _STEP_SUMMARY_MAX_BYTES,
+                fallback_state,
+            )
         with open(dest, "a", encoding="utf-8") as handle:
-            handle.write(text + "\n")
+            handle.write(output.rstrip() + "\n")
         LOG.info("Wrote step summary: %s", dest)
     else:
-        LOG.info("Step summary:\n%s", text)
+        LOG.info("Step summary:\n%s", text if local_text is None else local_text)
 
 
 def _usable_whitelist_path(whitelist):
@@ -4325,6 +4712,8 @@ def _run_report(  # noqa: PLR0913
     *,
     findings,
     outdir=None,
+    index_outdir=None,
+    index_findings=None,
     nixprs_enabled=False,
     nixprs_exclude_packages=(),
     nixtracker_enabled=False,
@@ -4377,12 +4766,38 @@ def _run_report(  # noqa: PLR0913
     if notes:
         lines.append("\n".join(notes))
         lines.append("")
+    head = list(lines)
     lines.append(reporter.render_detailed_summary())
     summary = "\n".join(lines).rstrip()
-    _write_summary(summary)
-    # The detailed markdown report is an opt-in publication choice.
+    # The Step Summary drops the no-longer-active, whitelisted, and
+    # patch-evidence tables: they are the bulk of a large report and the least
+    # useful part to read inline. Everything published or logged elsewhere
+    # stays complete.
+    step_summary = "\n".join(
+        [
+            *head,
+            reporter.render_detailed_summary(
+                full=False, artifact_run_url=_published_artifact_run_url()
+            ),
+        ]
+    ).rstrip()
+    fallback = None
+    # The detailed markdown report is an opt-in publication choice. When it is
+    # present, its landing page indexes the complete per-target reports used as
+    # the source of truth for an oversized Step Summary.
     if outdir is not None:
-        reporter.report(outdir)
+        reporter.report(outdir, notes=notes)
+        if index_outdir is None:
+            index_outdir = outdir
+        if index_findings is None:
+            index_findings = findings
+        fallback = _render_report_output_fallback(
+            reporter,
+            notes,
+            outdir=index_outdir,
+            findings=index_findings,
+        )
+    _write_summary(step_summary, fallback=fallback, local_text=summary)
     _update_next_baseline_reporter(reporter, update_baseline_findings)
     return reporter
 
@@ -4464,6 +4879,8 @@ def _cmd_local(args):
         reporter = _run_report(
             findings=findings,
             outdir=report_dir,
+            index_outdir=outdir / "report",
+            index_findings=outdir / "findings.json",
             nixprs_enabled=args.nixprs,
             nixprs_exclude_packages=getattr(args, "nixprs_exclude_packages", []),
             nixtracker_enabled=getattr(args, "nixtracker", False),

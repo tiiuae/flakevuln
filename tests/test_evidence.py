@@ -1515,7 +1515,9 @@ def test_suppressed_findings_are_accounted_for_in_the_active_section(
     current_section = report.split(COMPONENT_EVIDENCE_HEADING)[0]
 
     assert "A further 1 finding is omitted here" in current_section
-    assert "[Patched and Partially Patched Findings](#" in current_section
+    assert "see Patched and Partially Patched Findings in the full report" in (
+        current_section
+    )
     assert suppressed["vuln_id"] not in current_section
     assert suppressed["vuln_id"] in report.split(COMPONENT_EVIDENCE_HEADING)[1]
 
@@ -1585,7 +1587,7 @@ def test_component_diagnostics_include_flake_input(tmp_path):
     assert "1234567" not in diagnostics
 
 
-def test_partially_patched_findings_are_marked_and_linked(monkeypatch, tmp_path):
+def test_partially_patched_findings_are_marked(monkeypatch, tmp_path):
     """The active tables point at the evidence for the ambiguous findings."""
     finding, components = tu.mixed_finding()
     scanner = _scanner_with(
@@ -1593,37 +1595,9 @@ def test_partially_patched_findings_are_marked_and_linked(monkeypatch, tmp_path)
     )
     report = _render(scanner, tmp_path)
     current_section, diagnostics = report.split(COMPONENT_EVIDENCE_HEADING)
-    anchor = scanner._evidence_anchor(scanner.flakeref, TARGET)
 
-    assert f"[(*)](#{anchor})" in current_section
-    assert f'<a id="{anchor}"></a>' in report
+    assert "(*)" in current_section
     assert "A (*) marks the 1 finding" in current_section
-
-
-def test_evidence_links_survive_githubs_id_rewrite(monkeypatch, tmp_path):
-    """Every link target must be spelled the way GitHub stores the id.
-
-    GitHub's markdown sanitizer rewrites `id` to `user-content-<id>` and leaves
-    `href="#..."` alone, so an unprefixed anchor renders a link that resolves to
-    nothing. Prefixing is idempotent there, so emitting it on both sides is what
-    keeps the id and the links that name it in agreement.
-    """
-    finding, components = tu.mixed_finding()
-    scanner = _scanner_with(
-        monkeypatch,
-        tmp_path,
-        [finding],
-        components,
-        [tu.triage_row(finding, whitelist="True")],
-    )
-    report = _render(scanner, tmp_path)
-    anchor = scanner._evidence_anchor(scanner.flakeref, TARGET)
-
-    assert anchor.startswith("user-content-")
-    # Nothing may point at the bare id, since those are the links that break.
-    assert f"](#{anchor[len('user-content-') :]})" not in report
-    assert f'<a id="{anchor}"></a>' in report
-    assert f"](#{anchor})" in report
 
 
 def test_the_marker_is_separated_from_an_existing_comment(monkeypatch, tmp_path):
@@ -1645,7 +1619,7 @@ def test_the_marker_is_separated_from_an_existing_comment(monkeypatch, tmp_path)
 
     table = scanner._df_to_report_tbl(pd.DataFrame([row]), marks=marks)
 
-    assert f"fixed downstream, [(*)](#{marks[0]})" in table
+    assert "fixed downstream, (*)" in table
 
 
 @pytest.mark.parametrize("comment", ["not exploitable.", "see below:", "why?"])
@@ -1670,8 +1644,8 @@ def test_the_marker_does_not_double_existing_punctuation(
 
     table = scanner._df_to_report_tbl(pd.DataFrame([row]), marks=marks)
 
-    assert f"[(*)](#{marks[0]})" in table
-    assert ", [(*)]" not in table
+    assert "(*)" in table
+    assert ", (*)" not in table
 
 
 def test_rows_from_another_run_are_not_marked(monkeypatch, tmp_path):
@@ -1750,15 +1724,15 @@ def test_marker_count_covers_whitelisted_findings_too(monkeypatch, tmp_path):
     report = _render(scanner, tmp_path)
     current_section = report.split(COMPONENT_EVIDENCE_HEADING)[0]
 
-    assert "A (*) marks the 2 findings in this report" in current_section
+    assert "A (*) marks the 2 findings in this scan" in current_section
     blocks = {
         block.split("</summary>")[0]: block
         for block in current_section.split("<summary>")[1:]
     }
     active = next(v for k, v in blocks.items() if k.startswith("Currently Active"))
     whitelisted = next(v for k, v in blocks.items() if k.startswith("Whitelisted"))
-    assert "[(*)](#" in active
-    assert "[(*)](#" in whitelisted
+    assert "(*)" in active
+    assert "(*)" in whitelisted
 
 
 def test_no_marker_when_every_finding_is_a_plain_no_match(monkeypatch, tmp_path):
@@ -1801,8 +1775,7 @@ def test_package_version_only_findings_stay_active_and_are_flagged(
     assert "derivation not identified" in diagnostics
     # The marker covers every ambiguous state, not just a partial patch, so
     # its explanation must not claim some derivations were patched.
-    anchor = scanner._evidence_anchor(scanner.flakeref, TARGET)
-    assert f"[(*)](#{anchor})" in current_section
+    assert "(*)" in current_section
     assert "only some" not in current_section
     assert "patch evidence needs review" in current_section
 

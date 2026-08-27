@@ -1,7 +1,7 @@
 name: Example scan (dogfood)
 
-# Dogfoods the action by scanning this repository's own flake and rendering the
-# markdown report layout into the workflow Step Summary.
+# Dogfoods the action by scanning this repository's own flake, rendering the
+# markdown report layout, and uploading the report artifact.
 
 on:
   workflow_dispatch:
@@ -22,7 +22,8 @@ jobs:
 
       # Use the action from this same checkout (local reference), so the dogfood
       # always exercises the current revision.
-      - uses: ./
+      - id: flakevuln
+        uses: ./
         with:
           # flakeref omitted -> scans the checked-out workspace (.)
           targets: |
@@ -32,3 +33,8 @@ jobs:
           nixprs: true
           nixprs-exclude-packages: linux
           nixtracker: true
+
+      - name: Check flakevuln outputs
+        run: |
+          test -s "${{ steps.flakevuln.outputs.findings-path }}"
+          test -s "${{ steps.flakevuln.outputs.report-path }}/README.md"
