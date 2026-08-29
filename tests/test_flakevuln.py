@@ -3343,6 +3343,7 @@ def test_update_repo_lock_uses_positional_input_name(monkeypatch, tmp_path):
     scanner.lockfile_bak = tmp_path / "flake.lock.bak"
     scanner.lockfile.write_text("{}", encoding="utf-8")
     scanner.lockfile_bak.write_text("{}", encoding="utf-8")
+    scanner._target_input_lock_digest = "stale"
     captured = {}
 
     def _fake_exec_cmd(cmd, **kwargs):
@@ -3354,6 +3355,7 @@ def test_update_repo_lock_uses_positional_input_name(monkeypatch, tmp_path):
     scanner._update_repo_lock("nixpkgs")
     assert captured["cmd"] == ["nix", "flake", "update", "nixpkgs"]
     assert captured["cwd"] == scanner.repodir
+    assert scanner._target_input_lock_digest == ""
 
 
 def _current_system_or_skip():

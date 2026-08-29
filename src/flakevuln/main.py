@@ -3104,8 +3104,9 @@ class FlakeScanner:
         # Reset possible earlier changes to the lockfile (flake.nix is never
         # mutated, so there is nothing to restore for it).
         shutil.copy(self.lockfile_bak, self.lockfile)
+        self._target_input_lock_digest = ""
 
-    def _evaluate_target_drv(self, target, pintype, override=None):
+    def _run_target_eval(self, target, overrides=(), *, reference_lock=None):
         eval_target = f"{self.eval_flakeref}#{target}"
         cmd = [
             "nix",
@@ -3117,17 +3118,17 @@ class FlakeScanner:
             "--impure",
         ]
         cwd = self.repodir
-        if self.remote_flake:
+        if reference_lock or self.remote_flake:
             cmd += [
                 "--reference-lock-file",
-                str(self.lockfile),
+                str(reference_lock or self.lockfile),
                 "--no-write-lock-file",
             ]
+        if self.remote_flake:
             cwd = None
-        if override:
+        for input_name, ref in overrides:
             # `--override-input` implies `--no-write-lock-file`, so the override
             # only takes effect on the invocation that evaluates.
-            input_name, ref = override
             cmd += ["--override-input", input_name, ref]
         # This is the one `--impure` call, so it is the only place untrusted
         # flake code can read the environment via `builtins.getEnv`. Scrub the
@@ -3136,7 +3137,11 @@ class FlakeScanner:
         evars: dict[str, object] = {"NIXPKGS_ALLOW_INSECURE": "1"}
         for key in UNTRUSTED_EVAL_DROP_ENV:
             evars[key] = DROP_ENV_VAR
-        ret = exec_cmd(cmd, raise_on_error=False, evars=evars, capture=True, cwd=cwd)
+        return exec_cmd(cmd, raise_on_error=False, evars=evars, capture=True, cwd=cwd)
+
+    def _evaluate_target_drv(self, target, pintype, override=None):
+        eval_target = f"{self.eval_flakeref}#{target}"
+        ret = self._run_target_eval(target, [override] if override else [])
         if ret.returncode != 0:
             LOG.warning("Error evaluating %s", eval_target)
             # The scanned flake controls this stderr/stdout tail. It is carried
@@ -3171,6 +3176,174 @@ class FlakeScanner:
         LOG.info("Target '%s' evaluates to derivation: %s", target, drv_path)
         return drv_path
 
+    def _target_input_probe_overrides(self, input_path, probe_ref, override):
+        """Compose overrides that replace the candidate used by the scan."""
+        data = _load_json_file(self.lockfile, what="flake.lock")
+        nodes = data.get("nodes", {}) if isinstance(data, dict) else {}
+        root = data.get("root", "") if isinstance(data, dict) else ""
+        input_node = _resolve_lock_input_path(nodes, root, input_path)
+        source_input = next(
+            (
+                entry["input_path"]
+                for entry in _lock_graph_input_entries(data)
+                if entry["lock_node"] == input_node
+            ),
+            "",
+        )
+        if not override:
+            return [(source_input, probe_ref)] if source_input else []
+
+        override_node = _resolve_lock_input_path(nodes, root, override[0])
+        same_input = override[0] == input_path or (
+            input_node and input_node == override_node
+        )
+        if same_input:
+            # An unstable scan may replace a follows alias rather than its
+            # source. Empty both paths so neither the real override nor the
+            # candidate's locked source can stay alive beside the probe.
+            if not source_input:
+                return []
+            probe_inputs = dict.fromkeys((override[0], source_input))
+            return [(path, probe_ref) for path in probe_inputs]
+        return [override, (source_input, probe_ref)] if source_input else []
+
+    def _target_input_probe_lock(self, override, lock_digest):
+        """Return a cached lockfile with the probe override fully locked."""
+        cache = getattr(self, "_target_input_probe_lock_cache", {})
+        self._target_input_probe_lock_cache = cache
+        cache_key = (override, lock_digest)
+        if cache_key in cache:
+            return cache[cache_key]
+
+        probe_lock = self.tmpdir / f"input-probe-{len(cache)}.lock"
+        cmd = ["nix", "flake", "lock", *_nix_verbosity_flags(self.verbosity)]
+        cwd = self.repodir
+        if self.remote_flake:
+            cmd += [
+                self.eval_flakeref,
+                "--reference-lock-file",
+                str(self.lockfile),
+            ]
+            cwd = None
+        input_name, ref = override
+        cmd += ["--override-input", input_name, ref]
+        cmd += ["--output-lock-file", str(probe_lock)]
+        ret = exec_cmd(cmd, raise_on_error=False, capture=True, cwd=cwd)
+        valid = False
+        if ret.returncode == 0:
+            try:
+                data = json.loads(probe_lock.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                pass
+            else:
+                nodes = data.get("nodes", {}) if isinstance(data, dict) else {}
+                nodes = nodes if isinstance(nodes, dict) else {}
+                root = data.get("root", "") if isinstance(data, dict) else ""
+                root = root if isinstance(root, str) else ""
+                node = nodes.get(_resolve_lock_input_path(nodes, root, input_name), {})
+                locked = node.get("locked", {}) if isinstance(node, dict) else {}
+                locked = locked if isinstance(locked, dict) else {}
+                locked_path = str(locked.get("path", ""))
+                valid = (
+                    locked.get("type") == "path"
+                    and locked_path
+                    and os.path.realpath(locked_path)
+                    == os.path.realpath(ref.removeprefix("path:"))
+                )
+        if not valid:
+            LOG.debug(
+                "Could not apply input probe override '%s': %s",
+                input_name,
+                _tail_text(ret.stderr),
+            )
+        cache[cache_key] = probe_lock if valid else None
+        return cache[cache_key]
+
+    def _target_uses_flake_input(
+        self, target, input_path, target_drv, *, override=None
+    ):
+        """Whether evaluating `target` requires a candidate flake input.
+
+        The lock graph contains inputs unused by an individual output. Replace
+        one candidate with a deliberately empty flake and evaluate that output.
+        Producing the same target derivation proves that the candidate cannot
+        be the source of one of its nixpkgs package derivations. Failures and
+        changed derivations retain the candidate conservatively because they
+        may mean that the target consumes it.
+        """
+        cache = getattr(self, "_target_input_use_cache", {})
+        self._target_input_use_cache = cache
+        lock_digest = getattr(self, "_target_input_lock_digest", "")
+        if not lock_digest:
+            lock_digest = hashlib.sha256(self.lockfile.read_bytes()).hexdigest()
+            self._target_input_lock_digest = lock_digest
+        cache_key = (target, input_path, str(target_drv), lock_digest, override)
+        if cache_key in cache:
+            return cache[cache_key]
+
+        probe_dir = self.tmpdir / "empty-input-probe"
+        probe_dir.mkdir(exist_ok=True)
+        probe_flake = probe_dir / "flake.nix"
+        if not probe_flake.exists():
+            probe_flake.write_text(
+                "{ outputs = { self }: { }; }\n",
+                encoding="utf-8",
+            )
+
+        overrides = self._target_input_probe_overrides(
+            input_path, f"path:{probe_dir}", override
+        )
+        if not overrides:
+            LOG.debug(
+                "Could not find the source path for flake input '%s'; "
+                "retaining it conservatively",
+                input_path,
+            )
+            cache[cache_key] = True
+            return True
+        if override:
+            ret = self._run_target_eval(target, overrides)
+            if "does not match any input" in str(getattr(ret, "stderr", "") or ""):
+                LOG.debug(
+                    "Could not apply every input probe override for '%s'; "
+                    "retaining it conservatively",
+                    input_path,
+                )
+                cache[cache_key] = True
+                return True
+        else:
+            # A non-override probe has exactly one canonical source path.
+            probe_lock = self._target_input_probe_lock(overrides[0], lock_digest)
+            if probe_lock is None:
+                LOG.debug(
+                    "Could not create a reference lock while probing flake input '%s'; "
+                    "retaining it conservatively",
+                    input_path,
+                )
+                cache[cache_key] = True
+                return True
+            ret = self._run_target_eval(target, reference_lock=probe_lock)
+        used = True
+        if ret.returncode == 0:
+            try:
+                probe_drv, _attributes = _parse_nix_derivation_show(ret.stdout)
+            except ValueError as error:
+                LOG.debug(
+                    "Could not verify target '%s' while probing flake input '%s': %s",
+                    target,
+                    input_path,
+                    error,
+                )
+            else:
+                # An empty input may select a fallback, so success proves
+                # nothing by itself. The probe preserves the scan's root-flake
+                # metadata; only reproducing its derivation proves non-use.
+                used = probe_drv != Path(target_drv)
+        cache[cache_key] = used
+        if not used:
+            LOG.debug("Target '%s' does not use flake input '%s'", target, input_path)
+        return used
+
     def _update_repo_lock(self, input_name):
         # Re-lock `input_name` in-channel. This relies on the post-2.19
         # `nix flake update <input>` interface where positional arguments are
@@ -3195,11 +3368,14 @@ class FlakeScanner:
             ]
             cwd = None
         exec_cmd(cmd, cwd=cwd)
+        self._target_input_lock_digest = ""
         diffstr = filediff(str(self.lockfile_bak), str(self.lockfile))
         if diffstr:
             LOG.info("Updated lockfile:\n%s", diffstr)
 
-    def _annotate_flake_inputs(self, components, df, override=None):
+    def _annotate_flake_inputs(
+        self, components, df, *, target="", target_drv="", override=None
+    ):
         """Add best-effort flake input matches to component and scan rows."""
         components = [
             {
@@ -3230,9 +3406,43 @@ class FlakeScanner:
         for component in components:
             pname = str(component.get("pname", ""))
             exact_matches = exact.get((pname, str(component.get("drv_path", ""))), [])
-            candidates = exact_matches or version_matches.get(
+            fallback_matches = version_matches.get(
                 (pname, str(component.get("version", ""))), []
             )
+            if target and target_drv:
+                candidates = [
+                    candidate
+                    for candidate in exact_matches
+                    if self._target_uses_flake_input(
+                        target,
+                        candidate["input_path"],
+                        target_drv=target_drv,
+                        override=override,
+                    )
+                ]
+                # Keep an all-replaceable equivalence set ambiguous; a single
+                # individually replaceable candidate can still be excluded.
+                if (
+                    candidates
+                    or len({candidate["input_path"] for candidate in exact_matches})
+                    <= 1
+                ):
+                    exact_matches = candidates
+                if not exact_matches:
+                    # A used input may still supply this component through an
+                    # overlay that changes its derivation. Retain that weaker
+                    # version match with candidate confidence.
+                    fallback_matches = [
+                        candidate
+                        for candidate in fallback_matches
+                        if self._target_uses_flake_input(
+                            target,
+                            candidate["input_path"],
+                            target_drv=target_drv,
+                            override=override,
+                        )
+                    ]
+            candidates = exact_matches or fallback_matches
             annotated = dict(component)
             if candidates:
                 paths = list(dict.fromkeys(row["input_path"] for row in candidates))
@@ -3506,7 +3716,13 @@ in builtins.listToAttrs (map (name: {{ inherit name; value = get name; }}) args.
         df = self._read_triage_rows(target, pintype, out_triage, findings)
         if df is None:
             return
-        components, df = self._annotate_flake_inputs(components, df, override=override)
+        components, df = self._annotate_flake_inputs(
+            components,
+            df,
+            target=target,
+            target_drv=str(drv_path),
+            override=override,
+        )
         if df is None:
             return
         if not df.empty:
@@ -4151,7 +4367,7 @@ def _bounded_paths(paths):
 
 
 def _lock_graph_input_entries(data):
-    """Return one shortest reachable flake input path per lock node."""
+    """Return one shortest non-follows input path per reachable lock node."""
     if not isinstance(data, dict):
         return []
     nodes = data.get("nodes", {})
@@ -4170,7 +4386,12 @@ def _lock_graph_input_entries(data):
         if not isinstance(inputs, dict):
             continue
         for input_name, ref in sorted(inputs.items()):
-            child = _resolve_lock_input_ref(nodes, root, ref)
+            # A list is a `follows` alias. The referenced lock node is reachable
+            # through its source path as well, and overriding only this alias
+            # would leave that source available to the target-usage probe.
+            if not isinstance(ref, str):
+                continue
+            child = ref
             if not child or child not in nodes or child in visited:
                 continue
             visited.add(child)

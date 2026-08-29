@@ -2,6 +2,7 @@
 """Tests for vulnxscan component-evidence ingestion, storage, and rendering."""
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
@@ -1211,6 +1212,353 @@ def test_flake_input_prefers_exact_nested_nixpkgs_match(monkeypatch, tmp_path):
     assert "@1234567" not in table
 
 
+@pytest.mark.parametrize(
+    ("used_path", "expected_paths"),
+    [
+        ("nixpkgs", ["nixpkgs"]),
+        (None, ["nixpkgs", "sbomnix/nixpkgs"]),
+    ],
+)
+def test_flake_input_scopes_unique_matches_and_retains_equivalent_fallbacks(
+    monkeypatch, tmp_path, used_path, expected_paths
+):
+    finding = tu.evidence_finding(package="perl", version="5.42.0")
+    component = tu.evidence_component(
+        finding, component_id="/nix/store/perl-5.42.0.drv"
+    )
+    scanner = tu.make_scanner(tmp_path)
+    scanner._target_system = "x86_64-linux"
+    candidates = [
+        {
+            "input_path": "nixpkgs",
+            "locked_rev": "aaaaaaaaaaaaaaaa",
+        },
+        {
+            "input_path": "sbomnix/nixpkgs",
+            "locked_rev": "bbbbbbbbbbbbbbbb",
+        },
+    ]
+    monkeypatch.setattr(
+        scanner,
+        "_nixpkgs_input_matches",
+        lambda *_args, **_kwargs: (
+            {("perl", "/nix/store/perl-5.42.0.drv"): candidates},
+            {},
+        ),
+    )
+    checked = []
+
+    def target_uses(_target, input_path, **_kwargs):
+        checked.append(input_path)
+        return input_path == used_path
+
+    monkeypatch.setattr(scanner, "_target_uses_flake_input", target_uses)
+
+    components, _rows = scanner._annotate_flake_inputs(
+        [component],
+        pd.DataFrame([tu.triage_row(finding)]),
+        target="nixosConfigurations.builder.config.system.build.toplevel",
+        target_drv="/nix/store/system.drv",
+    )
+
+    assert checked == ["nixpkgs", "sbomnix/nixpkgs"]
+    assert components[0]["flake_input_paths"] == expected_paths
+    assert components[0]["flake_input_confidence"] == (
+        "exact" if used_path else "ambiguous"
+    )
+
+
+@pytest.mark.parametrize(
+    ("used_path", "expected_checked", "expected_confidence"),
+    [
+        pytest.param(
+            "nixpkgs",
+            ["nixpkgs"],
+            "exact",
+            id="exact-survives",
+        ),
+        pytest.param(
+            "sbomnix/nixpkgs",
+            ["nixpkgs", "sbomnix/nixpkgs"],
+            "candidate",
+            id="fallback-after-exact-excluded",
+        ),
+    ],
+)
+def test_flake_input_probes_fallback_only_when_needed(
+    monkeypatch,
+    tmp_path,
+    used_path,
+    expected_checked,
+    expected_confidence,
+):
+    """Fallback candidates are probed only if no exact candidate survives."""
+    finding = tu.evidence_finding(package="perl", version="5.42.0")
+    component = tu.evidence_component(
+        finding, component_id="/nix/store/perl-5.42.0.drv"
+    )
+    scanner = tu.make_scanner(tmp_path)
+    scanner._target_system = "x86_64-linux"
+    exact_candidate = {
+        "input_path": "nixpkgs",
+        "locked_rev": "aaaaaaaaaaaaaaaa",
+    }
+    fallback_candidate = {
+        "input_path": "sbomnix/nixpkgs",
+        "locked_rev": "bbbbbbbbbbbbbbbb",
+    }
+    monkeypatch.setattr(
+        scanner,
+        "_nixpkgs_input_matches",
+        lambda *_args, **_kwargs: (
+            {("perl", "/nix/store/perl-5.42.0.drv"): [exact_candidate]},
+            {("perl", "5.42.0"): [fallback_candidate]},
+        ),
+    )
+    checked = []
+
+    def target_uses(_target, input_path, **_kwargs):
+        checked.append(input_path)
+        return input_path == used_path
+
+    monkeypatch.setattr(scanner, "_target_uses_flake_input", target_uses)
+
+    components, _rows = scanner._annotate_flake_inputs(
+        [component],
+        pd.DataFrame([tu.triage_row(finding)]),
+        target=TARGET,
+        target_drv="/nix/store/system.drv",
+    )
+
+    assert checked == expected_checked
+    assert components[0]["flake_input_paths"] == [used_path]
+    assert components[0]["flake_input_confidence"] == expected_confidence
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        ((0, "/nix/store/scanned.drv", ""), False),
+        ((0, "/nix/store/fallback.drv", ""), True),
+        ((1, "", ""), True),
+        (
+            (
+                0,
+                "/nix/store/scanned.drv",
+                "warning: the flag '--override-input nested path:x' "
+                "does not match any input",
+            ),
+            True,
+        ),
+    ],
+)
+def test_target_input_probe_is_target_specific_and_conservative(
+    monkeypatch, tmp_path, result, expected
+):
+    returncode, probe_drv, stderr = result
+    scanner = tu.make_scanner(tmp_path)
+    _write_lock(
+        scanner,
+        {"nixpkgs": "nixpkgs", "sbomnix": "sbomnix"},
+        {
+            "nixpkgs": _locked_input("aaaaaaaaaaaaaaaa"),
+            "sbomnix": _locked_input(
+                "bbbbbbbbbbbbbbbb",
+                owner="tiiuae",
+                repo="sbomnix",
+                inputs={"nixpkgs": "nixpkgs_2"},
+            ),
+            "nixpkgs_2": _locked_input("cccccccccccccccc"),
+        },
+    )
+    calls = []
+    lock_reads = []
+    real_read_bytes = Path.read_bytes
+
+    def tracked_read_bytes(path):
+        if path == scanner.lockfile:
+            lock_reads.append(path)
+        return real_read_bytes(path)
+
+    def fake_eval(target, overrides):
+        calls.append((target, overrides))
+        stdout = json.dumps({probe_drv: {}}) if probe_drv else ""
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    monkeypatch.setattr(Path, "read_bytes", tracked_read_bytes)
+    monkeypatch.setattr(scanner, "_run_target_eval", fake_eval)
+    override = ("nixpkgs", "github:NixOS/nixpkgs/nixos-unstable")
+
+    assert (
+        scanner._target_uses_flake_input(
+            "packages.x86_64-linux.default",
+            "sbomnix/nixpkgs",
+            "/nix/store/scanned.drv",
+            override=override,
+        )
+        is expected
+    )
+    assert (
+        scanner._target_uses_flake_input(
+            "packages.x86_64-linux.default",
+            "sbomnix/nixpkgs",
+            "/nix/store/scanned.drv",
+            override=override,
+        )
+        is expected
+    )
+    assert len(calls) == 1
+    assert lock_reads == [scanner.lockfile]
+    assert calls[0][0] == "packages.x86_64-linux.default"
+    assert calls[0][1][0] == override
+    probe_input, probe_ref = calls[0][1][1]
+    assert probe_input == "sbomnix/nixpkgs"
+    assert probe_ref.startswith("path:")
+    assert Path(probe_ref.removeprefix("path:")).joinpath("flake.nix").exists()
+
+
+@pytest.mark.parametrize("remote", [False, True])
+def test_target_input_probe_uses_shared_reference_lock(monkeypatch, tmp_path, remote):
+    """A fully locked probe preserves the scanned branch across targets."""
+    scanner = tu.make_scanner(tmp_path)
+    scanner.repodir = tmp_path
+    scanner.remote_flake = remote
+    if remote:
+        scanner.eval_flakeref = "github:example/flake/deadbeef"
+    _write_lock(
+        scanner,
+        {"candidate": "candidate"},
+        {"candidate": _locked_input("aaaaaaaaaaaaaaaa")},
+    )
+    calls = []
+
+    def fake_exec(cmd, **kwargs):
+        calls.append((cmd, kwargs.get("cwd")))
+        if cmd[:3] == ["nix", "flake", "lock"]:
+            data = json.loads(scanner.lockfile.read_text(encoding="utf-8"))
+            probe_ref = cmd[cmd.index("--override-input") + 2]
+            data["nodes"]["candidate"]["locked"] = {
+                "type": "path",
+                "path": probe_ref.removeprefix("path:"),
+            }
+            output = cmd[cmd.index("--output-lock-file") + 1]
+            Path(output).write_text(json.dumps(data), encoding="utf-8")
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps({"/nix/store/scanned.drv": {}}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(flakevuln_main, "exec_cmd", fake_exec)
+
+    for target in (TARGET, "other"):
+        assert not scanner._target_uses_flake_input(
+            target,
+            "candidate",
+            "/nix/store/scanned.drv",
+        )
+
+    lock_calls = [call for call in calls if call[0][:3] == ["nix", "flake", "lock"]]
+    eval_calls = [
+        cmd for cmd, _cwd in calls if cmd[:3] == ["nix", "derivation", "show"]
+    ]
+    assert len(lock_calls) == 1
+    lock_cmd, lock_cwd = lock_calls[0]
+    assert lock_cwd == (None if remote else scanner.repodir)
+    assert "--override-input" in lock_cmd
+    if remote:
+        assert scanner.eval_flakeref in lock_cmd
+        assert "--flake" not in lock_cmd
+    else:
+        assert scanner.eval_flakeref not in lock_cmd
+    probe_lock = lock_cmd[lock_cmd.index("--output-lock-file") + 1]
+    assert len(eval_calls) == 2
+    assert all(
+        cmd[cmd.index("--reference-lock-file") + 1] == probe_lock for cmd in eval_calls
+    )
+    assert all("--override-input" not in cmd for cmd in eval_calls)
+
+
+def test_target_input_probe_rejects_unmatched_lock_override(
+    monkeypatch, tmp_path, caplog
+):
+    """A successful lock command must still prove that it applied the probe."""
+    scanner = tu.make_scanner(tmp_path)
+    scanner.repodir = tmp_path
+    _write_lock(
+        scanner,
+        {"candidate": "candidate"},
+        {"candidate": _locked_input("aaaaaaaaaaaaaaaa")},
+    )
+
+    def fake_exec(cmd, **_kwargs):
+        if cmd[:3] != ["nix", "flake", "lock"]:
+            pytest.fail("target evaluated with an unapplied input probe")
+        output = cmd[cmd.index("--output-lock-file") + 1]
+        Path(output).write_bytes(scanner.lockfile.read_bytes())
+        return SimpleNamespace(
+            returncode=0,
+            stdout="",
+            stderr="warning: override does not match any input",
+        )
+
+    monkeypatch.setattr(flakevuln_main, "exec_cmd", fake_exec)
+
+    with caplog.at_level("DEBUG"):
+        assert scanner._target_uses_flake_input(
+            TARGET,
+            "candidate",
+            "/nix/store/scanned.drv",
+        )
+
+    assert "override does not match any input" in caplog.text
+
+
+def test_target_input_probe_empties_follows_override_and_source(monkeypatch, tmp_path):
+    """A followed override and its source cannot survive beside the probe."""
+    scanner = tu.make_scanner(tmp_path)
+    _write_lock(
+        scanner,
+        {"nixpkgs": ["sbomnix", "nixpkgs"], "sbomnix": "sbomnix"},
+        {
+            "sbomnix": _locked_input(
+                "bbbbbbbbbbbbbbbb",
+                owner="tiiuae",
+                repo="sbomnix",
+                inputs={"nixpkgs": "nixpkgs_2"},
+            ),
+            "nixpkgs_2": _locked_input("aaaaaaaaaaaaaaaa"),
+        },
+    )
+    calls = []
+
+    def fake_eval(target, overrides):
+        calls.append((target, overrides))
+        emptied = {input_path for input_path, _ref in overrides}
+        returncode = 1 if emptied == {"nixpkgs", "sbomnix/nixpkgs"} else 0
+        return SimpleNamespace(
+            returncode=returncode,
+            stdout=json.dumps({"/nix/store/scanned.drv": {}}),
+        )
+
+    monkeypatch.setattr(scanner, "_run_target_eval", fake_eval)
+    override = ("nixpkgs", "github:NixOS/nixpkgs/nixos-unstable")
+
+    assert scanner._target_uses_flake_input(
+        "packages.x86_64-linux.default",
+        "sbomnix/nixpkgs",
+        "/nix/store/scanned.drv",
+        override=override,
+    )
+
+    assert len(calls) == 1
+    assert [input_path for input_path, _ref in calls[0][1]] == [
+        "nixpkgs",
+        "sbomnix/nixpkgs",
+    ]
+    assert all(ref.startswith("path:") for _input_path, ref in calls[0][1])
+
+
 def test_flake_input_collapses_follows_aliases(monkeypatch, tmp_path):
     """A followed nixpkgs node is one input source, not ambiguous aliases."""
     scanner = tu.make_scanner(tmp_path)
@@ -1253,6 +1601,46 @@ def test_flake_input_collapses_follows_aliases(monkeypatch, tmp_path):
     assert candidates[0]["input_path"] == "nixpkgs"
     assert candidates[0]["locked_rev"] == "bbbbbbbbbbbbbbbb"
     assert candidates[0]["flake_ref"] == ("github:NixOS/nixpkgs/bbbbbbbbbbbbbbbb")
+
+
+def test_flake_input_prefers_source_path_over_sort_first_follows_alias(tmp_path):
+    """Canonical candidates use the source path that a probe can replace."""
+    scanner = tu.make_scanner(tmp_path)
+    _write_lock(
+        scanner,
+        {"aaa": ["nixpkgs"], "nixpkgs": "nixpkgs"},
+        {"nixpkgs": _locked_input("aaaaaaaaaaaaaaaa")},
+    )
+
+    candidates = scanner._nixpkgs_input_candidates()
+    overrides = scanner._target_input_probe_overrides(
+        "aaa", "path:/empty-input", override=None
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0]["input_path"] == "nixpkgs"
+    assert overrides == [("nixpkgs", "path:/empty-input")]
+
+
+def test_target_input_probe_retains_alias_without_source_path(monkeypatch, tmp_path):
+    """An unresolvable alias cannot safely prove that an input is unused."""
+    scanner = tu.make_scanner(tmp_path)
+    _write_lock(
+        scanner,
+        {"aaa": ["missing"]},
+        {"nixpkgs": _locked_input("aaaaaaaaaaaaaaaa")},
+    )
+    monkeypatch.setattr(
+        scanner,
+        "_run_target_eval",
+        lambda *_args, **_kwargs: pytest.fail("unsafe alias probe was evaluated"),
+    )
+
+    assert scanner._target_uses_flake_input(
+        TARGET,
+        "aaa",
+        "/nix/store/scanned.drv",
+    )
 
 
 def test_flake_input_strips_untrusted_sidecar_fields(monkeypatch, tmp_path):
