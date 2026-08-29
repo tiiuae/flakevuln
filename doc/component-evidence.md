@@ -140,7 +140,8 @@ scan states from running.
   "completed_scans": [],
   "scan_rows": [],
   "evidence_findings": [],
-  "component_evidence": []
+  "component_evidence": [],
+  "package_inventory": {}
 }
 ```
 
@@ -170,6 +171,14 @@ successful scan state in `scan_rows`, and loading enforces that. Published and
 local findings use `true`; the rolling previous-run cache baseline is written
 compact — `false` with empty arrays — because baseline comparisons consume only
 `scan_rows`.
+
+`package_inventory` optionally retains the evaluated package versions needed
+for report comparisons when an unstable scan no longer contains the
+vulnerability row itself. It maps target names to objects whose package names
+map to version arrays. When it is absent, reports omit evaluated unstable
+versions for findings absent from the unstable scan, matching the previous
+report behavior. Older version-2 artifacts omit it; compact baselines write an
+empty inventory.
 
 ### Compatibility
 

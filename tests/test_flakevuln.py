@@ -656,7 +656,9 @@ def test_report_subcommand_reads_findings_without_flake_eval(monkeypatch, tmp_pa
 
 def test_findings_round_trip_scan_to_report(tmp_path):
     """write_findings -> from_findings should preserve the scan state."""
-    scanner = _make_scanner(tmp_path)
+    scanner = _make_scanner(
+        tmp_path, unstable_ref="github:NixOS/nixpkgs/nixos-unstable"
+    )
     target = "packages.x86_64-linux.default"
     scanner.scanned_targets = [(scanner.flakeref, target)]
     scanner.repo_head = "cafef00d"
@@ -680,6 +682,8 @@ def test_findings_round_trip_scan_to_report(tmp_path):
             }
         ]
     )
+    scanner.package_inventory[target] = {"pkg": ("1.1",)}
+    scanner.completed_scans.add((scanner.scope_flakeref, target, PIN_NIX_UNSTABLE))
 
     findings = tmp_path / "sub" / "findings.json"
     scanner.write_findings(findings)
@@ -697,6 +701,23 @@ def test_findings_round_trip_scan_to_report(tmp_path):
     }
     assert restored.comparison_state == scanner.comparison_state
     assert restored.df_scan["vuln_id"].tolist() == ["CVE-0000-0001"]
+    assert restored.package_inventory == {target: {"pkg": ("1.1",)}}
+
+
+def test_ambiguous_package_inventory_is_ignored(tmp_path, caplog):
+    """Optional versions must not break reports with same-named targets."""
+    scanner = _mark_current_only(_make_scanner(tmp_path))
+    target = "packages.x86_64-linux.default"
+    scanner.scanned_targets = [
+        ("github:example/one", target),
+        ("github:example/two", target),
+    ]
+    scanner.package_inventory[target] = {"pkg": ("1.1",)}
+
+    restored = FlakeScanner.from_findings_data(scanner._findings_data())
+
+    assert restored.package_inventory == {}
+    assert "Ignoring package inventory" in caplog.text
 
 
 def test_scope_targets_are_derived_from_the_persisted_scope(tmp_path):
@@ -1118,6 +1139,36 @@ def test_current_report_prefers_evaluated_unstable_over_repology(tmp_path):
     assert sections["fixed_unstable"] == "```No vulnerabilities```"
 
 
+def test_fixed_by_relock_uses_evaluated_unstable_package_version(tmp_path):
+    """A fixed finding still gets its package version from the unstable graph."""
+    target = "packages.x86_64-linux.default"
+    scanner = _make_scanner(
+        tmp_path,
+        flakeref="flake",
+        unstable_ref="github:NixOS/nixpkgs/nixos-unstable",
+    )
+    scanner.scanned_targets = [("flake", target)]
+    scanner.df_scan = pd.DataFrame(
+        [
+            _scan_row(
+                target,
+                PIN_CURRENT,
+                "CVE-1",
+                "libgit2",
+                version_local="1.9.4",
+                version_nixpkgs="repology-version",
+            )
+        ]
+    )
+    scanner.package_inventory[target] = {"libgit2": ("1.9.7",)}
+
+    table = scanner._target_report_sections("flake", target)["fixed_upstream"]
+
+    assert "1.9.7" in table
+    assert "not detected" not in table
+    assert "repology-version" not in table
+
+
 def test_diff_sections_prefer_evaluated_unstable_over_repology(tmp_path):
     """Report diffs should use the evaluated unstable version when present."""
     target = "packages.x86_64-linux.default"
@@ -1176,8 +1227,9 @@ def test_diff_sections_prefer_evaluated_unstable_over_repology(tmp_path):
     assert "1.2-repology" not in sections["fixed_since_last_run"]
 
 
-def test_fixed_unstable_section_omits_unavailable_unstable_version(tmp_path):
-    """A finding absent from unstable has no evaluated version to display."""
+@pytest.mark.parametrize("inventory", [{"pkg": ("1.4",)}, None])
+def test_fixed_unstable_section_uses_only_available_inventory(tmp_path, inventory):
+    """A fixed finding uses inventory only when the scan collected it."""
     target = "packages.x86_64-linux.default"
     scanner = _make_scanner(
         tmp_path,
@@ -1199,15 +1251,23 @@ def test_fixed_unstable_section_omits_unavailable_unstable_version(tmp_path):
             ),
         ]
     )
+    if inventory is not None:
+        scanner.package_inventory[target] = inventory
 
     sections = scanner._target_report_sections("flake", target)
     table = sections["fixed_unstable"]
 
     header = next(line for line in table.splitlines() if line.startswith("| vuln_id"))
-    assert "nix_unstable" not in header
     assert "upstream" in header
     assert "1.3" in table
-    assert "not detected" in sections["current"]
+    assert "1.2" not in table
+    if inventory is None:
+        assert "nix_unstable" not in header
+        assert "not detected" not in table
+    else:
+        assert "nix_unstable" in header
+        assert "1.4" in table
+        assert "1.4" in sections["current"]
 
 
 def test_current_report_wraps_multiple_unstable_versions(tmp_path):
@@ -3049,6 +3109,59 @@ def test_read_scan_results_runs_vulnxscan_in_tmpdir(monkeypatch, tmp_path):
     scanner._read_scan_results(["vulnxscan"], "t", PIN_CURRENT)
 
     assert captured["cwd"] == scanner.tmpdir
+
+
+def test_derivation_package_inventory_reads_selected_versions(monkeypatch, tmp_path):
+    """The inventory uses actual package metadata from the target's drv graph."""
+    scanner = _make_scanner(tmp_path)
+    payload = {
+        "derivations": {
+            "aaa-authen-sasl.drv": {
+                "name": "perl5.40.0-Authen-SASL-2.17",
+                "structuredAttrs": {"pname": "Authen-SASL", "version": "2.17"},
+            },
+            "bbb-perl.drv": {
+                "name": "perl",
+                "env": {"__json": json.dumps({"version": "5.42.3"})},
+            },
+            "ccc-ignored.drv": {"env": {"pname": "ignored", "version": "9.9"}},
+        }
+    }
+
+    def fake_exec(cmd, **kwargs):
+        assert cmd[-2:] == ["--recursive", "/nix/store/target.drv"]
+        assert kwargs == {"raise_on_error": False, "capture": True}
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=json.dumps(payload), stderr=""
+        )
+
+    monkeypatch.setattr(flakevuln_main, "exec_cmd", fake_exec)
+
+    inventory = scanner._derivation_package_inventory(
+        "/nix/store/target.drv", {"perl5.40.0-Authen-SASL", "perl"}
+    )
+
+    assert inventory == {
+        "perl": ("5.42.3",),
+        "perl5.40.0-Authen-SASL": ("2.17",),
+    }
+
+
+@pytest.mark.parametrize(("returncode", "stdout"), [(1, ""), (0, "not-json")])
+def test_derivation_package_inventory_degrades_on_read_error(
+    monkeypatch, tmp_path, returncode, stdout
+):
+    """An unavailable inventory must not fail the vulnerability scan."""
+    scanner = _make_scanner(tmp_path)
+    monkeypatch.setattr(
+        flakevuln_main,
+        "exec_cmd",
+        lambda cmd, **_kwargs: subprocess.CompletedProcess(
+            cmd, returncode, stdout=stdout, stderr="error"
+        ),
+    )
+
+    assert scanner._derivation_package_inventory("target.drv", {"pkg"}) is None
 
 
 def test_scan_target_skips_unstable_without_ref(monkeypatch, tmp_path):

@@ -25,7 +25,15 @@ TARGET = "packages.x86_64-linux.default"
 COMPONENT_EVIDENCE_HEADING = "Patched and Partially Patched Findings (press to expand)"
 
 
-def _run_scan(monkeypatch, tmp_path, *, pintype=PIN_CURRENT, scanner=None, **fake):
+def _run_scan(
+    monkeypatch,
+    tmp_path,
+    *,
+    pintype=PIN_CURRENT,
+    scanner=None,
+    buildtime=False,
+    **fake,
+):
     """Run one `_read_scan_results` against a faked vulnxscan process."""
     if scanner is None:
         scanner = tu.make_scanner(tmp_path)
@@ -37,7 +45,8 @@ def _run_scan(monkeypatch, tmp_path, *, pintype=PIN_CURRENT, scanner=None, **fak
     monkeypatch.setattr(
         flakevuln_main, "exec_cmd", tu.fake_vulnxscan(**fake), raising=True
     )
-    scanner._read_scan_results(["vulnxscan"], TARGET, pintype)
+    cmd = ["vulnxscan", *(["--buildtime"] if buildtime else [])]
+    scanner._read_scan_results(cmd, TARGET, pintype)
     return scanner
 
 
@@ -57,6 +66,57 @@ def _scanner_with(monkeypatch, tmp_path, findings, components, triage_rows):
 
 def _has_error(scanner, pintype=PIN_CURRENT):
     return scanner._read_error(scanner.flakeref, TARGET, [pintype]) is not None
+
+
+@pytest.mark.parametrize("inventory", [{"libgit2": ("1.9.7",)}, None])
+def test_unstable_scan_records_available_package_inventory(
+    monkeypatch, tmp_path, inventory
+):
+    """A build-time unstable scan retains only a successful inventory read."""
+    scanner = tu.make_scanner(
+        tmp_path, unstable_ref="github:NixOS/nixpkgs/nixos-unstable"
+    )
+    scanner.evidence_included = True
+    scanner.scanned_targets = [(scanner.flakeref, TARGET)]
+    scanner.df_scan = pd.DataFrame(
+        [
+            {
+                "target": TARGET,
+                "flakeref": scanner.flakeref,
+                "scope_flakeref": scanner.scope_flakeref,
+                "pintype": PIN_CURRENT,
+                "package": "libgit2",
+            },
+            {
+                "target": TARGET,
+                "flakeref": scanner.flakeref,
+                "scope_flakeref": scanner.scope_flakeref,
+                "pintype": PIN_LOCK_UPDATED,
+                "package": "openssl",
+            },
+        ]
+    )
+    finding, component = tu.package_version_only_finding(package="perl")
+
+    def package_inventory(drv, packages):
+        assert drv == "/nix/store/x.drv"
+        assert packages == {"libgit2", "openssl"}
+        return inventory
+
+    monkeypatch.setattr(scanner, "_derivation_package_inventory", package_inventory)
+    scanner = _run_scan(
+        monkeypatch,
+        tmp_path,
+        scanner=scanner,
+        pintype=PIN_NIX_UNSTABLE,
+        buildtime=True,
+        document=tu.evidence_document([finding], [component]),
+        triage_rows=[tu.triage_row(finding)],
+    )
+
+    assert scanner.package_inventory == (
+        {TARGET: inventory} if inventory is not None else {}
+    )
 
 
 # --- vulnxscan contract fixtures ------------------------------------------

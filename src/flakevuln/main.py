@@ -254,8 +254,8 @@ def _normalize_nix_store_path(path, store_dir="/nix/store"):
     return str(Path(store_dir) / text)
 
 
-def _parse_nix_derivation_show(stdout):
-    """Return the first derivation path and its attributes from Nix JSON."""
+def _parse_nix_derivation_show_all(stdout):
+    """Return every derivation and its attributes from Nix JSON."""
     try:
         payload = json.loads(stdout)
     except json.JSONDecodeError as error:
@@ -269,16 +269,23 @@ def _parse_nix_derivation_show(stdout):
     derivations = payload.get("derivations", payload)
     if not isinstance(derivations, dict):
         raise ValueError("`nix derivation show` returned a non-object `derivations`")
+    parsed = {}
     for drv_path, attributes in derivations.items():
         if not isinstance(drv_path, str) or not drv_path.strip():
             raise ValueError(
                 "`nix derivation show` returned a non-string derivation path"
             )
-        return (
-            Path(_normalize_nix_store_path(drv_path)),
-            attributes if isinstance(attributes, dict) else {},
-        )
-    raise ValueError("`nix derivation show` returned no derivation paths")
+        parsed[drv_path] = attributes if isinstance(attributes, dict) else {}
+    if not parsed:
+        raise ValueError("`nix derivation show` returned no derivation paths")
+    return parsed
+
+
+def _parse_nix_derivation_show(stdout):
+    """Return the first derivation path and its attributes from Nix JSON."""
+    derivations = _parse_nix_derivation_show_all(stdout)
+    drv_path = next(iter(derivations))
+    return Path(_normalize_nix_store_path(drv_path)), derivations[drv_path]
 
 
 def _add_verbose_arg(parser):
@@ -1099,6 +1106,7 @@ class FlakeScanner:
         self.df_scan = _empty_scan_df()
         self.evidence_findings = []
         self.component_evidence = []
+        self.package_inventory = {}
         self.evidence_included = True
         self.flakeref = flakeref
         self.input_name = input_name
@@ -1318,6 +1326,11 @@ class FlakeScanner:
         ) = evidence.read_findings_evidence(data)
         rows = data.get("scan_rows", [])
         self.df_scan = _normalize_scan_df(pd.DataFrame(rows))
+        self.package_inventory = _validated_package_inventory(
+            data.get("package_inventory", {})
+            if findings_schema_version == evidence.FINDINGS_SCHEMA_VERSION
+            else {}
+        )
         self.scanned_targets = _validated_target_pairs(
             data.get("scanned_targets", []), "scanned_targets"
         )
@@ -1360,6 +1373,15 @@ class FlakeScanner:
         rows = _normalize_scan_df(self.df_scan).to_dict(orient="records")
         reachable = self._reachable_scan_targets(rows)
         self._validate_scan_keys_are_reachable(rows, reachable)
+        for target in list(self.package_inventory):
+            scopes = {scope for scope, name in reachable if name == target}
+            if len(scopes) != 1:
+                LOG.warning(
+                    "Ignoring package inventory for target '%s': it does not "
+                    "identify exactly one scanned flake",
+                    target,
+                )
+                del self.package_inventory[target]
         self._validate_error_keys(rows, reachable)
         if not completed_scans_included:
             if findings_schema_version == evidence.FINDINGS_SCHEMA_VERSION:
@@ -1630,6 +1652,17 @@ class FlakeScanner:
             "component_evidence": (
                 list(self.component_evidence) if not compact else []
             ),
+            "package_inventory": (
+                {
+                    target: {
+                        package: list(versions)
+                        for package, versions in sorted(packages.items())
+                    }
+                    for target, packages in sorted(self.package_inventory.items())
+                }
+                if not compact
+                else {}
+            ),
             "flakeref": str(self.flakeref),
             "scope_flakeref": self.scope_flakeref,
             "input_name": self.input_name,
@@ -1746,6 +1779,14 @@ class FlakeScanner:
             flakeref, target, [PIN_NIX_UNSTABLE]
         ):
             unstable_versions = self._pin_version_map(all_rows, PIN_NIX_UNSTABLE)
+            unstable_versions.update(
+                {
+                    ("", package): versions
+                    for package, versions in self.package_inventory.get(
+                        str(target), {}
+                    ).items()
+                }
+            )
         return _TargetReportContext(
             all_rows=all_rows,
             active_rows=active_rows,
@@ -2701,19 +2742,18 @@ class FlakeScanner:
         err = self._read_error(flakeref, target, [left_pin, right_pin])
         if err:
             return _render_error(err)
+        comparison_versions = context.unstable_versions
         if right_pin == PIN_NIX_UNSTABLE:
-            # These rows are defined by their absence from the unstable scan,
-            # so no evaluated unstable vulnerability-row version exists.
-            # Dropping the Repology fallback avoids presenting metadata as an
-            # observed comparison version; the upstream column remains.
+            # These rows have no unstable vulnerability row. The package
+            # inventory still supplies their evaluated version; dropping the
+            # Repology fallback prevents metadata posing as that observation.
             df = df.drop(columns=["version_nixpkgs"], errors="ignore")
-            unstable_versions = None
-        else:
-            unstable_versions = context.unstable_versions
+            if str(target) not in self.package_inventory:
+                comparison_versions = None
         return self._df_to_report_tbl(
             df,
             marks=self._evidence_marks(flakeref, target),
-            comparison_versions=unstable_versions,
+            comparison_versions=comparison_versions,
             comparison_column=PIN_NIX_UNSTABLE,
         )
 
@@ -3023,9 +3063,13 @@ class FlakeScanner:
                 _REPORT_VERSION_NOT_DETECTED if has_evaluated_unstable else ""
             )
             df[comparison_column] = df.apply(
-                lambda row: comparison_versions.get(
-                    (row.get("vuln_id", ""), row.get("package", "")),
-                    missing_version,
+                lambda row: (
+                    comparison_versions.get(
+                        (row.get("vuln_id", ""), row.get("package", ""))
+                    )
+                    or comparison_versions.get(
+                        ("", row.get("package", "")), missing_version
+                    )
                 ),
                 axis=1,
             )
@@ -3740,7 +3784,88 @@ in builtins.listToAttrs (map (name: {{ inherit name; value = get name; }}) args.
         }
         self.evidence_findings.extend(evidence.annotate(findings, **annotation))
         self.component_evidence.extend(evidence.annotate(components, **annotation))
+        if "--buildtime" in cmd and pintype == PIN_NIX_UNSTABLE:
+            # vulnxscan's complete SBOM is temporary. Retain just the versions
+            # needed to report findings fixed from either diff baseline.
+            compared = self._target_df(self.flakeref, target)
+            compared = compared[
+                (compared["pintype"] == PIN_CURRENT)
+                | (compared["pintype"] == PIN_LOCK_UPDATED)
+            ]
+            packages = set(compared["package"])
+            inventory = self._derivation_package_inventory(drv_path, packages)
+            if inventory is not None:
+                self.package_inventory[str(target)] = inventory
         self._record_completed_scan(target, pintype)
+
+    def _derivation_package_inventory(self, drv_path, packages):
+        """Read selected package versions from a build-time derivation graph."""
+        if not packages:
+            return {}
+        ret = exec_cmd(
+            [
+                "nix",
+                "derivation",
+                "show",
+                *_nix_verbosity_flags(self.verbosity),
+                "--recursive",
+                str(drv_path),
+            ],
+            raise_on_error=False,
+            capture=True,
+        )
+        if ret.returncode != 0:
+            LOG.warning(
+                "Could not read package inventory for '%s': %s",
+                drv_path,
+                _tail_text(ret.stderr),
+            )
+            return None
+        try:
+            derivations = _parse_nix_derivation_show_all(ret.stdout)
+        except ValueError as error:
+            LOG.warning(
+                "Could not parse package inventory for '%s': %s", drv_path, error
+            )
+            return None
+        inventory = {}
+
+        def string_value(*values):
+            return next(
+                (
+                    value.strip()
+                    for value in values
+                    if isinstance(value, str) and value.strip()
+                ),
+                "",
+            )
+
+        for attributes in derivations.values():
+            env = attributes.get("env", {})
+            env = env if isinstance(env, dict) else {}
+            structured = attributes.get("structuredAttrs", {})
+            structured = structured if isinstance(structured, dict) else {}
+            if not structured and isinstance(env.get("__json"), str):
+                try:
+                    decoded = json.loads(env["__json"])
+                except json.JSONDecodeError:
+                    decoded = {}
+                structured = decoded if isinstance(decoded, dict) else {}
+            name = string_value(
+                attributes.get("name"), env.get("name"), structured.get("name")
+            )
+            package = string_value(env.get("pname"), structured.get("pname")) or name
+            version = string_value(env.get("version"), structured.get("version"))
+            if package and name:
+                prefix, separator, _suffix = name.partition(package)
+                if separator:
+                    package = prefix + package
+            if package in packages and version:
+                inventory.setdefault(package, set()).add(version)
+        return {
+            package: tuple(sorted(versions))
+            for package, versions in sorted(inventory.items())
+        }
 
     def _record_completed_scan(self, target, pintype):
         """Remember a successful scan state, even when it found no rows."""
@@ -4188,6 +4313,43 @@ def _validated_scan_keys(value, what):
             raise evidence.EvidenceError(f"{what} repeats {list(key)}")
         keys.add(key)
     return keys
+
+
+def _validated_package_inventory(value):
+    """Return evaluated package versions keyed by target name."""
+    if not isinstance(value, dict):
+        raise evidence.EvidenceError("package_inventory must be a JSON object")
+    inventory = {}
+    for target, packages in value.items():
+        if not isinstance(target, str) or not target:
+            raise evidence.EvidenceError(
+                "package_inventory target names must be non-empty strings"
+            )
+        if not isinstance(packages, dict):
+            raise evidence.EvidenceError(
+                f"package_inventory for target '{target}' must be a JSON object"
+            )
+        validated = {}
+        for package, versions in packages.items():
+            if not isinstance(package, str) or not package:
+                raise evidence.EvidenceError(
+                    "package_inventory package names must be non-empty strings"
+                )
+            if (
+                not isinstance(versions, list)
+                or not versions
+                or not all(isinstance(version, str) and version for version in versions)
+            ):
+                raise evidence.EvidenceError(
+                    "package_inventory versions must be non-empty string arrays"
+                )
+            if len(set(versions)) != len(versions):
+                raise evidence.EvidenceError(
+                    f"package_inventory repeats a version for package '{package}'"
+                )
+            validated[package] = tuple(versions)
+        inventory[target] = validated
+    return inventory
 
 
 def _deduplicated_targets(targets):
