@@ -8,32 +8,31 @@ import requests
 from flakevuln import nixprs
 
 
-def _findings():
-    return [
-        {"vuln_id": "CVE-1", "package": "a", "whitelist": False},
-        {"vuln_id": "CVE-2", "package": "b", "whitelist": True},
-        {"vuln_id": "CVE-3", "package": "c", "whitelist": False},
-    ]
-
-
-def test_enrich_annotates_non_whitelisted(monkeypatch):
+def test_enrich_annotates_non_whitelisted():
     queried = []
 
     def fake_fetcher(query, token, sleeper):
         queried.append(query)
         return [f"https://github.com/NixOS/nixpkgs/pull/{len(queried)}"]
 
-    findings = _findings()
+    findings = [
+        {"vuln_id": "CVE-1", "package": "a", "whitelist": False},
+        {"vuln_id": "CVE-2", "package": "b", "whitelist": True},
+        {"vuln_id": "CVE-3", "package": "c", "whitelist": False},
+        {"vuln_id": "CVE-1", "package": "a", "whitelist": False},
+    ]
     ok = nixprs.enrich_actionable(findings, token="t", fetcher=fake_fetcher)
 
     assert ok is True
-    # Whitelisted CVE-2 is skipped; the other two are queried.
-    assert "CVE-1" in queried[0]
-    assert all("CVE-2" not in q for q in queried)
+    assert queried == [
+        "repo:NixOS/nixpkgs is:pr CVE-1",
+        "repo:NixOS/nixpkgs is:pr CVE-3",
+    ]
     assert findings[0]["nixpkgs_pr"].startswith(
         "https://github.com/NixOS/nixpkgs/pull/"
     )
     assert "nixpkgs_pr" not in findings[1]
+    assert findings[3]["nixpkgs_pr"] == findings[0]["nixpkgs_pr"]
 
 
 def test_enrich_skips_excluded_packages():
@@ -61,15 +60,83 @@ def test_enrich_skips_excluded_packages():
 
 
 def test_enrich_is_non_fatal_on_error():
+    queried = []
+
     def boom(query, token, sleeper):
+        queried.append(query)
         raise RuntimeError("rate limited")
 
-    findings = _findings()
+    findings = [
+        {"vuln_id": "CVE-1", "package": "a", "whitelist": False},
+        {"vuln_id": "CVE-1", "package": "b", "whitelist": False},
+        {"vuln_id": "CVE-1", "package": "c", "whitelist": False},
+    ]
     ok = nixprs.enrich_actionable(findings, token="", fetcher=boom)
 
     # The run completes; failures are reported via the return value, not raised.
     assert ok is False
-    assert findings[0].get("nixpkgs_pr", "") == ""
+    # A failed id is retried once, then given up on for the rest of the run.
+    assert queried == [
+        "repo:NixOS/nixpkgs is:pr CVE-1",
+        "repo:NixOS/nixpkgs is:pr CVE-1",
+    ]
+    assert "nixpkgs_pr" not in findings[0]
+    assert "nixpkgs_pr" not in findings[1]
+    assert "nixpkgs_pr" not in findings[2]
+
+
+def test_enrich_retries_same_vuln_id_after_failure():
+    queried = []
+
+    def flaky(query, token, sleeper):
+        queried.append(query)
+        if len(queried) == 1:
+            raise RuntimeError("rate limited")
+        return ["https://github.com/NixOS/nixpkgs/pull/1"]
+
+    findings = [
+        {"vuln_id": "CVE-1", "package": "a", "whitelist": False},
+        {"vuln_id": "CVE-1", "package": "b", "whitelist": False},
+        {"vuln_id": "CVE-1", "package": "c", "whitelist": False},
+    ]
+    ok = nixprs.enrich_actionable(findings, token="t", fetcher=flaky)
+
+    # One failure, one success, then the cached success is reused; every
+    # eligible finding has a lookup result after backfill.
+    assert ok is True
+    assert queried == [
+        "repo:NixOS/nixpkgs is:pr CVE-1",
+        "repo:NixOS/nixpkgs is:pr CVE-1",
+    ]
+    # The finding that hit the failure is backfilled from the later success.
+    assert findings[0]["nixpkgs_pr"].endswith("/pull/1")
+    assert findings[1]["nixpkgs_pr"] == findings[0]["nixpkgs_pr"]
+    assert findings[2]["nixpkgs_pr"] == findings[0]["nixpkgs_pr"]
+
+
+def test_enrich_backfill_skips_whitelisted_and_excluded():
+    def flaky(query, token, sleeper):
+        if "CVE-1" in query:
+            raise RuntimeError("rate limited")
+        return ["https://github.com/NixOS/nixpkgs/pull/1"]
+
+    findings = [
+        {"vuln_id": "CVE-1", "package": "linux", "whitelist": False},
+        {"vuln_id": "CVE-1", "package": "a", "whitelist": True},
+        {"vuln_id": "CVE-2", "package": "b", "whitelist": False},
+    ]
+    ok = nixprs.enrich_actionable(
+        findings,
+        token="t",
+        exclude_packages=["linux"],
+        fetcher=flaky,
+    )
+
+    # CVE-1 is never queried, so neither ineligible finding is annotated.
+    assert ok is True
+    assert "nixpkgs_pr" not in findings[0]
+    assert "nixpkgs_pr" not in findings[1]
+    assert findings[2]["nixpkgs_pr"].endswith("/pull/1")
 
 
 def test_default_fetcher_retries_then_gives_up_on_rate_limit(monkeypatch):

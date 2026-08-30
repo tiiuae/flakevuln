@@ -31,6 +31,8 @@ AUTH_SEARCH_REQUESTS_PER_MINUTE = 29
 SEARCH_REQUESTS_PER_SECOND = 1
 DEFAULT_RATE_LIMIT_RETRY_DELAY = 60
 MAX_RATE_LIMIT_RETRY_DELAY = 120
+# Per vuln_id lookup attempts before the id is given up on for this run.
+MAX_LOOKUP_ATTEMPTS = 2
 
 
 def _rate_limit_retry_delay(resp, *, fallback_delay, now=None):
@@ -81,9 +83,9 @@ def _default_fetcher(
 ):
     """Query the GitHub issues search API; return up to MAX_RESULTS PR URLs.
 
-    Retries a couple of times on rate limiting, then gives up (returns []).
-    Raises on other HTTP/network errors so the caller can treat them as a
-    non-fatal enrichment failure.
+    Retries a couple of times on rate limiting, then raises. Other HTTP and
+    network errors raise immediately. Either way the caller treats the raise
+    as a non-fatal enrichment failure.
     """
     quoted = urllib.parse.quote(query_str, safe="")
     url = f"{GITHUB_SEARCH_URL}?q={quoted}&per_page={MAX_RESULTS}"
@@ -108,10 +110,23 @@ def _default_fetcher(
             payload = resp.json()
             items = payload.get("items", [])
             return [item["html_url"] for item in items[:MAX_RESULTS]]
+        # Not reachable: the last attempt either returns or raises above.
         return []
     finally:
         if owns_session and hasattr(session, "close"):
             session.close()
+
+
+def _eligible_findings(actionable, excluded_packages):
+    """Yield the (finding, vuln_id) pairs that qualify for a PR lookup."""
+    for finding in actionable:
+        if finding.get("whitelist"):
+            continue
+        package = str(finding.get("package", "")).strip()
+        vuln_id = finding.get("vuln_id", "")
+        if not vuln_id or package in excluded_packages:
+            continue
+        yield finding, vuln_id
 
 
 def enrich_actionable(
@@ -119,9 +134,12 @@ def enrich_actionable(
 ):
     """Annotate each non-whitelisted finding with a `nixpkgs_pr` field.
 
-    Returns True if every queried finding was enriched without error, False if
-    any query failed. `fetcher` is injectable for testing; by default it
-    queries the live GitHub search API.
+    Returns True if every eligible finding got a lookup result, False if any
+    still lacks one after retries and backfill. Only successful lookups are
+    cached per vuln_id: a failed id is retried once by the next finding that
+    shares it, then given up on so duplicates do not each pay for the same
+    failure. `fetcher` is injectable for testing; by default it queries the
+    live GitHub search API.
     """
     excluded_packages = {
         str(package).strip()
@@ -133,17 +151,17 @@ def enrich_actionable(
     fetcher = _default_fetcher if fetcher is None else fetcher
     if not token:
         LOG.warning("No GH_TOKEN for --nixprs; using anonymous (low) rate limit")
-    ok = True
     session = _create_github_session(token) if use_default_fetcher else None
+    pr_urls_by_vuln_id = {}
+    failures_by_vuln_id = {}
+    queried = []
     try:
-        for finding in actionable:
-            if finding.get("whitelist"):
+        for finding, vuln_id in _eligible_findings(actionable, excluded_packages):
+            queried.append((finding, vuln_id))
+            if vuln_id in pr_urls_by_vuln_id:
+                finding["nixpkgs_pr"] = pr_urls_by_vuln_id[vuln_id]
                 continue
-            package = str(finding.get("package", "")).strip()
-            if package in excluded_packages:
-                continue
-            vuln_id = finding.get("vuln_id", "")
-            if not vuln_id:
+            if failures_by_vuln_id.get(vuln_id, 0) >= MAX_LOOKUP_ATTEMPTS:
                 continue
             query = f"repo:NixOS/nixpkgs is:pr {vuln_id}"
             try:
@@ -151,11 +169,19 @@ def enrich_actionable(
                     urls = fetcher(query, token, sleeper)
                 else:
                     urls = fetcher(query, token, sleeper, session=session)
-                finding["nixpkgs_pr"] = " ".join(urls)
+                joined = " ".join(urls)
             except Exception as error:
                 LOG.warning("nixpkgs PR enrichment failed for %s: %s", vuln_id, error)
-                ok = False
-        return ok
+                failures_by_vuln_id[vuln_id] = failures_by_vuln_id.get(vuln_id, 0) + 1
+                continue
+            pr_urls_by_vuln_id[vuln_id] = joined
+            finding["nixpkgs_pr"] = pr_urls_by_vuln_id[vuln_id]
+        # A vuln_id that failed early can succeed on its retry; backfill the
+        # findings that passed through before that success was cached.
+        for finding, vuln_id in queried:
+            if "nixpkgs_pr" not in finding and vuln_id in pr_urls_by_vuln_id:
+                finding["nixpkgs_pr"] = pr_urls_by_vuln_id[vuln_id]
+        return all("nixpkgs_pr" in finding for finding, _vuln_id in queried)
     finally:
         if session is not None:
             session.close()
