@@ -2936,25 +2936,36 @@ def test_scan_target_scan_model_verbs(monkeypatch, tmp_path):
     re-lock, and an override-input unstable eval (no flake.nix mutation)."""
     unstable = "github:NixOS/nixpkgs/nixos-unstable"
     scanner = _make_scanner(tmp_path, unstable_ref=unstable)
+    scanner.lockfile.write_text("orig", encoding="utf-8")
+    scanner.lockfile_bak.write_text("orig", encoding="utf-8")
     relocked = []
     calls = []
 
-    monkeypatch.setattr(scanner, "_reset_lock", lambda: None)
-    monkeypatch.setattr(scanner, "_update_repo_lock", relocked.append)
+    def _update(input_name):
+        relocked.append(input_name)
+        scanner.lockfile.write_text("updated", encoding="utf-8")
 
-    def _rec(_cmd, _target, pintype, override=None):
-        calls.append((pintype, override))
+    def _rec(_cmd, target, pintype, override=None):
+        calls.append(
+            (target, pintype, override, scanner.lockfile.read_text(encoding="utf-8"))
+        )
 
+    monkeypatch.setattr(scanner, "_update_repo_lock", _update)
     monkeypatch.setattr(scanner, "_read_scan_results", _rec)
 
-    scanner.scan_target("packages.x86_64-linux.default", buildtime=False)
+    scanner.scan_target("packages.x86_64-linux.a", buildtime=False)
+    scanner.scan_target("packages.x86_64-linux.b", buildtime=False)
 
     assert calls == [
-        ("current", None),
-        ("lock_updated", None),
-        ("nix_unstable", ("nixpkgs", unstable)),
+        ("packages.x86_64-linux.a", PIN_CURRENT, None, "orig"),
+        ("packages.x86_64-linux.a", PIN_LOCK_UPDATED, None, "updated"),
+        ("packages.x86_64-linux.a", PIN_NIX_UNSTABLE, ("nixpkgs", unstable), "orig"),
+        ("packages.x86_64-linux.b", PIN_CURRENT, None, "orig"),
+        ("packages.x86_64-linux.b", PIN_LOCK_UPDATED, None, "updated"),
+        ("packages.x86_64-linux.b", PIN_NIX_UNSTABLE, ("nixpkgs", unstable), "orig"),
     ]
-    # Only `lock_updated` writes a real lock; `nix_unstable` rides on the eval.
+    # Only `lock_updated` writes a real lock, and that lock is reused across
+    # targets; `nix_unstable` rides on the eval.
     assert relocked == ["nixpkgs"]
 
 

@@ -2204,18 +2204,11 @@ class FlakeScanner:
         self._reset_lock()
         self._read_scan_results(cmd_vulnxscan, target, PIN_CURRENT)
         # Second scan: re-lock the input in-channel, then evaluate the new lock.
-        self._reset_lock()
-        self._update_repo_lock(self.input_name)
-        if self.lockfile.read_bytes() == self.lockfile_bak.read_bytes():
-            self._set_comparison_skipped(
-                PIN_LOCK_UPDATED,
-                "Skipped upstream comparison: updating "
-                f"`{self.input_name}` did not change `flake.lock`.",
-            )
-            LOG.info(self._comparison_skip_reason(PIN_LOCK_UPDATED))
-            self._skip_redundant_unstable_after_upstream_noop()
-        else:
+        updated_lockfile = self._prepare_lock_updated_lockfile()
+        if updated_lockfile is not None:
             LOG.info("Scanning vulnerabilities after lockfile update")
+            shutil.copy(updated_lockfile, self.lockfile)
+            self._target_input_lock_digest = ""
             self._read_scan_results(cmd_vulnxscan, target, PIN_LOCK_UPDATED)
         # Third scan: only when an unstable ref is configured. Override the
         # input on the eval itself (no lock write).
@@ -3149,6 +3142,26 @@ class FlakeScanner:
         # mutated, so there is nothing to restore for it).
         shutil.copy(self.lockfile_bak, self.lockfile)
         self._target_input_lock_digest = ""
+
+    def _prepare_lock_updated_lockfile(self):
+        """Re-lock the configured input once and return the prepared lockfile."""
+        if hasattr(self, "_lock_updated_lockfile"):
+            return self._lock_updated_lockfile
+        self._reset_lock()
+        self._update_repo_lock(self.input_name)
+        if self.lockfile.read_bytes() == self.lockfile_bak.read_bytes():
+            self._lock_updated_lockfile = None
+            self._set_comparison_skipped(
+                PIN_LOCK_UPDATED,
+                "Skipped upstream comparison: updating "
+                f"`{self.input_name}` did not change `flake.lock`.",
+            )
+            LOG.info(self._comparison_skip_reason(PIN_LOCK_UPDATED))
+            self._skip_redundant_unstable_after_upstream_noop()
+            return None
+        self._lock_updated_lockfile = self.tmpdir / "flake.lock.lock-updated"
+        shutil.copy(self.lockfile, self._lock_updated_lockfile)
+        return self._lock_updated_lockfile
 
     def _run_target_eval(self, target, overrides=(), *, reference_lock=None):
         eval_target = f"{self.eval_flakeref}#{target}"
