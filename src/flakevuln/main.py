@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -2172,6 +2173,7 @@ class FlakeScanner:
 
     def scan_target(self, target, buildtime=True, whitelist=None):
         """Scan given flake output target"""
+        target_started = time.monotonic()
         self.scanned_targets.append((str(self.flakeref), target))
         LOG.info("Scanning flake output '%s'", target)
         # PR enrichment is deliberately not run here: it belongs in the trusted
@@ -2204,7 +2206,13 @@ class FlakeScanner:
         self._reset_lock()
         self._read_scan_results(cmd_vulnxscan, target, PIN_CURRENT)
         # Second scan: re-lock the input in-channel, then evaluate the new lock.
+        lock_started = time.monotonic()
+        lock_reused = hasattr(self, "_lock_updated_lockfile")
         updated_lockfile = self._prepare_lock_updated_lockfile()
+        lock_detail = f"target={target}, reused={str(lock_reused).lower()}"
+        if updated_lockfile is None:
+            lock_detail += ", skipped=true"
+        _log_scan_timing("prepare lock_updated lockfile", lock_started, lock_detail)
         if updated_lockfile is not None:
             LOG.info("Scanning vulnerabilities after lockfile update")
             shutil.copy(updated_lockfile, self.lockfile)
@@ -2225,6 +2233,7 @@ class FlakeScanner:
             )
         elif self._comparison_skip_reason(PIN_NIX_UNSTABLE):
             LOG.info(self._comparison_skip_reason(PIN_NIX_UNSTABLE))
+        _log_scan_timing(f"target '{target}' total", target_started)
 
     @staticmethod
     def _report_target_filename(flakeref, target, target_counts):
@@ -3735,7 +3744,9 @@ in builtins.listToAttrs (map (name: {{ inherit name; value = get name; }}) args.
         }
 
     def _read_scan_results(self, cmd, target, pintype, override=None):
+        started = time.monotonic()
         drv_path = self._evaluate_target_drv(target, pintype, override=override)
+        _log_scan_timing(f"evaluate '{target}' on {pintype}", started)
         if drv_path is None:
             return
         out, out_triage, out_evidence = self._scan_output_paths(target, pintype)
@@ -3748,7 +3759,9 @@ in builtins.listToAttrs (map (name: {{ inherit name; value = get name; }}) args.
         # Run vulnxscan in the disposable tmpdir: at higher verbosity it writes
         # df_vulnix.csv/df_grype.csv/df_osv.csv/df_report_raw.csv/meta.csv
         # relative to cwd, and we never want those in the user's worktree.
+        started = time.monotonic()
         ret = exec_cmd(cmd, raise_on_error=False, capture=True, cwd=self.tmpdir)
+        _log_scan_timing(f"vulnxscan '{target}' on {pintype}", started)
         LOG.debug("vulnxscan ==>\n\n%s\n\n<== vulnxscan\n", ret.stderr)
         if ret.returncode != 0:
             self._record_scan_error(
@@ -3758,9 +3771,13 @@ in builtins.listToAttrs (map (name: {{ inherit name; value = get name; }}) args.
                 ret.stderr or ret.stdout,
             )
             return
+        started = time.monotonic()
         try:
             findings, components = evidence.load_sidecar(out_evidence)
         except evidence.EvidenceError as error:
+            _log_scan_timing(
+                f"read outputs '{target}' on {pintype}", started, "failed=true"
+            )
             # A missing or unreadable evidence report must never be mistaken
             # for a scan that found nothing.
             self._record_scan_error(
@@ -3772,13 +3789,29 @@ in builtins.listToAttrs (map (name: {{ inherit name; value = get name; }}) args.
             return
         df = self._read_triage_rows(target, pintype, out_triage, findings)
         if df is None:
+            _log_scan_timing(
+                f"read outputs '{target}' on {pintype}",
+                started,
+                f"findings={len(findings)}, components={len(components)}, rows=invalid",
+            )
             return
+        _log_scan_timing(
+            f"read outputs '{target}' on {pintype}",
+            started,
+            f"findings={len(findings)}, components={len(components)}, rows={len(df)}",
+        )
+        started = time.monotonic()
         components, df = self._annotate_flake_inputs(
             components,
             df,
             target=target,
             target_drv=str(drv_path),
             override=override,
+        )
+        _log_scan_timing(
+            f"annotate flake inputs '{target}' on {pintype}",
+            started,
+            f"components={len(components)}, rows={'invalid' if df is None else len(df)}",
         )
         if df is None:
             return
@@ -3806,9 +3839,15 @@ in builtins.listToAttrs (map (name: {{ inherit name; value = get name; }}) args.
                 | (compared["pintype"] == PIN_LOCK_UPDATED)
             ]
             packages = set(compared["package"])
+            started = time.monotonic()
             inventory = self._derivation_package_inventory(drv_path, packages)
+            detail = f"packages={len(packages)}"
             if inventory is not None:
+                detail += f", recorded={len(inventory)}"
                 self.package_inventory[str(target)] = inventory
+            _log_scan_timing(
+                f"package inventory '{target}' on {pintype}", started, detail
+            )
         self._record_completed_scan(target, pintype)
 
     def _derivation_package_inventory(self, drv_path, packages):
@@ -5084,9 +5123,13 @@ def _run_scan(  # noqa: PLR0913
     excluded_paths=(),
 ):
     """Run a scan and materialize findings."""
+    scan_started = time.monotonic()
     # Fail early if the following commands are not in PATH.
+    started = time.monotonic()
     exit_unless_command_exists("nix")
     exit_unless_command_exists("vulnxscan")
+    _log_scan_timing("preflight", started)
+    started = time.monotonic()
     scanner = FlakeScanner(
         flakeref,
         input_name=input_name,
@@ -5096,15 +5139,36 @@ def _run_scan(  # noqa: PLR0913
         verbosity=verbosity,
         excluded_paths=excluded_paths,
     )
+    _log_scan_timing("initialize scanner", started)
+    started = time.monotonic()
     whitelist = _usable_whitelist_path(whitelist)
     targets = _deduplicated_targets(targets)
+    _log_scan_timing("prepare inputs", started, f"targets={len(targets)}")
     for target in targets:
         scanner.scan_target(target, whitelist=whitelist)
+    started = time.monotonic()
     scanner.write_findings(findings)
+    _log_scan_timing("write findings", started)
+    _log_scan_timing("total", scan_started)
     return scanner
 
 
-def _run_report(  # noqa: PLR0913
+def _log_timing(kind, label, started, detail=""):
+    suffix = f" ({detail})" if detail else ""
+    LOG.info(
+        "%s timing: %s took %.3fs%s", kind, label, time.monotonic() - started, suffix
+    )
+
+
+def _log_scan_timing(label, started, detail=""):
+    _log_timing("Scan", label, started, detail)
+
+
+def _log_report_timing(label, started, detail=""):
+    _log_timing("Report", label, started, detail)
+
+
+def _run_report(  # noqa: PLR0913, PLR0914, PLR0915
     *,
     findings,
     outdir=None,
@@ -5118,20 +5182,54 @@ def _run_report(  # noqa: PLR0913
     token=None,
 ):
     """Render report outputs from materialized findings."""
+    report_started = time.monotonic()
+    started = time.monotonic()
     reporter = FlakeScanner.from_findings(findings)
     reporter.baseline = _load_baseline_reporter(baseline_findings)
     comparison_notes = getattr(reporter, "_comparison_notes", lambda: [])()
+    _log_report_timing("load findings/baseline", started)
     # Network enrichment runs only here, in the trusted phase, once on the
     # current findings set, and is non-fatal.
     notes = []
     actionable = None
+    actionable_detail = ""
+    pr_detail = ""
+    tracker_detail = ""
+    if nixprs_enabled or nixtracker_enabled:
+        started = time.monotonic()
+        actionable = reporter.compute_actionable()
+        excluded_pr_packages = {
+            str(package).strip()
+            for package in (nixprs_exclude_packages or ())
+            if str(package).strip()
+        }
+        vuln_ids = {
+            str(finding.get("vuln_id", "")).strip()
+            for finding in actionable
+            if str(finding.get("vuln_id", "")).strip()
+        }
+        pr_vuln_ids = {
+            str(finding.get("vuln_id", "")).strip()
+            for finding in actionable
+            if not finding.get("whitelist")
+            and str(finding.get("package", "")).strip() not in excluded_pr_packages
+            and str(finding.get("vuln_id", "")).strip()
+        }
+        cve_count = sum(nixtracker.is_cve_id(vuln_id) for vuln_id in vuln_ids)
+        actionable_detail = (
+            f"actionable={len(actionable)}, vuln_ids={len(vuln_ids)}, cves={cve_count}"
+        )
+        pr_detail = f"actionable={len(actionable)}, query_vuln_ids={len(pr_vuln_ids)}"
+        tracker_detail = f"actionable={len(actionable)}, cves={cve_count}"
+        _log_report_timing("compute actionable", started, actionable_detail)
     if nixprs_enabled:
         token = os.environ.get("GH_TOKEN", "") if token is None else token
-        actionable = reporter.compute_actionable()
+        started = time.monotonic()
         ok = nixprs.enrich_actionable(
             actionable, token, exclude_packages=nixprs_exclude_packages
         )
         reporter.apply_nixprs(actionable)
+        _log_report_timing("nixpkgs PR enrichment", started, pr_detail)
         # Keep `report --findings=...` read-only; owned callers can persist the
         # enriched reporter state separately for future baselines or outputs.
         notes.append(
@@ -5143,10 +5241,10 @@ def _run_report(  # noqa: PLR0913
             )
         )
     if nixtracker_enabled:
-        if actionable is None:
-            actionable = reporter.compute_actionable()
+        started = time.monotonic()
         ok = nixtracker.enrich_actionable(actionable)
         reporter.apply_nixtracker(actionable)
+        _log_report_timing("Nixpkgs tracker enrichment", started, tracker_detail)
         notes.append(
             (
                 "Nixpkgs security tracker lookup: complete for CVE findings"
@@ -5155,6 +5253,7 @@ def _run_report(  # noqa: PLR0913
                 "findings could not be enriched with tracker links"
             )
         )
+    started = time.monotonic()
     notes.extend(
         _safe_markdown_text(note) for note in comparison_notes if str(note).strip()
     )
@@ -5177,11 +5276,13 @@ def _run_report(  # noqa: PLR0913
             ),
         ]
     ).rstrip()
+    _log_report_timing("render summary markdown", started)
     fallback = None
     # The detailed markdown report is an opt-in publication choice. When it is
     # present, its landing page indexes the complete per-target reports used as
     # the source of truth for an oversized Step Summary.
     if outdir is not None:
+        started = time.monotonic()
         reporter.report(outdir, notes=notes)
         if index_outdir is None:
             index_outdir = outdir
@@ -5193,8 +5294,12 @@ def _run_report(  # noqa: PLR0913
             outdir=index_outdir,
             findings=index_findings,
         )
+        _log_report_timing("write target reports", started)
+    started = time.monotonic()
     _write_summary(step_summary, fallback=fallback, local_text=summary)
     _update_next_baseline_reporter(reporter, update_baseline_findings)
+    _log_report_timing("write summary/baseline", started)
+    _log_report_timing("total", report_started)
     return reporter
 
 

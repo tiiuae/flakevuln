@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import logging
 import os
 import re
 import shutil
@@ -2931,7 +2932,7 @@ def test_report_target_current_failure_masks_later_diff_sections(monkeypatch, tm
     assert "CVE-1" not in report_text
 
 
-def test_scan_target_scan_model_verbs(monkeypatch, tmp_path):
+def test_scan_target_scan_model_verbs(monkeypatch, tmp_path, caplog):
     """With an unstable ref, the three scans use the pinned lock, an in-channel
     re-lock, and an override-input unstable eval (no flake.nix mutation)."""
     unstable = "github:NixOS/nixpkgs/nixos-unstable"
@@ -2952,6 +2953,7 @@ def test_scan_target_scan_model_verbs(monkeypatch, tmp_path):
 
     monkeypatch.setattr(scanner, "_update_repo_lock", _update)
     monkeypatch.setattr(scanner, "_read_scan_results", _rec)
+    caplog.set_level(logging.INFO, logger=flakevuln_main.LOG.name)
 
     scanner.scan_target("packages.x86_64-linux.a", buildtime=False)
     scanner.scan_target("packages.x86_64-linux.b", buildtime=False)
@@ -2967,6 +2969,9 @@ def test_scan_target_scan_model_verbs(monkeypatch, tmp_path):
     # Only `lock_updated` writes a real lock, and that lock is reused across
     # targets; `nix_unstable` rides on the eval.
     assert relocked == ["nixpkgs"]
+    assert "Scan timing: prepare lock_updated lockfile took " in caplog.text
+    assert "(target=packages.x86_64-linux.a, reused=false)" in caplog.text
+    assert "(target=packages.x86_64-linux.b, reused=true)" in caplog.text
 
 
 def test_scan_target_forwards_whitelist_flag(monkeypatch, tmp_path):
@@ -3120,6 +3125,17 @@ def test_read_scan_results_runs_vulnxscan_in_tmpdir(monkeypatch, tmp_path):
     scanner._read_scan_results(["vulnxscan"], "t", PIN_CURRENT)
 
     assert captured["cwd"] == scanner.tmpdir
+
+
+def test_read_scan_results_logs_scan_timing(monkeypatch, tmp_path, caplog):
+    scanner = _make_scanner(tmp_path)
+    target = "packages.x86_64-linux.default"
+    monkeypatch.setattr(scanner, "_evaluate_target_drv", lambda *_a, **_k: None)
+    caplog.set_level(logging.INFO, logger=flakevuln_main.LOG.name)
+
+    scanner._read_scan_results(["vulnxscan"], target, PIN_CURRENT)
+
+    assert f"Scan timing: evaluate '{target}' on current took " in caplog.text
 
 
 def test_derivation_package_inventory_reads_selected_versions(monkeypatch, tmp_path):
@@ -3738,21 +3754,29 @@ def test_evaluate_target_drv_reports_stderr(monkeypatch, tmp_path):
     assert "ghafscan" not in err["details"]
 
 
-def test_run_report_sanitizes_comparison_notes_in_summary(monkeypatch, tmp_path):
+def test_run_report_sanitizes_notes_and_logs_enrichment_timings(
+    monkeypatch, tmp_path, caplog
+):
     """Comparison notes loaded from findings must not inject markdown headings."""
 
     class FakeReporter:
         def compute_actionable(self):
-            return []
+            return [
+                {"vuln_id": "CVE-2026-0001", "package": "openssl"},
+                {"vuln_id": "CVE-2026-0001", "package": "zlib"},
+                {"vuln_id": "GHSA-test", "package": "app"},
+                {"vuln_id": "CVE-2026-0002", "package": "linux"},
+                {"vuln_id": "CVE-2026-0003", "package": "bash", "whitelist": True},
+            ]
 
         def apply_nixprs(self, _actionable):
             return None
 
+        def apply_nixtracker(self, _actionable):
+            return None
+
         def render_detailed_summary(self, *, full=True, artifact_run_url=""):
             return "details"
-
-        def report(self, _outdir):
-            return None
 
         def has_current_scan_failures(self):
             return False
@@ -3772,9 +3796,43 @@ def test_run_report_sanitizes_comparison_notes_in_summary(monkeypatch, tmp_path)
         "_write_summary",
         lambda text, **_kwargs: captured.setdefault("text", text),
     )
+    monkeypatch.setattr(
+        flakevuln_main.nixprs,
+        "enrich_actionable",
+        lambda _actionable, _token, exclude_packages=(): True,
+    )
+    monkeypatch.setattr(
+        flakevuln_main.nixtracker,
+        "enrich_actionable",
+        lambda _actionable: True,
+    )
+    caplog.set_level(logging.INFO, logger=flakevuln_main.LOG.name)
 
-    flakevuln_main._run_report(findings=tmp_path / "findings.json")
+    flakevuln_main._run_report(
+        findings=tmp_path / "findings.json",
+        nixprs_enabled=True,
+        nixprs_exclude_packages=["linux"],
+        nixtracker_enabled=True,
+        token="t",
+    )
 
+    timing_lines = [
+        message
+        for record in caplog.records
+        if (message := record.getMessage()).startswith("Report timing:")
+    ]
+    assert [line.split(" took ", 1)[0] for line in timing_lines] == [
+        "Report timing: load findings/baseline",
+        "Report timing: compute actionable",
+        "Report timing: nixpkgs PR enrichment",
+        "Report timing: Nixpkgs tracker enrichment",
+        "Report timing: render summary markdown",
+        "Report timing: write summary/baseline",
+        "Report timing: total",
+    ]
+    assert "(actionable=5, vuln_ids=4, cves=3)" in caplog.text
+    assert "(actionable=5, query_vuln_ids=2)" in caplog.text
+    assert "(actionable=5, cves=3)" in caplog.text
     assert "\n# injected" not in captured["text"]
     assert "bad note" in captured["text"]
 
@@ -3899,7 +3957,7 @@ def test_write_summary_counts_content_already_in_the_file(tmp_path, monkeypatch)
 
 
 def test_run_report_writes_oversize_artifact_index_and_passes_notes(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, caplog
 ):
     class FakeReporter:
         def _comparison_notes(self):
@@ -3944,6 +4002,7 @@ def test_run_report_writes_oversize_artifact_index_and_passes_notes(
         "from_findings",
         classmethod(lambda _cls, _findings: FakeReporter()),
     )
+    caplog.set_level(logging.INFO, logger=flakevuln_main.LOG.name)
 
     flakevuln_main._run_report(findings=findings, outdir=report_dir)
 
@@ -3961,6 +4020,7 @@ def test_run_report_writes_oversize_artifact_index_and_passes_notes(
     assert "custom-report/pkg.md" in step_summary
     assert "evidence/results.json" in step_summary
     assert len(step_summary.encode("utf-8")) <= flakevuln_main._STEP_SUMMARY_MAX_BYTES
+    assert "Report timing: write target reports took " in caplog.text
 
 
 def test_report_output_index_uses_collision_safe_local_target_paths(
