@@ -68,11 +68,18 @@ def _has_error(scanner, pintype=PIN_CURRENT):
     return scanner._read_error(scanner.flakeref, TARGET, [pintype]) is not None
 
 
+@pytest.mark.parametrize(
+    ("pintype", "field"),
+    [
+        (PIN_NIX_UNSTABLE, "package_inventory"),
+        (PIN_LOCK_UPDATED, "lock_updated_package_inventory"),
+    ],
+)
 @pytest.mark.parametrize("inventory", [{"libgit2": ("1.9.7",)}, None])
-def test_unstable_scan_records_available_package_inventory(
-    monkeypatch, tmp_path, inventory
+def test_buildtime_scan_records_available_package_inventory(
+    monkeypatch, tmp_path, inventory, pintype, field
 ):
-    """A build-time unstable scan retains only a successful inventory read."""
+    """Build-time comparison scans retain only successful inventory reads."""
     scanner = tu.make_scanner(
         tmp_path, unstable_ref="github:NixOS/nixpkgs/nixos-unstable"
     )
@@ -100,7 +107,9 @@ def test_unstable_scan_records_available_package_inventory(
 
     def package_inventory(drv, packages):
         assert drv == "/nix/store/x.drv"
-        assert packages == {"libgit2", "openssl"}
+        assert packages == {"libgit2", "openssl"} | (
+            {"perl"} if pintype == PIN_LOCK_UPDATED else set()
+        )
         return inventory
 
     monkeypatch.setattr(scanner, "_derivation_package_inventory", package_inventory)
@@ -108,13 +117,13 @@ def test_unstable_scan_records_available_package_inventory(
         monkeypatch,
         tmp_path,
         scanner=scanner,
-        pintype=PIN_NIX_UNSTABLE,
+        pintype=pintype,
         buildtime=True,
         document=tu.evidence_document([finding], [component]),
         triage_rows=[tu.triage_row(finding)],
     )
 
-    assert scanner.package_inventory == (
+    assert getattr(scanner, field) == (
         {TARGET: inventory} if inventory is not None else {}
     )
 

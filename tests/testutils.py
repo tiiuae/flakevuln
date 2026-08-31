@@ -27,6 +27,7 @@ def make_scanner(tmp_path, flakeref="github:example/flake", unstable_ref=""):
     scanner.evidence_findings = []
     scanner.component_evidence = []
     scanner.package_inventory = {}
+    scanner.lock_updated_package_inventory = {}
     # Tests that exercise component evidence opt in explicitly; the synthetic
     # scan rows built by most tests carry no vulnxscan evidence.
     scanner.evidence_included = False

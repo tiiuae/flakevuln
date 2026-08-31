@@ -684,7 +684,12 @@ def test_findings_round_trip_scan_to_report(tmp_path):
         ]
     )
     scanner.package_inventory[target] = {"pkg": ("1.1",)}
-    scanner.completed_scans.add((scanner.scope_flakeref, target, PIN_NIX_UNSTABLE))
+    scanner.lock_updated_package_inventory[target] = {"pkg": ("1.2",)}
+    scanner._set_comparison_skipped(
+        PIN_NIX_UNSTABLE,
+        "Skipped nixpkgs unstable comparison: equivalent to current.",
+        version_alias=PIN_CURRENT,
+    )
 
     findings = tmp_path / "sub" / "findings.json"
     scanner.write_findings(findings)
@@ -703,6 +708,7 @@ def test_findings_round_trip_scan_to_report(tmp_path):
     assert restored.comparison_state == scanner.comparison_state
     assert restored.df_scan["vuln_id"].tolist() == ["CVE-0000-0001"]
     assert restored.package_inventory == {target: {"pkg": ("1.1",)}}
+    assert restored.lock_updated_package_inventory == {target: {"pkg": ("1.2",)}}
 
 
 def test_ambiguous_package_inventory_is_ignored(tmp_path, caplog):
@@ -714,11 +720,14 @@ def test_ambiguous_package_inventory_is_ignored(tmp_path, caplog):
         ("github:example/two", target),
     ]
     scanner.package_inventory[target] = {"pkg": ("1.1",)}
+    scanner.lock_updated_package_inventory[target] = {"pkg": ("1.2",)}
 
     restored = FlakeScanner.from_findings_data(scanner._findings_data())
 
     assert restored.package_inventory == {}
+    assert restored.lock_updated_package_inventory == {}
     assert "Ignoring package inventory" in caplog.text
+    assert "Ignoring lock-updated package inventory" in caplog.text
 
 
 def test_scope_targets_are_derived_from_the_persisted_scope(tmp_path):
@@ -766,6 +775,36 @@ def test_from_findings_invalid_comparison_state_falls_back_to_defaults(tmp_path)
     assert "does not record whether" in restored._comparison_skip_reason(
         PIN_LOCK_UPDATED
     )
+    assert restored.comparison_state[PIN_NIX_UNSTABLE]["version_alias"] == ""
+
+
+def test_from_findings_malformed_state_cannot_assert_version_alias(tmp_path):
+    """Untrusted comparison_state can only opt into a validated skipped alias."""
+    for comparison_state in (
+        {
+            PIN_NIX_UNSTABLE: {
+                "show": True,
+                "skip_reason": "",
+                "version_alias": PIN_LOCK_UPDATED,
+            }
+        },
+        {
+            PIN_NIX_UNSTABLE: {
+                "show": False,
+                "skip_reason": "skip",
+                "version_alias": PIN_NIX_UNSTABLE,
+            }
+        },
+    ):
+        scanner = flakevuln_main.FlakeScanner.from_findings_data(
+            {
+                "unstable_ref": "github:NixOS/nixpkgs/nixos-unstable",
+                "comparison_state": comparison_state,
+                "scan_rows": [],
+            }
+        )
+
+        assert scanner.comparison_state[PIN_NIX_UNSTABLE]["version_alias"] == ""
 
 
 def test_from_findings_missing_file_exits(tmp_path):
@@ -1095,12 +1134,16 @@ def test_diff_sections_do_not_treat_whitelisted_comparison_rows_as_fixed(tmp_pat
 def test_current_report_prefers_evaluated_unstable_over_repology(tmp_path):
     """The `nix_unstable` report column prefers the actual unstable scan."""
     target = "packages.x86_64-linux.default"
+    error_target = "packages.x86_64-linux.error"
     scanner = _make_scanner(
         tmp_path,
         flakeref="flake",
         unstable_ref="github:NixOS/nixpkgs/nixos-unstable",
     )
-    scanner.scanned_targets = [("flake", target)]
+    scanner.scanned_targets = [("flake", target), ("flake", error_target)]
+    scanner.errors = {
+        scanner._error_key("flake", error_target, PIN_NIX_UNSTABLE): "unstable failed"
+    }
     scanner.df_scan = pd.DataFrame(
         [
             _scan_row(
@@ -1127,17 +1170,109 @@ def test_current_report_prefers_evaluated_unstable_over_repology(tmp_path):
                 version_local="6.18.44",
                 version_nixpkgs="7.2",
             ),
+            _scan_row(
+                target,
+                PIN_CURRENT,
+                "CVE-2",
+                "openssl",
+                version_nixpkgs="repology-missing",
+            ),
+            _scan_row(target, PIN_LOCK_UPDATED, "CVE-2", "openssl"),
+            _scan_row(
+                error_target,
+                PIN_CURRENT,
+                "CVE-3",
+                "pkg",
+                version_nixpkgs="repology-error",
+            ),
         ]
     )
 
     sections = scanner._target_report_sections("flake", target)
+    error_sections = scanner._target_report_sections("flake", error_target)
 
     assert "| nix_unstable" in sections["current"]
     assert "repology_nix_unstable" not in sections["current"]
     assert "| 6.18.44" in sections["current"]
     assert "7.2" not in sections["current"]
+    assert "not detected" in sections["current"]
+    assert "repology-missing" not in sections["current"]
+    assert "repology-error" in error_sections["current"]
+    assert "not detected" not in error_sections["current"]
     assert sections["fixed_upstream"] == "```No vulnerabilities```"
-    assert sections["fixed_unstable"] == "```No vulnerabilities```"
+
+
+def test_alias_versions_win_without_suppressing_repology_fallback(tmp_path):
+    """A skipped unstable alias reuses known versions but keeps metadata fallback."""
+    target = "packages.x86_64-linux.default"
+    failed_target = "packages.x86_64-linux.failed"
+    scanner = _make_scanner(
+        tmp_path,
+        flakeref="flake",
+        unstable_ref="github:NixOS/nixpkgs/nixos-unstable",
+    )
+    scanner.scanned_targets = [("flake", target), ("flake", failed_target)]
+    scanner._set_comparison_skipped(
+        PIN_NIX_UNSTABLE,
+        "Skipped nixpkgs unstable comparison: equivalent to lock_updated.",
+        version_alias=PIN_LOCK_UPDATED,
+    )
+    scanner.errors = {
+        scanner._error_key(
+            "flake", failed_target, PIN_LOCK_UPDATED
+        ): "lock_updated failed"
+    }
+    scanner.df_scan = pd.DataFrame(
+        [
+            _scan_row(
+                target,
+                PIN_CURRENT,
+                "CVE-STAYS",
+                "linux",
+                version_nixpkgs="repology-stays",
+            ),
+            _scan_row(
+                target,
+                PIN_LOCK_UPDATED,
+                "CVE-STAYS",
+                "linux",
+                version_local="lock-updated",
+            ),
+            _scan_row(
+                target,
+                PIN_CURRENT,
+                "CVE-FIXED",
+                "openssl",
+                version_nixpkgs="repology-fixed",
+            ),
+            _scan_row(
+                failed_target,
+                PIN_CURRENT,
+                "CVE-LATER",
+                "pkg",
+                version_nixpkgs="repology-later",
+            ),
+        ]
+    )
+    scanner.lock_updated_package_inventory[target] = {"openssl": ("lock-inventory",)}
+    baseline = _make_scanner(tmp_path / "baseline", flakeref="flake")
+    baseline.scanned_targets = [("flake", target)]
+    scanner.baseline = baseline
+
+    sections = scanner._target_report_sections("flake", target)
+    failed_current = scanner._target_report_sections("flake", failed_target)["current"]
+
+    for section in (sections["current"], sections["new_since_last_run"]):
+        assert "lock-updated" in section
+        assert "repology-stays" not in section
+        assert "lock-inventory" in section
+        assert "repology-fixed" not in section
+        assert "not detected" not in section
+    assert "lock-inventory" in sections["fixed_upstream"]
+    assert "repology-fixed" not in sections["fixed_upstream"]
+    assert "not detected" not in sections["fixed_upstream"]
+    assert "repology-later" in failed_current
+    assert "not detected" not in failed_current
 
 
 def test_fixed_by_relock_uses_evaluated_unstable_package_version(tmp_path):
@@ -3204,7 +3339,8 @@ def test_scan_target_skips_unstable_without_ref(monkeypatch, tmp_path):
 
     monkeypatch.setattr(scanner, "_read_scan_results", _rec)
 
-    scanner.scan_target("packages.x86_64-linux.default", buildtime=False)
+    target = "packages.x86_64-linux.default"
+    scanner.scan_target(target, buildtime=False)
 
     assert calls == ["current", "lock_updated"]
 
@@ -3272,7 +3408,8 @@ def test_scan_target_skips_unchanged_lock_update(monkeypatch, tmp_path):
 
     monkeypatch.setattr(scanner, "_read_scan_results", _rec)
 
-    scanner.scan_target("packages.x86_64-linux.default", buildtime=False)
+    target = "packages.x86_64-linux.default"
+    scanner.scan_target(target, buildtime=False)
 
     assert calls == [("current", None)]
     assert scanner._comparison_enabled(PIN_LOCK_UPDATED) is False
@@ -3296,12 +3433,29 @@ def test_scan_target_skips_equivalent_unstable_after_upstream_noop(
         lambda _ref, **_kwargs: {"locked": dict(locked, lastModified=2)},
     )
 
-    scanner.scan_target("packages.x86_64-linux.default", buildtime=False)
+    target = "packages.x86_64-linux.default"
+    scanner.scan_target(target, buildtime=False)
 
     assert calls == [("current", None)]
     assert scanner._comparison_enabled(PIN_NIX_UNSTABLE) is False
     assert "same source tree" in scanner._comparison_skip_reason(PIN_NIX_UNSTABLE)
     assert "current lock" in scanner._comparison_skip_reason(PIN_NIX_UNSTABLE)
+    assert scanner.comparison_state[PIN_NIX_UNSTABLE]["version_alias"] == PIN_CURRENT
+    scanner.df_scan = pd.DataFrame(
+        [
+            _scan_row(
+                target,
+                PIN_CURRENT,
+                "CVE-1",
+                "pkg",
+                version_local="v1",
+                version_nixpkgs="repo",
+            )
+        ]
+    )
+    current = scanner._target_report_sections("flake", target)["current"]
+    assert current.count("v1") == 2
+    assert "repo" not in current
 
 
 @pytest.mark.parametrize(
@@ -3360,6 +3514,9 @@ def test_scan_target_skips_unstable_when_updated_lock_matches_ref(
     ]
     assert metadata_refs == [_NIXPKGS_UNSTABLE_REF]
     assert scanner._comparison_enabled(PIN_NIX_UNSTABLE) is False
+    assert (
+        scanner.comparison_state[PIN_NIX_UNSTABLE]["version_alias"] == PIN_LOCK_UPDATED
+    )
     reason = scanner._comparison_skip_reason(PIN_NIX_UNSTABLE)
     assert "same source tree" in reason
     assert "updated lock" in reason

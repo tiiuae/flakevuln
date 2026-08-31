@@ -189,6 +189,7 @@ class _TargetReportContext:
     all_rows: pd.DataFrame
     active_rows: pd.DataFrame
     unstable_versions: dict[tuple[str, str], tuple[str, ...]] | None
+    has_evaluated_unstable: bool
 
 
 @dataclass(frozen=True)
@@ -1108,6 +1109,7 @@ class FlakeScanner:
         self.evidence_findings = []
         self.component_evidence = []
         self.package_inventory = {}
+        self.lock_updated_package_inventory = {}
         self.evidence_included = True
         self.flakeref = flakeref
         self.input_name = input_name
@@ -1154,10 +1156,15 @@ class FlakeScanner:
 
     def _default_comparison_state(self):
         return {
-            PIN_LOCK_UPDATED: {"show": True, "skip_reason": ""},
+            PIN_LOCK_UPDATED: {
+                "show": True,
+                "skip_reason": "",
+                "version_alias": "",
+            },
             PIN_NIX_UNSTABLE: {
                 "show": bool(self.unstable_ref),
                 "skip_reason": "",
+                "version_alias": "",
             },
         }
 
@@ -1185,20 +1192,24 @@ class FlakeScanner:
         if not isinstance(state, dict):
             if not unreadable_is_skip:
                 return normalized
-            return {
-                pintype: {"show": False, "skip_reason": unreadable}
-                for pintype in normalized
-            }
+            for info in normalized.values():
+                info.update(show=False, skip_reason=unreadable, version_alias="")
+            return normalized
         for pintype in normalized:
             info = state.get(pintype)
             if not isinstance(info, dict) or (
                 unreadable_is_skip and not isinstance(info.get("show"), bool)
             ):
                 if unreadable_is_skip:
-                    normalized[pintype] = {"show": False, "skip_reason": unreadable}
+                    normalized[pintype].update(
+                        show=False, skip_reason=unreadable, version_alias=""
+                    )
                 continue
             show = bool(info.get("show"))
             reason = str(info.get("skip_reason", "")).strip()
+            version_alias = str(info.get("version_alias", "")).strip()
+            if show or version_alias not in {PIN_CURRENT, PIN_LOCK_UPDATED}:
+                version_alias = ""
             if show and reason:
                 # A shown comparison that also states why it was skipped
                 # contradicts itself. The summary believes the reason while
@@ -1208,6 +1219,7 @@ class FlakeScanner:
                 show = False
             normalized[pintype]["show"] = show
             normalized[pintype]["skip_reason"] = reason
+            normalized[pintype]["version_alias"] = version_alias
         return normalized
 
     def _comparison_info(self, pintype):
@@ -1222,8 +1234,12 @@ class FlakeScanner:
     def _comparison_skip_reason(self, pintype):
         return str(self._comparison_info(pintype).get("skip_reason", "")).strip()
 
-    def _set_comparison_skipped(self, pintype, reason):
-        self.comparison_state[pintype] = {"show": False, "skip_reason": str(reason)}
+    def _set_comparison_skipped(self, pintype, reason, *, version_alias=""):
+        self.comparison_state[pintype] = {
+            "show": False,
+            "skip_reason": str(reason),
+            "version_alias": str(version_alias),
+        }
 
     def _comparison_notes(self):
         return [
@@ -1264,6 +1280,7 @@ class FlakeScanner:
         lockfile,
         *,
         lock_label,
+        version_alias,
         require_confined_update=False,
     ):
         """Skip `nix_unstable` when it duplicates the selected input lock.
@@ -1333,6 +1350,7 @@ class FlakeScanner:
             f"`unstable-ref` resolves to the same source tree as input "
             f"`{self.input_name}` in the {lock_label}; the dedicated unstable "
             "diff would add no rows beyond that lock state.",
+            version_alias=version_alias,
         )
         return True
 
@@ -1364,6 +1382,12 @@ class FlakeScanner:
             data.get("package_inventory", {})
             if findings_schema_version == evidence.FINDINGS_SCHEMA_VERSION
             else {}
+        )
+        self.lock_updated_package_inventory = _validated_package_inventory(
+            data.get("lock_updated_package_inventory", {})
+            if findings_schema_version == evidence.FINDINGS_SCHEMA_VERSION
+            else {},
+            what="lock_updated_package_inventory",
         )
         self.scanned_targets = _validated_target_pairs(
             data.get("scanned_targets", []), "scanned_targets"
@@ -1407,15 +1431,20 @@ class FlakeScanner:
         rows = _normalize_scan_df(self.df_scan).to_dict(orient="records")
         reachable = self._reachable_scan_targets(rows)
         self._validate_scan_keys_are_reachable(rows, reachable)
-        for target in list(self.package_inventory):
-            scopes = {scope for scope, name in reachable if name == target}
-            if len(scopes) != 1:
-                LOG.warning(
-                    "Ignoring package inventory for target '%s': it does not "
-                    "identify exactly one scanned flake",
-                    target,
-                )
-                del self.package_inventory[target]
+        for what, inventory in (
+            ("package inventory", self.package_inventory),
+            ("lock-updated package inventory", self.lock_updated_package_inventory),
+        ):
+            for target in list(inventory):
+                scopes = {scope for scope, name in reachable if name == target}
+                if len(scopes) != 1:
+                    LOG.warning(
+                        "Ignoring %s for target '%s': it does not identify exactly "
+                        "one scanned flake",
+                        what,
+                        target,
+                    )
+                    del inventory[target]
         self._validate_error_keys(rows, reachable)
         if not completed_scans_included:
             if findings_schema_version == evidence.FINDINGS_SCHEMA_VERSION:
@@ -1687,13 +1716,10 @@ class FlakeScanner:
                 list(self.component_evidence) if not compact else []
             ),
             "package_inventory": (
-                {
-                    target: {
-                        package: list(versions)
-                        for package, versions in sorted(packages.items())
-                    }
-                    for target, packages in sorted(self.package_inventory.items())
-                }
+                _package_inventory_data(self.package_inventory) if not compact else {}
+            ),
+            "lock_updated_package_inventory": (
+                _package_inventory_data(self.lock_updated_package_inventory)
                 if not compact
                 else {}
             ),
@@ -1809,7 +1835,9 @@ class FlakeScanner:
                 active_rows[active_rows["whitelist"] == "False"],
             )
         unstable_versions = None
-        if self._comparison_enabled(PIN_NIX_UNSTABLE) and not self._read_error(
+        has_evaluated_unstable = False
+        unstable_info = self._comparison_info(PIN_NIX_UNSTABLE)
+        if unstable_info.get("show") and not self._read_error(
             flakeref, target, [PIN_NIX_UNSTABLE]
         ):
             unstable_versions = self._pin_version_map(all_rows, PIN_NIX_UNSTABLE)
@@ -1821,10 +1849,26 @@ class FlakeScanner:
                     ).items()
                 }
             )
+            has_evaluated_unstable = True
+        elif alias := str(unstable_info.get("version_alias", "")).strip():
+            # Failed aliases have no rows by validation, leaving Repology fallback.
+            unstable_versions = self._pin_version_map(all_rows, alias)
+            if alias == PIN_LOCK_UPDATED:
+                # PIN_CURRENT aliases already cover active rows; baseline-only
+                # gaps can still use Repology.
+                unstable_versions.update(
+                    {
+                        ("", package): versions
+                        for package, versions in self.lock_updated_package_inventory.get(
+                            str(target), {}
+                        ).items()
+                    }
+                )
         return _TargetReportContext(
             all_rows=all_rows,
             active_rows=active_rows,
             unstable_versions=unstable_versions,
+            has_evaluated_unstable=has_evaluated_unstable,
         )
 
     def _aggregate_current(self, df_current):
@@ -1996,7 +2040,7 @@ class FlakeScanner:
             self._diff_left_only_df(left, right),
             marks=self._evidence_marks(flakeref, target),
             comparison_versions=context.unstable_versions,
-            comparison_column=PIN_NIX_UNSTABLE,
+            has_evaluated_unstable=context.has_evaluated_unstable,
         )
 
     def _snapshot_workspace(self, flakeref):
@@ -2261,6 +2305,7 @@ class FlakeScanner:
                     self._skip_redundant_unstable_for_input_lock(
                         updated_lockfile,
                         lock_label="updated lock",
+                        version_alias=PIN_LOCK_UPDATED,
                         require_confined_update=True,
                     )
         # Third scan: only when an unstable ref is configured. Override the
@@ -2492,7 +2537,7 @@ class FlakeScanner:
                 df_current,
                 marks=self._evidence_marks(flakeref, target),
                 comparison_versions=context.unstable_versions,
-                comparison_column=PIN_NIX_UNSTABLE,
+                has_evaluated_unstable=context.has_evaluated_unstable,
             ),
         }
         if full:
@@ -2790,6 +2835,7 @@ class FlakeScanner:
         if err:
             return _render_error(err)
         comparison_versions = context.unstable_versions
+        has_evaluated_unstable = context.has_evaluated_unstable
         if right_pin == PIN_NIX_UNSTABLE:
             # These rows have no unstable vulnerability row. The package
             # inventory still supplies their evaluated version; dropping the
@@ -2797,11 +2843,12 @@ class FlakeScanner:
             df = df.drop(columns=["version_nixpkgs"], errors="ignore")
             if str(target) not in self.package_inventory:
                 comparison_versions = None
+                has_evaluated_unstable = False
         return self._df_to_report_tbl(
             df,
             marks=self._evidence_marks(flakeref, target),
             comparison_versions=comparison_versions,
-            comparison_column=PIN_NIX_UNSTABLE,
+            has_evaluated_unstable=has_evaluated_unstable,
         )
 
     def _current_scan_key(self, flakeref, target):
@@ -3071,10 +3118,11 @@ class FlakeScanner:
     def _df_to_report_tbl(
         self,
         df,
+        *,
         up_ver=True,
         marks=None,
         comparison_versions=None,
-        comparison_column="",
+        has_evaluated_unstable=False,
     ):
         LOG.debug("")
         if df.empty:
@@ -3101,15 +3149,12 @@ class FlakeScanner:
         # Report table will have the following columns
         report_cols = ["vuln_id", "package", "severity", "version_local"]
         # Optionally add the following upstream versions
-        has_evaluated_unstable = (
-            comparison_versions is not None and comparison_column == PIN_NIX_UNSTABLE
-        )
-        if up_ver and comparison_versions is not None and comparison_column:
-            report_cols.append(comparison_column)
+        if up_ver and comparison_versions is not None:
+            report_cols.append(PIN_NIX_UNSTABLE)
             missing_version = (
                 _REPORT_VERSION_NOT_DETECTED if has_evaluated_unstable else ""
             )
-            df[comparison_column] = df.apply(
+            df[PIN_NIX_UNSTABLE] = df.apply(
                 lambda row: (
                     comparison_versions.get(
                         (row.get("vuln_id", ""), row.get("package", ""))
@@ -3214,6 +3259,7 @@ class FlakeScanner:
             self._skip_redundant_unstable_for_input_lock(
                 self.lockfile_bak,
                 lock_label="current lock",
+                version_alias=PIN_CURRENT,
             )
             return None
         self._lock_updated_lockfile = self.tmpdir / "flake.lock.lock-updated"
@@ -3878,7 +3924,16 @@ in builtins.listToAttrs (map (name: {{ inherit name; value = get name; }}) args.
         }
         self.evidence_findings.extend(evidence.annotate(findings, **annotation))
         self.component_evidence.extend(evidence.annotate(components, **annotation))
+        self._record_package_inventory(cmd, target, pintype, drv_path)
+        self._record_completed_scan(target, pintype)
+
+    def _record_package_inventory(self, cmd, target, pintype, drv_path):
+        inventory_store = None
         if "--buildtime" in cmd and pintype == PIN_NIX_UNSTABLE:
+            inventory_store = self.package_inventory
+        elif "--buildtime" in cmd and pintype == PIN_LOCK_UPDATED and self.unstable_ref:
+            inventory_store = self.lock_updated_package_inventory
+        if inventory_store is not None:
             # vulnxscan's complete SBOM is temporary. Retain just the versions
             # needed to report findings fixed from either diff baseline.
             compared = self._target_df(self.flakeref, target)
@@ -3892,11 +3947,10 @@ in builtins.listToAttrs (map (name: {{ inherit name; value = get name; }}) args.
             detail = f"packages={len(packages)}"
             if inventory is not None:
                 detail += f", recorded={len(inventory)}"
-                self.package_inventory[str(target)] = inventory
+                inventory_store[str(target)] = inventory
             _log_scan_timing(
                 f"package inventory '{target}' on {pintype}", started, detail
             )
-        self._record_completed_scan(target, pintype)
 
     def _derivation_package_inventory(self, drv_path, packages):
         """Read selected package versions from a build-time derivation graph."""
@@ -4415,25 +4469,34 @@ def _validated_scan_keys(value, what):
     return keys
 
 
-def _validated_package_inventory(value):
+def _package_inventory_data(inventory):
+    return {
+        target: {
+            package: list(versions) for package, versions in sorted(packages.items())
+        }
+        for target, packages in sorted(inventory.items())
+    }
+
+
+def _validated_package_inventory(value, *, what="package_inventory"):
     """Return evaluated package versions keyed by target name."""
     if not isinstance(value, dict):
-        raise evidence.EvidenceError("package_inventory must be a JSON object")
+        raise evidence.EvidenceError(f"{what} must be a JSON object")
     inventory = {}
     for target, packages in value.items():
         if not isinstance(target, str) or not target:
             raise evidence.EvidenceError(
-                "package_inventory target names must be non-empty strings"
+                f"{what} target names must be non-empty strings"
             )
         if not isinstance(packages, dict):
             raise evidence.EvidenceError(
-                f"package_inventory for target '{target}' must be a JSON object"
+                f"{what} for target '{target}' must be a JSON object"
             )
         validated = {}
         for package, versions in packages.items():
             if not isinstance(package, str) or not package:
                 raise evidence.EvidenceError(
-                    "package_inventory package names must be non-empty strings"
+                    f"{what} package names must be non-empty strings"
                 )
             if (
                 not isinstance(versions, list)
@@ -4441,11 +4504,11 @@ def _validated_package_inventory(value):
                 or not all(isinstance(version, str) and version for version in versions)
             ):
                 raise evidence.EvidenceError(
-                    "package_inventory versions must be non-empty string arrays"
+                    f"{what} versions must be non-empty string arrays"
                 )
             if len(set(versions)) != len(versions):
                 raise evidence.EvidenceError(
-                    f"package_inventory repeats a version for package '{package}'"
+                    f"{what} repeats a version for package '{package}'"
                 )
             validated[package] = tuple(versions)
         inventory[target] = validated
