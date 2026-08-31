@@ -1232,74 +1232,107 @@ class FlakeScanner:
             if self._comparison_skip_reason(pintype)
         ]
 
-    def _lock_input_original(self, input_name):
-        data = _load_json_file(self.lockfile, what="flake.lock")
+    def _lock_nodes_and_input_node(self, lockfile, input_name, *, fatal=True):
+        """Return `(nodes, node_name)` for `input_name` in `lockfile`."""
+        if fatal:
+            data = _load_json_file(lockfile, what="flake.lock")
+        else:
+            try:
+                data = json.loads(Path(lockfile).read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as error:
+                LOG.debug(
+                    "Could not inspect flake.lock for redundant unstable skip: %s",
+                    error,
+                )
+                return {}, ""
         if not isinstance(data, dict):
-            return None
+            return {}, ""
         nodes = data.get("nodes", {})
-        if not isinstance(nodes, dict):
-            return None
-        root = nodes.get(data.get("root", ""), {})
-        if not isinstance(root, dict):
-            return None
-        inputs = root.get("inputs", {})
-        if not isinstance(inputs, dict):
-            return None
-        node_name = inputs.get(input_name)
-        if not isinstance(node_name, str):
-            return None
-        original = nodes.get(node_name, {}).get("original")
-        return original if isinstance(original, dict) else None
+        root = data.get("root", "")
+        if not isinstance(nodes, dict) or not isinstance(root, str):
+            return {}, ""
+        return nodes, _resolve_lock_input_path(nodes, root, input_name)
 
     def _lock_input_locked_rev(self, input_name):
-        data = _load_json_file(self.lockfile, what="flake.lock")
-        rev = ""
-        if isinstance(data, dict):
-            nodes = data.get("nodes", {})
-            if isinstance(nodes, dict):
-                root = nodes.get(data.get("root", ""), {})
-                if isinstance(root, dict):
-                    inputs = root.get("inputs", {})
-                    if isinstance(inputs, dict):
-                        node_name = inputs.get(input_name)
-                        if isinstance(node_name, str):
-                            locked = nodes.get(node_name, {}).get("locked")
-                            if isinstance(locked, dict):
-                                rev = str(locked.get("rev", "")).strip()
-        return rev
+        nodes, node_name = self._lock_nodes_and_input_node(self.lockfile, input_name)
+        node = nodes.get(node_name, {})
+        locked = node.get("locked") if isinstance(node, dict) else None
+        return str(locked.get("rev", "")).strip() if isinstance(locked, dict) else ""
 
-    @staticmethod
-    def _normalize_original_ref(original):
-        if not isinstance(original, dict):
-            return None
-        return json.dumps(original, sort_keys=True, separators=(",", ":"))
+    def _skip_redundant_unstable_for_input_lock(
+        self,
+        lockfile,
+        *,
+        lock_label,
+        require_confined_update=False,
+    ):
+        """Skip `nix_unstable` when it duplicates the selected input lock.
 
-    def _skip_redundant_unstable_after_upstream_noop(self):
-        """Skip `nix_unstable` only when it truly duplicates a no-op re-lock.
-
-        This check is deliberately lazy and best-effort. `lock_updated` and
-        `nix_unstable` have different failure surfaces, so we only prune the
-        unstable comparison after the in-channel lock update proved to be a
-        no-op, and we never let metadata resolution failure abort the scan.
+        The unstable report section is the diff from the selected comparison
+        lock to `nix_unstable`. If the selected input resolves to the same
+        source tree, and no unrelated lock nodes changed, that diff is
+        provably empty, so rendering the skip reason is complete information.
         """
         if not self.unstable_ref or not self._comparison_enabled(PIN_NIX_UNSTABLE):
             return False
-        input_original = self._normalize_original_ref(
-            self._lock_input_original(self.input_name)
+        nodes, node_name = self._lock_nodes_and_input_node(
+            lockfile, self.input_name, fatal=False
         )
-        if input_original is None:
+        node = nodes.get(node_name, {})
+        input_locked = node.get("locked") if isinstance(node, dict) else None
+        if not isinstance(input_locked, dict):
             return False
         metadata = self._nix_flake_metadata(self.unstable_ref, exit_on_error=False)
-        if metadata is None:
+        unstable_locked = metadata.get("locked") if isinstance(metadata, dict) else None
+        if not isinstance(unstable_locked, dict):
             return False
-        unstable_original = self._normalize_original_ref(metadata.get("original"))
-        if unstable_original != input_original:
+        input_source = {
+            key: value
+            for key, value in input_locked.items()
+            if key not in {"lastModified", "lastModifiedDate"}
+        }
+        unstable_source = {
+            key: value
+            for key, value in unstable_locked.items()
+            if key not in {"lastModified", "lastModifiedDate"}
+        }
+        source_hashes = (
+            str(input_source.get("narHash", "")).strip(),
+            str(unstable_source.get("narHash", "")).strip(),
+        )
+        same_source = (
+            source_hashes[0] == source_hashes[1]
+            if all(source_hashes)
+            else input_source == unstable_source
+        )
+        if not same_source:
             return False
+        if require_confined_update:
+            before_nodes, before_node = self._lock_nodes_and_input_node(
+                self.lockfile_bak, self.input_name, fatal=False
+            )
+            before_other = {
+                name: node for name, node in before_nodes.items() if name != before_node
+            }
+            after_other = {
+                name: node for name, node in nodes.items() if name != node_name
+            }
+            if not before_node or before_other != after_other:
+                LOG.info(
+                    "Not skipping nixpkgs unstable comparison: `unstable-ref` "
+                    "resolves to the same source tree as input `%s` in the %s, "
+                    "but updating `%s` changed other lock nodes.",
+                    self.input_name,
+                    lock_label,
+                    self.input_name,
+                )
+                return False
         self._set_comparison_skipped(
             PIN_NIX_UNSTABLE,
             "Skipped nixpkgs unstable comparison: "
-            f"`unstable-ref` is equivalent to input `{self.input_name}`, "
-            f"and updating `{self.input_name}` did not change `flake.lock`.",
+            f"`unstable-ref` resolves to the same source tree as input "
+            f"`{self.input_name}` in the {lock_label}; the dedicated unstable "
+            "diff would add no rows beyond that lock state.",
         )
         return True
 
@@ -2218,6 +2251,18 @@ class FlakeScanner:
             shutil.copy(updated_lockfile, self.lockfile)
             self._target_input_lock_digest = ""
             self._read_scan_results(cmd_vulnxscan, target, PIN_LOCK_UPDATED)
+            if not hasattr(self, "_lock_updated_unstable_skip_checked"):
+                self._lock_updated_unstable_skip_checked = True
+                if (
+                    self.scope_flakeref,
+                    str(target),
+                    PIN_LOCK_UPDATED,
+                ) in self.completed_scans:
+                    self._skip_redundant_unstable_for_input_lock(
+                        updated_lockfile,
+                        lock_label="updated lock",
+                        require_confined_update=True,
+                    )
         # Third scan: only when an unstable ref is configured. Override the
         # input on the eval itself (no lock write).
         if self._comparison_enabled(PIN_NIX_UNSTABLE):
@@ -3166,7 +3211,10 @@ class FlakeScanner:
                 f"`{self.input_name}` did not change `flake.lock`.",
             )
             LOG.info(self._comparison_skip_reason(PIN_LOCK_UPDATED))
-            self._skip_redundant_unstable_after_upstream_noop()
+            self._skip_redundant_unstable_for_input_lock(
+                self.lockfile_bak,
+                lock_label="current lock",
+            )
             return None
         self._lock_updated_lockfile = self.tmpdir / "flake.lock.lock-updated"
         shutil.copy(self.lockfile, self._lock_updated_lockfile)

@@ -3209,6 +3209,52 @@ def test_scan_target_skips_unstable_without_ref(monkeypatch, tmp_path):
     assert calls == ["current", "lock_updated"]
 
 
+def _locked_nixpkgs(rev, nar_hash=None, **extra):
+    locked = {"rev": rev, "narHash": nar_hash or f"sha256-{rev}", "lastModified": 1}
+    locked.update(extra)
+    return locked
+
+
+_NIXPKGS_UNSTABLE_REF = "github:NixOS/nixpkgs/nixos-unstable"
+
+
+def _write_lockfile(path, locked, *, extra_nodes=None):
+    nodes = {
+        "root": {"inputs": {"nixpkgs": "nixpkgs"}},
+        "nixpkgs": {"locked": locked},
+    }
+    if extra_nodes:
+        nodes.update(extra_nodes)
+    path.write_text(
+        json.dumps({"nodes": nodes, "root": "root"}, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def _locked_scan_case(tmp_path, locked, *, extra_nodes=None):
+    scanner = _make_scanner(tmp_path, unstable_ref=_NIXPKGS_UNSTABLE_REF)
+    scanner.lockfile = tmp_path / "flake.lock"
+    scanner.lockfile_bak = tmp_path / "flake.lock.bak"
+    _write_lockfile(scanner.lockfile, locked, extra_nodes=extra_nodes)
+    _write_lockfile(scanner.lockfile_bak, locked, extra_nodes=extra_nodes)
+    return scanner
+
+
+def _record_scan_calls(monkeypatch, scanner):
+    calls = []
+
+    def record(_cmd, target, pintype, override=None):
+        calls.append((pintype, override))
+        scanner._record_completed_scan(target, pintype)
+
+    monkeypatch.setattr(
+        scanner,
+        "_read_scan_results",
+        record,
+    )
+    return calls
+
+
 def test_scan_target_skips_unchanged_lock_update(monkeypatch, tmp_path):
     """When updating the lock is a no-op, the lock_updated scan is skipped."""
     scanner = _make_scanner(tmp_path)
@@ -3238,86 +3284,197 @@ def test_scan_target_skips_unchanged_lock_update(monkeypatch, tmp_path):
 def test_scan_target_skips_equivalent_unstable_after_upstream_noop(
     monkeypatch, tmp_path
 ):
-    """A truly redundant unstable comparison is skipped only after a no-op re-lock."""
-    unstable = "github:NixOS/nixpkgs/nixos-unstable"
-    scanner = _make_scanner(tmp_path, unstable_ref=unstable)
-    scanner.lockfile = tmp_path / "flake.lock"
-    scanner.lockfile_bak = tmp_path / "flake.lock.bak"
-    scanner.lockfile.write_text("same", encoding="utf-8")
-    scanner.lockfile_bak.write_text("same", encoding="utf-8")
-    calls = []
+    """A no-op lock update can also skip a redundant unstable comparison."""
+    locked = _locked_nixpkgs("rev-a", "sha256-a")
+    scanner = _locked_scan_case(tmp_path, locked)
+    calls = _record_scan_calls(monkeypatch, scanner)
 
-    monkeypatch.setattr(scanner, "_reset_lock", lambda: None)
     monkeypatch.setattr(scanner, "_update_repo_lock", lambda _name: None)
     monkeypatch.setattr(
         scanner,
-        "_lock_input_original",
-        lambda _name: {
-            "type": "github",
-            "owner": "NixOS",
-            "repo": "nixpkgs",
-            "ref": "nixos-unstable",
-        },
-    )
-    monkeypatch.setattr(
-        scanner,
         "_nix_flake_metadata",
-        lambda _ref, **_kwargs: {
-            "original": {
-                "type": "github",
-                "owner": "NixOS",
-                "repo": "nixpkgs",
-                "ref": "nixos-unstable",
-            }
-        },
-    )
-    monkeypatch.setattr(
-        scanner,
-        "_read_scan_results",
-        lambda _cmd, _target, pintype, override=None: calls.append((pintype, override)),
+        lambda _ref, **_kwargs: {"locked": dict(locked, lastModified=2)},
     )
 
     scanner.scan_target("packages.x86_64-linux.default", buildtime=False)
 
     assert calls == [("current", None)]
     assert scanner._comparison_enabled(PIN_NIX_UNSTABLE) is False
-    assert "did not change `flake.lock`" in scanner._comparison_skip_reason(
-        PIN_NIX_UNSTABLE
-    )
+    assert "same source tree" in scanner._comparison_skip_reason(PIN_NIX_UNSTABLE)
+    assert "current lock" in scanner._comparison_skip_reason(PIN_NIX_UNSTABLE)
 
 
-def test_scan_target_runs_unstable_when_equivalence_probe_fails(monkeypatch, tmp_path):
-    """Metadata lookup failure must not abort the scan or suppress unstable."""
-    unstable = "github:NixOS/nixpkgs/nixos-unstable"
-    scanner = _make_scanner(tmp_path, unstable_ref=unstable)
-    scanner.lockfile = tmp_path / "flake.lock"
-    scanner.lockfile_bak = tmp_path / "flake.lock.bak"
-    scanner.lockfile.write_text("same", encoding="utf-8")
-    scanner.lockfile_bak.write_text("same", encoding="utf-8")
-    calls = []
+@pytest.mark.parametrize(
+    "metadata",
+    [None, {"locked": _locked_nixpkgs("rev-b", "sha256-b")}],
+)
+def test_scan_target_runs_unstable_after_noop_when_not_equivalent(
+    monkeypatch, tmp_path, metadata
+):
+    locked = _locked_nixpkgs("rev-a", "sha256-a")
+    scanner = _locked_scan_case(tmp_path, locked)
+    calls = _record_scan_calls(monkeypatch, scanner)
 
-    monkeypatch.setattr(scanner, "_reset_lock", lambda: None)
     monkeypatch.setattr(scanner, "_update_repo_lock", lambda _name: None)
     monkeypatch.setattr(
-        scanner,
-        "_lock_input_original",
-        lambda _name: {
-            "type": "github",
-            "owner": "NixOS",
-            "repo": "nixpkgs",
-            "ref": "nixos-unstable",
-        },
-    )
-    monkeypatch.setattr(scanner, "_nix_flake_metadata", lambda _ref, **_kwargs: None)
-    monkeypatch.setattr(
-        scanner,
-        "_read_scan_results",
-        lambda _cmd, _target, pintype, override=None: calls.append((pintype, override)),
+        scanner, "_nix_flake_metadata", lambda _ref, **_kwargs: metadata
     )
 
     scanner.scan_target("packages.x86_64-linux.default", buildtime=False)
 
-    assert calls == [("current", None), (PIN_NIX_UNSTABLE, ("nixpkgs", unstable))]
+    assert calls == [
+        ("current", None),
+        (PIN_NIX_UNSTABLE, ("nixpkgs", _NIXPKGS_UNSTABLE_REF)),
+    ]
+
+
+def test_scan_target_skips_unstable_when_updated_lock_matches_ref(
+    monkeypatch, tmp_path
+):
+    """A changed but equivalent updated input does not need a third target scan."""
+    original = _locked_nixpkgs("rev-a", "sha256-a")
+    updated = _locked_nixpkgs("rev-b", "sha256-b")
+    scanner = _locked_scan_case(tmp_path, original)
+    calls = _record_scan_calls(monkeypatch, scanner)
+    metadata_refs = []
+
+    def update_lock(_name):
+        _write_lockfile(scanner.lockfile, updated)
+
+    monkeypatch.setattr(scanner, "_update_repo_lock", update_lock)
+
+    def metadata(ref, **_kwargs):
+        metadata_refs.append(ref)
+        return {"locked": dict(updated, lastModified=2)}
+
+    monkeypatch.setattr(scanner, "_nix_flake_metadata", metadata)
+
+    scanner.scan_target("packages.x86_64-linux.a", buildtime=False)
+    scanner.scan_target("packages.x86_64-linux.b", buildtime=False)
+
+    assert calls == [
+        ("current", None),
+        (PIN_LOCK_UPDATED, None),
+        ("current", None),
+        (PIN_LOCK_UPDATED, None),
+    ]
+    assert metadata_refs == [_NIXPKGS_UNSTABLE_REF]
+    assert scanner._comparison_enabled(PIN_NIX_UNSTABLE) is False
+    reason = scanner._comparison_skip_reason(PIN_NIX_UNSTABLE)
+    assert "same source tree" in reason
+    assert "updated lock" in reason
+    summary = scanner.render_detailed_summary()
+    assert "<summary>Vulnerabilities Fixed in nixpkgs Unstable</summary>" in summary
+    assert "same source tree as input" in summary
+
+
+def test_scan_target_runs_unstable_when_first_updated_lock_scan_fails(
+    monkeypatch, tmp_path
+):
+    """A failed first lock_updated scan keeps the global unstable comparison."""
+    original = _locked_nixpkgs("rev-a", "sha256-a")
+    updated = _locked_nixpkgs("rev-b", "sha256-b")
+    scanner = _locked_scan_case(tmp_path, original)
+    calls = []
+    metadata_refs = []
+
+    def update_lock(_name):
+        _write_lockfile(scanner.lockfile, updated)
+
+    def record(_cmd, target, pintype, override=None):
+        calls.append((pintype, override))
+        if target == "packages.x86_64-linux.a" and pintype == PIN_LOCK_UPDATED:
+            scanner._record_scan_error(target, pintype, "lock_updated failed")
+        else:
+            scanner._record_completed_scan(target, pintype)
+
+    monkeypatch.setattr(scanner, "_update_repo_lock", update_lock)
+    monkeypatch.setattr(scanner, "_read_scan_results", record)
+    monkeypatch.setattr(
+        scanner,
+        "_nix_flake_metadata",
+        lambda ref, **_kwargs: (
+            metadata_refs.append(ref) or {"locked": dict(updated, lastModified=2)}
+        ),
+    )
+
+    scanner.scan_target("packages.x86_64-linux.a", buildtime=False)
+    scanner.scan_target("packages.x86_64-linux.b", buildtime=False)
+
+    assert calls == [
+        ("current", None),
+        (PIN_LOCK_UPDATED, None),
+        (PIN_NIX_UNSTABLE, ("nixpkgs", _NIXPKGS_UNSTABLE_REF)),
+        ("current", None),
+        (PIN_LOCK_UPDATED, None),
+        (PIN_NIX_UNSTABLE, ("nixpkgs", _NIXPKGS_UNSTABLE_REF)),
+    ]
+    assert scanner._comparison_enabled(PIN_NIX_UNSTABLE) is True
+    assert metadata_refs == []
+
+
+def test_scan_target_runs_unstable_when_updated_lock_moves_other_nodes(
+    monkeypatch, tmp_path, caplog
+):
+    """A matching selected input is not enough if the re-lock moved other nodes."""
+    original = _locked_nixpkgs("rev-a", "sha256-a")
+    updated = _locked_nixpkgs("rev-b", "sha256-b")
+    original_other = {"locked": _locked_nixpkgs("other-a", "sha256-other-a")}
+    updated_other = {"locked": _locked_nixpkgs("other-b", "sha256-other-b")}
+    scanner = _locked_scan_case(
+        tmp_path, original, extra_nodes={"other": original_other}
+    )
+    calls = _record_scan_calls(monkeypatch, scanner)
+    caplog.set_level(logging.INFO)
+
+    def update_lock(_name):
+        _write_lockfile(scanner.lockfile, updated, extra_nodes={"other": updated_other})
+
+    monkeypatch.setattr(scanner, "_update_repo_lock", update_lock)
+    monkeypatch.setattr(
+        scanner,
+        "_nix_flake_metadata",
+        lambda _ref, **_kwargs: {"locked": dict(updated, lastModified=2)},
+    )
+
+    scanner.scan_target("packages.x86_64-linux.default", buildtime=False)
+
+    assert calls == [
+        ("current", None),
+        (PIN_LOCK_UPDATED, None),
+        (PIN_NIX_UNSTABLE, ("nixpkgs", _NIXPKGS_UNSTABLE_REF)),
+    ]
+    assert scanner._comparison_enabled(PIN_NIX_UNSTABLE) is True
+    assert "changed other lock nodes" in caplog.text
+
+
+def test_scan_target_runs_unstable_when_updated_lock_differs_from_ref(
+    monkeypatch, tmp_path
+):
+    """A distinct unstable source still gets its own scan."""
+    original = _locked_nixpkgs("rev-a", "sha256-a")
+    updated = _locked_nixpkgs("rev-b", "sha256-b")
+    scanner = _locked_scan_case(tmp_path, original)
+    calls = _record_scan_calls(monkeypatch, scanner)
+
+    def update_lock(_name):
+        _write_lockfile(scanner.lockfile, updated)
+
+    monkeypatch.setattr(scanner, "_update_repo_lock", update_lock)
+    monkeypatch.setattr(
+        scanner,
+        "_nix_flake_metadata",
+        lambda _ref, **_kwargs: {"locked": _locked_nixpkgs("rev-c", "sha256-c")},
+    )
+
+    scanner.scan_target("packages.x86_64-linux.default", buildtime=False)
+
+    assert calls == [
+        ("current", None),
+        (PIN_LOCK_UPDATED, None),
+        (PIN_NIX_UNSTABLE, ("nixpkgs", _NIXPKGS_UNSTABLE_REF)),
+    ]
+    assert scanner._comparison_enabled(PIN_NIX_UNSTABLE) is True
 
 
 def test_scan_target_uses_configured_input_name(monkeypatch, tmp_path):
