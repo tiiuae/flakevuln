@@ -93,188 +93,21 @@ def test_report_parser_accepts_nixprs_excluded_packages():
     assert args.nixprs_exclude_packages == ["linux", "openssl"]
 
 
-def _sarif_result(rule_id, package, version, fingerprint, level="warning"):
-    affected = " ".join(value for value in (package, version) if value)
-    return {
-        "ruleId": rule_id,
-        "level": level,
-        "message": {
-            "text": (
-                f"{rule_id} affects {affected}. Severity: {level}. "
-                f"Detected by: grype Derivations: /nix/store/{fingerprint}"
-            )
-        },
-        "partialFingerprints": {"primaryLocationLineHash": fingerprint},
-        "properties": {
-            "package": package,
-            "version": version,
-            "severity": level,
-            "drvPaths": [f"/nix/store/{fingerprint}"],
-        },
-    }
-
-
-def _sarif_document(*results):
-    return {"version": "2.1.0", "runs": [{"results": list(results)}]}
-
-
-def test_scan_sarif_parser_accepts_previous_report_inputs():
+def test_scan_parser_accepts_sarif_output():
     args = flakevuln_main._getargs(
         [
-            "scan-sarif",
-            "result-current",
+            "scan",
+            "--flakeref=.",
+            "--target=packages.x86_64-linux.default",
+            "--findings=findings.json",
             "--sarif=current.sarif",
             "--sarif-location=flake.nix",
-            "--previous-sarif=previous.sarif",
-            "--markdown=diff.md",
         ]
     )
 
-    assert args.command == "scan-sarif"
-    assert args.target == Path("result-current")
-    assert args.previous_sarif == Path("previous.sarif")
-    assert args.markdown == Path("diff.md")
-
-
-def test_render_sarif_diff_matches_ci_semantics():
-    previous = _sarif_document(
-        _sarif_result("CVE-CARRIED", "carried", "1.0", "carried-old"),
-        _sarif_result("CVE-CHANGED", "changed", "1.0", "changed", "warning"),
-        _sarif_result("CVE-RESOLVED", "resolved", "1.0", "resolved"),
-    )
-    for index, result in enumerate(previous["runs"][0]["results"], start=1):
-        result["properties"] = {
-            "github/alertNumber": index,
-            "github/alertUrl": f"https://api.github.com/alerts/{index}",
-        }
-    current = _sarif_document(
-        _sarif_result("CVE-CARRIED", "carried", "2.0", "carried-new"),
-        _sarif_result("CVE-CHANGED", "changed", "1.0", "changed", "error"),
-        _sarif_result("CVE-ADDED", "added", "1.0", "added"),
-    )
-
-    report = flakevuln_main._render_sarif_diff(current, previous)
-
-    assert (
-        "3 current, 1 added, 1 resolved, 1 changed; "
-        "1 persisted across package version updates." in report
-    )
-    assert "### Added" in report
-    assert "CVE\\-ADDED affects added 1\\.0\\." in report
-    assert "### Resolved" in report
-    assert "CVE\\-RESOLVED affects resolved 1\\.0\\." in report
-    assert "### Changed" in report
-    assert "**CVE\\-CHANGED**" in report
-    assert "/nix/store/" not in report
-
-
-def test_render_sarif_diff_ignores_message_wording():
-    previous_result = _sarif_result("CVE-1", "pkg", "1.0", "same")
-    previous_result["properties"].update(
-        {
-            "github/alertNumber": 7,
-            "github/alertUrl": "https://github.com/acme/repo/security/code-scanning/7",
-        }
-    )
-    current_result = _sarif_result("CVE-1", "pkg", "1.0", "same")
-    current_result["message"]["text"] = "The producer changed this wording."
-
-    report = flakevuln_main._render_sarif_diff(
-        _sarif_document(current_result), _sarif_document(previous_result)
-    )
-
-    assert "No finding additions, resolutions, or detail changes" in report
-
-
-def test_render_sarif_diff_handles_github_baseline_without_version():
-    previous_result = _sarif_result("CVE-1", "pkg", "", "old")
-    previous_result["properties"] = {"github/alertNumber": 1}
-    current_result = _sarif_result("CVE-1", "pkg", "1.0", "new")
-
-    report = flakevuln_main._render_sarif_diff(
-        _sarif_document(current_result), _sarif_document(previous_result)
-    )
-
-    assert "persisted across package version updates" in report
-    assert "added" not in report
-    assert "resolved" not in report
-
-
-def test_render_sarif_diff_detects_github_baseline_message_changes():
-    previous_result = _sarif_result("CVE-1", "pkg", "1.0", "same")
-    previous_result["properties"] = {"github/alertNumber": 1}
-    current_result = _sarif_result("CVE-1", "pkg", "1.0", "same")
-    current_result["message"]["text"] = current_result["message"]["text"].replace(
-        "Detected by: grype", "Detected by: osv"
-    )
-
-    report = flakevuln_main._render_sarif_diff(
-        _sarif_document(current_result), _sarif_document(previous_result)
-    )
-
-    assert "1 changed" in report
-
-
-def test_run_sarif_scan_writes_current_sarif_and_markdown(monkeypatch, tmp_path):
-    target = tmp_path / "result-current"
-    target.mkdir()
-    sarif = tmp_path / "current.sarif"
-    markdown = tmp_path / "diff.md"
-    current = _sarif_document(_sarif_result("CVE-1", "pkg", "1.0", "one"))
-    captured = {}
-
-    monkeypatch.setattr(
-        flakevuln_main, "exit_unless_command_exists", lambda _command: None
-    )
-
-    def fake_exec(cmd, *_args, **kwargs):
-        captured["cmd"] = cmd
-        captured["evars"] = kwargs.get("evars")
-        out = next(
-            arg.removeprefix("--out=") for arg in cmd if arg.startswith("--out=")
-        )
-        Path(out).write_text(json.dumps(current), encoding="utf-8")
-        return argparse.Namespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(flakevuln_main, "exec_cmd", fake_exec)
-
-    flakevuln_main._run_sarif_scan(
-        target=target,
-        sarif=sarif,
-        sarif_location="flake.nix",
-        markdown=markdown,
-    )
-
-    assert "--require-cpe-dictionary" in captured["cmd"]
-    assert captured["evars"] == {"GRYPE_DB_REQUIRE_UPDATE_CHECK": "true"}
-    assert json.loads(sarif.read_text(encoding="utf-8")) == current
-    assert "No previous SARIF baseline available (1 current)." in markdown.read_text(
-        encoding="utf-8"
-    )
-
-
-def test_run_sarif_scan_removes_stale_outputs_before_validation(monkeypatch, tmp_path):
-    target = tmp_path / "result-current"
-    sarif = tmp_path / "current.sarif"
-    markdown = tmp_path / "diff.md"
-    sarif.write_text("stale", encoding="utf-8")
-    markdown.write_text("stale", encoding="utf-8")
-
-    monkeypatch.setattr(
-        flakevuln_main, "exit_unless_command_exists", lambda _command: None
-    )
-
-    with pytest.raises(SystemExit):
-        flakevuln_main._run_sarif_scan(
-            target=target,
-            sarif=sarif,
-            sarif_location="flake.nix",
-            markdown=markdown,
-            previous_sarif=markdown,
-        )
-
-    assert not sarif.exists()
-    assert not markdown.exists()
+    assert args.command == "scan"
+    assert args.sarif == Path("current.sarif")
+    assert args.sarif_location == "flake.nix"
 
 
 def test_exec_cmd_treats_arguments_literally(tmp_path):
@@ -407,6 +240,31 @@ def test_scan_subcommand_scans_all_targets_and_materializes_findings(
     ]
     assert written == [findings]
     assert seen["kwargs"]["verbosity"] == 1
+
+
+def test_run_scan_requires_one_target_for_sarif(tmp_path):
+    with pytest.raises(SystemExit) as excinfo:
+        flakevuln_main._run_scan(
+            flakeref=".",
+            targets=["a", "b"],
+            findings=tmp_path / "findings.json",
+            sarif=tmp_path / "vulns.sarif",
+            sarif_location="flake.nix",
+        )
+
+    assert excinfo.value.code == 1
+
+
+def test_run_scan_requires_location_for_sarif(tmp_path):
+    with pytest.raises(SystemExit) as excinfo:
+        flakevuln_main._run_scan(
+            flakeref=".",
+            targets=["a"],
+            findings=tmp_path / "findings.json",
+            sarif=tmp_path / "vulns.sarif",
+        )
+
+    assert excinfo.value.code == 1
 
 
 def _local_args(tmp_path, **overrides):
@@ -3445,8 +3303,8 @@ def test_read_scan_results_runs_vulnxscan_in_tmpdir(monkeypatch, tmp_path):
 
     scanner._read_scan_results(["vulnxscan"], "t", PIN_CURRENT)
 
-    assert "--require-cpe-dictionary" in captured["cmd"]
-    assert captured["evars"] == {"GRYPE_DB_REQUIRE_UPDATE_CHECK": "true"}
+    assert "--require-cpe-dictionary" not in captured["cmd"]
+    assert captured["evars"] is None
     assert captured["cwd"] == scanner.tmpdir
 
 

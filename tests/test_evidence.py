@@ -23,6 +23,12 @@ TARGET = "packages.x86_64-linux.default"
 # note points readers at "Component Evidence" by name, so splitting a report on
 # the short string would cut it at the pointer instead of at the section.
 COMPONENT_EVIDENCE_HEADING = "Patched and Partially Patched Findings (press to expand)"
+VALID_SARIF = json.dumps(
+    {
+        "version": "2.1.0",
+        "runs": [{"tool": {"driver": {"name": "vulnxscan"}}, "results": []}],
+    }
+)
 
 
 def _run_scan(
@@ -588,7 +594,9 @@ def test_current_scan_requests_native_sarif(monkeypatch, tmp_path):
 
     def _fake(cmd, *args, **kwargs):
         captured.extend(cmd)
-        return fake(cmd, *args, **kwargs)
+        result = fake(cmd, *args, **kwargs)
+        Path(tu.arg_value(cmd, "--out=")).write_text(VALID_SARIF, encoding="utf-8")
+        return result
 
     monkeypatch.setattr(flakevuln_main, "exec_cmd", _fake)
 
@@ -599,6 +607,59 @@ def test_current_scan_requests_native_sarif(monkeypatch, tmp_path):
     assert f"--out={scanner.sarif_out}" in captured
     assert not _has_error(scanner)
     assert (scanner.scope_flakeref, TARGET, PIN_CURRENT) in scanner.completed_scans
+
+
+def test_current_sarif_scan_fails_on_scanner_error(monkeypatch, tmp_path):
+    scanner = tu.make_scanner(tmp_path)
+    scanner.sarif_out = tmp_path / "vulns.sarif"
+    scanner.sarif_location = "flake.nix"
+    monkeypatch.setattr(
+        scanner, "_evaluate_target_drv", lambda *_a, **_k: "/nix/store/x.drv"
+    )
+    monkeypatch.setattr(
+        flakevuln_main,
+        "exec_cmd",
+        tu.fake_vulnxscan(returncode=7, stderr="scanner failed"),
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        scanner._read_scan_results(["vulnxscan"], TARGET, PIN_CURRENT)
+
+    assert excinfo.value.code == 7
+    assert _has_error(scanner)
+    assert not scanner.sarif_out.exists()
+
+
+@pytest.mark.parametrize(
+    "sarif_text",
+    [None, ""],
+    ids=["missing", "empty"],
+)
+def test_current_sarif_scan_rejects_missing_or_empty_output(
+    monkeypatch, tmp_path, sarif_text
+):
+    scanner = tu.make_scanner(tmp_path)
+    scanner.sarif_out = tmp_path / "vulns.sarif"
+    scanner.sarif_location = "flake.nix"
+    monkeypatch.setattr(
+        scanner, "_evaluate_target_drv", lambda *_a, **_k: "/nix/store/x.drv"
+    )
+    fake = tu.fake_vulnxscan()
+
+    def _fake(cmd, *args, **kwargs):
+        result = fake(cmd, *args, **kwargs)
+        if sarif_text is not None:
+            Path(tu.arg_value(cmd, "--out=")).write_text(sarif_text, encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(flakevuln_main, "exec_cmd", _fake)
+
+    with pytest.raises(SystemExit) as excinfo:
+        scanner._read_scan_results(["vulnxscan"], TARGET, PIN_CURRENT)
+
+    assert excinfo.value.code == 1
+    assert _has_error(scanner)
+    assert not scanner.sarif_out.exists()
 
 
 def test_triage_csv_without_finding_id_column_fails(monkeypatch, tmp_path):
