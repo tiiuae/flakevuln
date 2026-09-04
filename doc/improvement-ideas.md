@@ -7,6 +7,16 @@ Short list of follow-up work.
 - Revisit remote monitoring / watcher-style operation as a separate follow-on.
   That would likely need a durable state store rather than the current
   cache-backed previous-run baseline.
+- Make previous-run baseline identity explicit for multi-workflow and
+  multi-branch use. The current scope contains the project, flakeref, normalized
+  target set, and selected input name. Independent action invocations with the
+  same values can therefore share a baseline, and workflows that check out
+  different target branches can collide because the checked-out revision is
+  not part of that scope. A persistent self-hosted runner can also reuse a local
+  baseline before GitHub's branch-scoped cache restore runs. Add an optional
+  caller-controlled `baseline-scope` or `baseline-id` to both the local path and
+  Actions cache key. Separately define or serialize concurrent updates to the
+  same scope, for example by documenting a matching workflow concurrency group.
 - Add a shared cache for `--nixprs` enrichment if many repos start hitting
   GitHub API rate limits.
 - Consider an action-level `vulnix` mirror input after `sbomnix` can pass the
