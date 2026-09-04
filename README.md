@@ -3,12 +3,14 @@
 Flake-agnostic vulnerability scanning for Nix flakes, packaged as both a
 reusable GitHub Action and a local CLI.
 
-`flakevuln` generalizes
-[`ghafscan`](https://github.com/tiiuae/ghafscan): keep the proven clone,
-re-lock against different nixpkgs pins, then diff the vulnerability sets
-engine; drop the Ghaf-specific assumptions and commit-back state model; render
-the results as a GitHub Actions Step Summary and a detailed local markdown
-report.
+`flakevuln` scans each configured output at its committed dependency pins,
+re-locks a selected input to compare against its current upstream, and can add
+an explicit unstable comparison. It renders the results as a GitHub Actions
+Step Summary, a detailed Markdown report, and machine-readable JSON.
+
+For a high-level explanation of the problem it solves, its outputs, and how it
+fits into an end-to-end vulnerability-management process, see the
+[flakevuln overview](doc/overview.md).
 
 ## Features
 

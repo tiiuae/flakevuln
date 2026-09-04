@@ -1,0 +1,132 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="440"
+     viewBox="0 0 1200 440" role="img"
+     aria-labelledby="title description">
+  <title id="title">Vulnerability set comparisons used by flakevuln</title>
+  <desc id="description">
+    Two Venn diagrams compare current findings (C) with lock-updated findings
+    (L), and lock-updated findings with findings from an unstable input (U).
+  </desc>
+
+  <style>
+    svg {
+      color-scheme: light dark;
+    }
+    .background {
+      fill: #ffffff;
+    }
+    .foreground {
+      fill: #111827;
+    }
+    .divider {
+      stroke: #d1d5db;
+    }
+    .set-outline {
+      stroke: #4b5563;
+      stroke-width: 2;
+    }
+    .current-set {
+      fill: #ef9a9a;
+      fill-opacity: 0.42;
+    }
+    .updated-set {
+      fill: #80cbc4;
+      fill-opacity: 0.42;
+    }
+    .unstable-set {
+      fill: #ffd166;
+      fill-opacity: 0.46;
+    }
+    @media (prefers-color-scheme: dark) {
+      .background {
+        fill: #151718;
+      }
+      .foreground {
+        fill: #f3f4f6;
+      }
+      .divider {
+        stroke: #4b5563;
+      }
+      .set-outline {
+        stroke: #d1d5db;
+      }
+      .current-set {
+        fill: #b85c5c;
+        fill-opacity: 0.48;
+      }
+      .updated-set {
+        fill: #3b948c;
+        fill-opacity: 0.48;
+      }
+      .unstable-set {
+        fill: #b78317;
+        fill-opacity: 0.48;
+      }
+    }
+  </style>
+
+  <rect class="background" width="1200" height="440"/>
+  <line class="divider" x1="600" y1="24" x2="600" y2="416"/>
+
+  <g class="foreground" font-family="Arial, Helvetica, sans-serif">
+    <text x="300" y="34" font-size="23" font-weight="700"
+          text-anchor="middle">Current vs. lock updated</text>
+    <text x="900" y="34" font-size="23" font-weight="700"
+          text-anchor="middle">Lock updated vs. unstable</text>
+
+    <circle class="current-set set-outline" cx="220" cy="210" r="128"/>
+    <circle class="updated-set set-outline" cx="370" cy="210" r="128"/>
+
+    <text x="220" y="70" font-size="16"
+          text-anchor="middle">current (C)</text>
+    <text x="370" y="70" font-size="16"
+          text-anchor="middle">lock updated (L)</text>
+
+    <text x="153" y="186" font-size="16" text-anchor="middle">
+      <tspan x="153" dy="0">Fixed by</tspan>
+      <tspan x="153" dy="22">updating</tspan>
+      <tspan x="153" dy="22">flake.lock</tspan>
+    </text>
+    <text x="295" y="197" font-size="16" text-anchor="middle">
+      <tspan x="295" dy="0">Still reported</tspan>
+      <tspan x="295" dy="22">after update</tspan>
+    </text>
+    <text x="438" y="197" font-size="16" text-anchor="middle">
+      <tspan x="438" dy="0">Introduced</tspan>
+      <tspan x="438" dy="22">by update</tspan>
+    </text>
+
+    <text x="295" y="370" font-size="16"
+          text-anchor="middle">current (C) - lock updated (L) =</text>
+    <text x="295" y="400" font-size="16" text-anchor="middle">
+      candidates fixed by a lock-file update
+    </text>
+
+    <circle class="updated-set set-outline" cx="830" cy="210" r="128"/>
+    <circle class="unstable-set set-outline" cx="980" cy="210" r="128"/>
+
+    <text x="830" y="70" font-size="16"
+          text-anchor="middle">lock updated (L)</text>
+    <text x="980" y="70" font-size="16"
+          text-anchor="middle">unstable (U)</text>
+
+    <text x="763" y="197" font-size="16" text-anchor="middle">
+      <tspan x="763" dy="0">Fixed in</tspan>
+      <tspan x="763" dy="22">unstable</tspan>
+    </text>
+    <text x="905" y="197" font-size="16" text-anchor="middle">
+      <tspan x="905" dy="0">Still reported</tspan>
+      <tspan x="905" dy="22">in unstable</tspan>
+    </text>
+    <text x="1048" y="197" font-size="16" text-anchor="middle">
+      <tspan x="1048" dy="0">Introduced</tspan>
+      <tspan x="1048" dy="22">in unstable</tspan>
+    </text>
+
+    <text x="905" y="370" font-size="16"
+          text-anchor="middle">lock updated (L) - unstable (U) =</text>
+    <text x="905" y="400" font-size="16" text-anchor="middle">
+      candidates fixed only in nixpkgs unstable
+    </text>
+  </g>
+</svg>
