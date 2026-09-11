@@ -616,16 +616,42 @@ def test_current_sarif_scan_fails_on_scanner_error(monkeypatch, tmp_path):
     monkeypatch.setattr(
         scanner, "_evaluate_target_drv", lambda *_a, **_k: "/nix/store/x.drv"
     )
-    monkeypatch.setattr(
-        flakevuln_main,
-        "exec_cmd",
-        tu.fake_vulnxscan(returncode=7, stderr="scanner failed"),
-    )
+    fake = tu.fake_vulnxscan(returncode=7, stderr="scanner failed")
+
+    def _fake(cmd, *args, **kwargs):
+        Path(tu.arg_value(cmd, "--out=")).write_text(VALID_SARIF, encoding="utf-8")
+        return fake(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(flakevuln_main, "exec_cmd", _fake)
 
     with pytest.raises(SystemExit) as excinfo:
         scanner._read_scan_results(["vulnxscan"], TARGET, PIN_CURRENT)
 
     assert excinfo.value.code == 7
+    assert _has_error(scanner)
+    assert not scanner.sarif_out.exists()
+
+
+def test_current_sarif_scan_discards_output_when_evidence_is_missing(
+    monkeypatch, tmp_path
+):
+    scanner = tu.make_scanner(tmp_path)
+    scanner.sarif_out = tmp_path / "vulns.sarif"
+    scanner.sarif_location = "flake.nix"
+    monkeypatch.setattr(
+        scanner, "_evaluate_target_drv", lambda *_a, **_k: "/nix/store/x.drv"
+    )
+    fake = tu.fake_vulnxscan(document=None)
+
+    def _fake(cmd, *args, **kwargs):
+        result = fake(cmd, *args, **kwargs)
+        Path(tu.arg_value(cmd, "--out=")).write_text(VALID_SARIF, encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(flakevuln_main, "exec_cmd", _fake)
+
+    scanner._read_scan_results(["vulnxscan"], TARGET, PIN_CURRENT)
+
     assert _has_error(scanner)
     assert not scanner.sarif_out.exists()
 

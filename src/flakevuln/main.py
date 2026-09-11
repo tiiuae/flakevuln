@@ -3839,6 +3839,8 @@ in builtins.listToAttrs (map (name: {{ inherit name; value = get name; }}) args.
 
     def _record_scan_error(self, target, pintype, message, details=""):
         """Record a scan failure for `(target, pintype)` and log it."""
+        if pintype == PIN_CURRENT and self.sarif_out is not None:
+            self.sarif_out.unlink(missing_ok=True)
         LOG.warning("%s", message)
         self.errors[self._error_key(self.scope_flakeref, target, pintype)] = {
             "message": message,
@@ -3898,7 +3900,6 @@ in builtins.listToAttrs (map (name: {{ inherit name; value = get name; }}) args.
                 sys.exit(ret.returncode or 1)
             return
         if sarif_requested and (not out.is_file() or out.stat().st_size == 0):
-            out.unlink(missing_ok=True)
             self._record_scan_error(
                 target,
                 pintype,
