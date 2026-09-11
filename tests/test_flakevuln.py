@@ -93,6 +93,23 @@ def test_report_parser_accepts_nixprs_excluded_packages():
     assert args.nixprs_exclude_packages == ["linux", "openssl"]
 
 
+def test_scan_parser_accepts_sarif_output():
+    args = flakevuln_main._getargs(
+        [
+            "scan",
+            "--flakeref=.",
+            "--target=packages.x86_64-linux.default",
+            "--findings=findings.json",
+            "--sarif=current.sarif",
+            "--sarif-location=flake.nix",
+        ]
+    )
+
+    assert args.command == "scan"
+    assert args.sarif == Path("current.sarif")
+    assert args.sarif_location == "flake.nix"
+
+
 def test_exec_cmd_treats_arguments_literally(tmp_path):
     """Arguments with shell metacharacters should not be interpreted."""
     marker = tmp_path / "marker"
@@ -223,6 +240,31 @@ def test_scan_subcommand_scans_all_targets_and_materializes_findings(
     ]
     assert written == [findings]
     assert seen["kwargs"]["verbosity"] == 1
+
+
+def test_run_scan_requires_one_target_for_sarif(tmp_path):
+    with pytest.raises(SystemExit) as excinfo:
+        flakevuln_main._run_scan(
+            flakeref=".",
+            targets=["a", "b"],
+            findings=tmp_path / "findings.json",
+            sarif=tmp_path / "vulns.sarif",
+            sarif_location="flake.nix",
+        )
+
+    assert excinfo.value.code == 1
+
+
+def test_run_scan_requires_location_for_sarif(tmp_path):
+    with pytest.raises(SystemExit) as excinfo:
+        flakevuln_main._run_scan(
+            flakeref=".",
+            targets=["a"],
+            findings=tmp_path / "findings.json",
+            sarif=tmp_path / "vulns.sarif",
+        )
+
+    assert excinfo.value.code == 1
 
 
 def _local_args(tmp_path, **overrides):
@@ -2572,8 +2614,8 @@ def test_snapshot_clean_tree_is_clean_and_keeps_rev(tmp_path):
     assert not snap.is_dirty()
 
 
-def test_local_git_defaults_branding_to_repo_name_and_remote_url(tmp_path):
-    """Local Git flakes default report branding from the repo root and remote."""
+def test_local_git_defaults_branding_and_resolves_sarif_path(tmp_path):
+    """Local Git flakes infer branding and anchor relative SARIF output."""
     import git
 
     ws = tmp_path / "widget"
@@ -2584,10 +2626,11 @@ def test_local_git_defaults_branding_to_repo_name_and_remote_url(tmp_path):
     (ws / "flake.lock").write_text("{}", encoding="utf-8")
     _commit_all(repo)
 
-    scanner = FlakeScanner(str(ws), verbosity=0)
+    scanner = FlakeScanner(str(ws), verbosity=0, sarif_out="vulns.sarif")
 
     assert scanner.project_name == "widget"
     assert scanner.project_url == "https://github.com/acme/widget"
+    assert scanner.sarif_out == Path("vulns.sarif").resolve()
 
 
 def test_snapshot_reproduces_tracked_deletion(tmp_path):
@@ -3236,8 +3279,7 @@ def test_cmd_scan_drops_inaccessible_whitelist(monkeypatch, tmp_path, caplog):
 
 
 def test_read_scan_results_runs_vulnxscan_in_tmpdir(monkeypatch, tmp_path):
-    """vulnxscan runs with cwd=tmpdir so any extra CSV dumps land in the
-    disposable scratch dir, never the user's worktree."""
+    """vulnxscan runs strictly in the disposable scratch directory."""
     scanner = _make_scanner(tmp_path)
     captured = {}
 
@@ -3245,8 +3287,10 @@ def test_read_scan_results_runs_vulnxscan_in_tmpdir(monkeypatch, tmp_path):
         scanner, "_evaluate_target_drv", lambda *_a, **_k: "/nix/store/x.drv"
     )
 
-    def fake_exec(_cmd, *_args, **kwargs):
+    def fake_exec(cmd, *_args, **kwargs):
+        captured["cmd"] = cmd
         captured["cwd"] = kwargs.get("cwd")
+        captured["evars"] = kwargs.get("evars")
 
         class _Ret:
             returncode = 0
@@ -3259,6 +3303,8 @@ def test_read_scan_results_runs_vulnxscan_in_tmpdir(monkeypatch, tmp_path):
 
     scanner._read_scan_results(["vulnxscan"], "t", PIN_CURRENT)
 
+    assert "--require-cpe-dictionary" not in captured["cmd"]
+    assert captured["evars"] is None
     assert captured["cwd"] == scanner.tmpdir
 
 

@@ -340,6 +340,10 @@ def _add_scan_parser(subparsers):
     scan.add_argument("--project-url", help=helps, default="")
     helps = "Path to the findings file this scan materializes (json)."
     scan.add_argument("--findings", help=helps, type=Path, required=True)
+    helps = "Optional path for native vulnxscan SARIF output. Requires one target."
+    scan.add_argument("--sarif", help=helps, type=Path)
+    helps = "Repository-relative file responsible for the scanned closure."
+    scan.add_argument("--sarif-location", help=helps)
     _add_verbose_arg(scan)
     return scan
 
@@ -1103,6 +1107,8 @@ class FlakeScanner:
         project_name="",
         project_url="",
         verbosity=1,
+        sarif_out=None,
+        sarif_location=None,
         excluded_paths=(),
     ):
         self.df_scan = _empty_scan_df()
@@ -1115,6 +1121,8 @@ class FlakeScanner:
         self.input_name = input_name
         self.unstable_ref = unstable_ref
         self.verbosity = _normalize_verbosity(verbosity)
+        self.sarif_out = Path(sarif_out).resolve() if sarif_out is not None else None
+        self.sarif_location = sarif_location
         self.excluded_paths = tuple(
             Path(path).resolve() for path in excluded_paths if path is not None
         )
@@ -3831,19 +3839,38 @@ in builtins.listToAttrs (map (name: {{ inherit name; value = get name; }}) args.
 
     def _record_scan_error(self, target, pintype, message, details=""):
         """Record a scan failure for `(target, pintype)` and log it."""
+        if pintype == PIN_CURRENT and self.sarif_out is not None:
+            self.sarif_out.unlink(missing_ok=True)
         LOG.warning("%s", message)
         self.errors[self._error_key(self.scope_flakeref, target, pintype)] = {
             "message": message,
             "details": _tail_text(details),
         }
 
+    def _prepare_sarif_output(self, cmd):
+        """Replace current-pin CSV output with fresh native SARIF paths."""
+        out = self.sarif_out
+        assert out is not None
+        out_triage = out.with_name(f"{out.stem}.triage.csv")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.unlink(missing_ok=True)
+        out_triage.unlink(missing_ok=True)
+        cmd = [*cmd, "--format=sarif", f"--sarif-location={self.sarif_location}"]
+        return cmd, out, out_triage
+
     def _read_scan_results(self, cmd, target, pintype, override=None):
         started = time.monotonic()
         drv_path = self._evaluate_target_drv(target, pintype, override=override)
         _log_scan_timing(f"evaluate '{target}' on {pintype}", started)
+        sarif_requested = self.sarif_out is not None and pintype == PIN_CURRENT
         if drv_path is None:
+            if sarif_requested:
+                LOG.fatal("Could not evaluate current target for SARIF output")
+                sys.exit(1)
             return
         out, out_triage, out_evidence = self._scan_output_paths(target, pintype)
+        if sarif_requested:
+            cmd, out, out_triage = self._prepare_sarif_output(cmd)
         cmd = [
             *cmd,
             f"--out={out}",
@@ -3854,7 +3881,12 @@ in builtins.listToAttrs (map (name: {{ inherit name; value = get name; }}) args.
         # df_vulnix.csv/df_grype.csv/df_osv.csv/df_report_raw.csv/meta.csv
         # relative to cwd, and we never want those in the user's worktree.
         started = time.monotonic()
-        ret = exec_cmd(cmd, raise_on_error=False, capture=True, cwd=self.tmpdir)
+        ret = exec_cmd(
+            cmd,
+            raise_on_error=False,
+            capture=True,
+            cwd=self.tmpdir,
+        )
         _log_scan_timing(f"vulnxscan '{target}' on {pintype}", started)
         LOG.debug("vulnxscan ==>\n\n%s\n\n<== vulnxscan\n", ret.stderr)
         if ret.returncode != 0:
@@ -3864,7 +3896,16 @@ in builtins.listToAttrs (map (name: {{ inherit name; value = get name; }}) args.
                 f"Error scanning '{target}' on {pintype}",
                 ret.stderr or ret.stdout,
             )
+            if sarif_requested:
+                sys.exit(ret.returncode or 1)
             return
+        if sarif_requested and (not out.is_file() or out.stat().st_size == 0):
+            self._record_scan_error(
+                target,
+                pintype,
+                f"Missing or empty SARIF for '{target}' on {pintype}",
+            )
+            sys.exit(1)
         started = time.monotonic()
         try:
             findings, components = evidence.load_sidecar(out_evidence)
@@ -4962,6 +5003,8 @@ def _cmd_scan(args):
         findings=args.findings,
         verbosity=args.verbose,
         whitelist=args.whitelist,
+        sarif=getattr(args, "sarif", None),
+        sarif_location=getattr(args, "sarif_location", None),
         excluded_paths=getattr(args, "excluded_paths", ()),
     )
 
@@ -5231,10 +5274,21 @@ def _run_scan(  # noqa: PLR0913
     findings,
     verbosity=1,
     whitelist=None,
+    sarif=None,
+    sarif_location=None,
     excluded_paths=(),
 ):
     """Run a scan and materialize findings."""
     scan_started = time.monotonic()
+    targets = _deduplicated_targets(targets)
+    if sarif is not None and len(targets) != 1:
+        LOG.fatal("SARIF output requires exactly one target")
+        sys.exit(1)
+    if sarif is not None and not sarif_location:
+        LOG.fatal("SARIF output requires --sarif-location")
+        sys.exit(1)
+    if sarif is not None:
+        Path(sarif).resolve().unlink(missing_ok=True)
     # Fail early if the following commands are not in PATH.
     started = time.monotonic()
     exit_unless_command_exists("nix")
@@ -5248,12 +5302,13 @@ def _run_scan(  # noqa: PLR0913
         project_name=project_name,
         project_url=project_url,
         verbosity=verbosity,
+        sarif_out=sarif,
+        sarif_location=sarif_location,
         excluded_paths=excluded_paths,
     )
     _log_scan_timing("initialize scanner", started)
     started = time.monotonic()
     whitelist = _usable_whitelist_path(whitelist)
-    targets = _deduplicated_targets(targets)
     _log_scan_timing("prepare inputs", started, f"targets={len(targets)}")
     for target in targets:
         scanner.scan_target(target, whitelist=whitelist)

@@ -42,6 +42,9 @@ inputs:
   report-retention-days:
     description: Number of days to retain the uploaded report artifact
     default: '30'
+  sarif-location:
+    description: Repository-relative file responsible for the scanned closure; empty disables SARIF output
+    default: ''
 
 outputs:
   findings-path:
@@ -56,6 +59,9 @@ outputs:
   report-artifact-url:
     description: URL for the uploaded report artifact when upload-report is true.
     value: ${{ steps.upload-report.outputs.artifact-url }}
+  sarif:
+    description: Current SARIF file produced when sarif-location is set
+    value: ${{ steps.scan.outputs.sarif }}
 
 runs:
   using: composite
@@ -241,9 +247,12 @@ runs:
         INPUT_NAME: ${{ inputs.input-name }}
         UNSTABLE_REF: ${{ inputs.unstable-ref }}
         WHITELIST: ${{ inputs.whitelist }}
+        SARIF_LOCATION: ${{ inputs.sarif-location }}
         TARGETS: ${{ inputs.targets }}
         OUTDIR: ${{ steps.cache-meta.outputs.outdir }}
         LEGACY_OUTDIR: ${{ runner.temp }}/flakevuln
+        GH_TOKEN: ''
+        GITHUB_TOKEN: ''
       run: |
         set -euo pipefail
         # Clear prior output for this invocation.
@@ -254,11 +263,15 @@ runs:
         done <<< "$TARGETS"
         wl=()
         if [ -n "$WHITELIST" ]; then wl+=( "--whitelist=$WHITELIST" ); fi
+        sarif=()
+        if [ -n "$SARIF_LOCATION" ]; then
+          sarif+=( "--sarif=$OUTDIR/vulns.sarif" "--sarif-location=$SARIF_LOCATION" )
+        fi
         "$FLAKEVULN_BIN" scan \
           --flakeref="$FLAKEREF" \
           --input-name="$INPUT_NAME" \
           --unstable-ref="$UNSTABLE_REF" \
-          "${wl[@]}" "${targets[@]}" \
+          "${wl[@]}" "${sarif[@]}" "${targets[@]}" \
           --findings="$OUTDIR/findings.json"
         # Compatibility for callers that uploaded the historical path directly.
         rm -rf "$LEGACY_OUTDIR"
@@ -266,8 +279,10 @@ runs:
         cp "$OUTDIR/findings.json" "$LEGACY_OUTDIR/findings.json"
         {
           echo "findings=$OUTDIR/findings.json"
+          if [ -n "$SARIF_LOCATION" ] && [ -s "$OUTDIR/vulns.sarif" ]; then
+            echo "sarif=$OUTDIR/vulns.sarif"
+          fi
         } >> "$GITHUB_OUTPUT"
-      # NOTE: no `env: GH_TOKEN` here.
 
     # Phase 2: render the Step Summary from the materialized findings.
     - name: Report (trusted)

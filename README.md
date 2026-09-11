@@ -21,6 +21,7 @@ fits into an end-to-end vulnerability-management process, see the
 - Optionally adds a third scan against an explicit unstable input such as
   `github:NixOS/nixpkgs/nixos-unstable`.
 - Writes machine-readable findings plus markdown reports.
+- Optionally produces SARIF for GitHub Code Scanning.
 - Explains each finding with per-derivation patch evidence from `vulnxscan`.
 - Reuses the same engine locally and in GitHub Actions.
 - Persists `grype`, `vulnix`, `sbomnix` HTTP cache data, and prior-run baseline
@@ -129,6 +130,30 @@ jobs:
 For an in-repository example that uses the checked-out action source directly,
 see [example-scan.yml](.github/workflows/example-scan.yml).
 
+### Example: upload SARIF to GitHub Code Scanning
+
+Set `sarif-location` when scanning one flake target. The action exposes native
+`vulnxscan` SARIF for the current pin while retaining the normal lock-updated
+and optional unstable comparisons in the Flakevuln report.
+
+```yaml
+- id: flakevuln
+  uses: tiiuae/flakevuln@<commit-sha>
+  with:
+    targets: packages.x86_64-linux.default
+    sarif-location: flake.nix
+    upload-report: false
+- name: Upload SARIF
+  if: ${{ always() && steps.flakevuln.outputs.sarif != '' }}
+  uses: github/codeql-action/upload-sarif@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+  with:
+    sarif_file: ${{ steps.flakevuln.outputs.sarif }}
+    category: vulnxscan
+```
+
+The job needs `security-events: write` to upload SARIF. Private and internal
+repositories also need GitHub Code Security enabled and `actions: read`.
+
 ### Inputs
 
 | Input | Required | Default | Description |
@@ -145,6 +170,7 @@ see [example-scan.yml](.github/workflows/example-scan.yml).
 | `cachix-caches` | no | `""` | Space-delimited Cachix cache names to add as read-only substituters. |
 | `upload-report` | no | `true` | Upload the findings and rendered report as an artifact. With `false` the Step Summary is still trimmed, so publish `report-path` yourself or the omitted tables are unreachable. |
 | `report-retention-days` | no | `30` | Number of days to retain the uploaded report artifact. |
+| `sarif-location` | no | `""` | Repository-relative file responsible for the scanned closure. Enables SARIF output for a single target. |
 
 ### Outputs
 
@@ -154,14 +180,17 @@ see [example-scan.yml](.github/workflows/example-scan.yml).
 | `report-path` | Path to the rendered markdown report directory. |
 | `report-artifact-name` | Name of the report artifact when `upload-report` is `true`. |
 | `report-artifact-url` | URL for the uploaded report artifact when `upload-report` is `true`. |
+| `sarif` | Path to the current SARIF file when `sarif-location` is set. |
 
 ### Behavior
 
 - Supported runners: Linux runners. The action is designed around
   [`cachix/install-nix-action`](https://github.com/cachix/install-nix-action),
   so macOS may work, but this repository currently validates releases on Linux.
-- Required workflow permissions: `contents: read` is sufficient for the normal
-  checkout-and-scan flow.
+- Required workflow permissions: `contents: read` is sufficient for the action.
+  Uploading its SARIF output needs `security-events: write`; private and
+  internal repositories also need GitHub Code Security enabled and
+  `actions: read`.
 - Security model: the untrusted `scan` phase runs without `GH_TOKEN`; optional
   GitHub-authenticated enrichment happens later in the trusted `report` phase.
 - Report publication: the action uploads a report artifact containing
@@ -192,6 +221,14 @@ see [example-scan.yml](.github/workflows/example-scan.yml).
 - The primary findings path is the `findings-path` output. For compatibility,
   the action also writes a copy to `${{ runner.temp }}/flakevuln/findings.json`,
   but callers should migrate to the output path for multi-invocation jobs.
+- SARIF output: setting `sarif-location` exposes `sarif` after a nonempty
+  current-pin file and consistent companion outputs are generated. Scanner
+  errors and missing or empty SARIF fail the scan; rejected companion output
+  discards SARIF. It is written before the lock-updated and unstable scans. Code
+  Scanning counts each affected package version, while the report collapses
+  versions by vulnerability and package, so the Security tab will normally show
+  more alerts than the report's Currently Active table. The report's
+  patch-evidence suppression can increase that difference.
 - Baseline diffing: the action persists a prior findings set keyed by flakeref,
   targets, and `input-name`, then reports what changed since the last
   successful run for that same scope.
@@ -350,7 +387,9 @@ render reports later:
 nix run .#flakevuln -- scan \
   --flakeref . \
   --target packages.x86_64-linux.default \
-  --findings findings.json
+  --findings findings.json \
+  --sarif vulns.sarif \
+  --sarif-location flake.nix
 
 nix run .#flakevuln -- report \
   --findings findings.json \
