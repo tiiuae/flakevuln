@@ -279,7 +279,7 @@ runs:
         cp "$OUTDIR/findings.json" "$LEGACY_OUTDIR/findings.json"
         {
           echo "findings=$OUTDIR/findings.json"
-          if [ -n "$SARIF_LOCATION" ]; then
+          if [ -n "$SARIF_LOCATION" ] && [ -s "$OUTDIR/vulns.sarif" ]; then
             echo "sarif=$OUTDIR/vulns.sarif"
           fi
         } >> "$GITHUB_OUTPUT"

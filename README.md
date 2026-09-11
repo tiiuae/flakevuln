@@ -220,11 +220,13 @@ repositories also need GitHub Code Security enabled and `actions: read`.
   the action also writes a copy to `${{ runner.temp }}/flakevuln/findings.json`,
   but callers should migrate to the output path for multi-invocation jobs.
 - SARIF output: setting `sarif-location` exposes `sarif` after a nonempty
-  current-pin file is generated. SARIF generation fails closed on scanner errors
-  and missing or empty output. It is written before the lock-updated and unstable
-  scans, and does not
-  apply the report's patch-evidence suppression. GitHub Code Scanning can
-  therefore show more alerts than the report's Currently Active table.
+  current-pin file and consistent companion outputs are generated. Scanner
+  errors and missing or empty SARIF fail the scan; rejected companion output
+  discards SARIF. It is written before the lock-updated and unstable scans. Code
+  Scanning counts each affected package version, while the report collapses
+  versions by vulnerability and package, so the Security tab will normally show
+  more alerts than the report's Currently Active table. The report's
+  patch-evidence suppression can increase that difference.
 - Baseline diffing: the action persists a prior findings set keyed by flakeref,
   targets, and `input-name`, then reports what changed since the last
   successful run for that same scope.
