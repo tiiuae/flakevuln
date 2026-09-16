@@ -186,6 +186,22 @@ def test_unknown_object_fields_are_accepted():
     assert components[0]["future_field"] == "ignored"
 
 
+def test_unavailable_triage_status_is_the_only_supported_marker(tmp_path):
+    document = tu.evidence_document(triage_status=evidence.TRIAGE_STATUS_UNAVAILABLE)
+    path = tmp_path / "evidence.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    assert evidence.load_sidecar(path) == (
+        [],
+        [],
+        evidence.TRIAGE_STATUS_UNAVAILABLE,
+    )
+
+    document[evidence.TRIAGE_STATUS] = "partial"
+    with pytest.raises(evidence.EvidenceError, match="triage_status"):
+        evidence.validate_document(document)
+
+
 def test_optional_component_flake_input_fields_are_validated():
     """flakevuln annotations are optional, but typed when present."""
     finding = tu.evidence_finding()
@@ -575,7 +591,7 @@ def test_malformed_triage_csv_fails(monkeypatch, tmp_path):
     assert _has_error(scanner)
 
 
-def test_current_scan_requests_native_sarif(monkeypatch, tmp_path):
+def test_unavailable_triage_keeps_native_sarif(monkeypatch, tmp_path):
     finding = tu.evidence_finding()
     component = tu.evidence_component(finding)
     scanner = tu.make_scanner(tmp_path)
@@ -584,7 +600,11 @@ def test_current_scan_requests_native_sarif(monkeypatch, tmp_path):
     scanner.sarif_location = "flake.nix"
     captured = []
     fake = tu.fake_vulnxscan(
-        document=tu.evidence_document([finding], [component]),
+        document=tu.evidence_document(
+            [finding],
+            [component],
+            triage_status=evidence.TRIAGE_STATUS_UNAVAILABLE,
+        ),
         triage_rows=[tu.triage_row(finding)],
     )
 
@@ -605,8 +625,12 @@ def test_current_scan_requests_native_sarif(monkeypatch, tmp_path):
     assert "--format=sarif" in captured
     assert "--sarif-location=flake.nix" in captured
     assert f"--out={scanner.sarif_out}" in captured
+    assert scanner.sarif_out.read_text(encoding="utf-8") == VALID_SARIF
     assert not _has_error(scanner)
     assert (scanner.scope_flakeref, TARGET, PIN_CURRENT) in scanner.completed_scans
+    assert scanner.triage_unavailable_scans == {
+        (scanner.scope_flakeref, TARGET, PIN_CURRENT)
+    }
 
 
 def test_current_sarif_scan_fails_on_scanner_error(monkeypatch, tmp_path):
@@ -854,6 +878,46 @@ def test_version_2_findings_round_trip(monkeypatch, tmp_path):
     ]
 
 
+def test_unavailable_triage_round_trips_and_warns_in_reports(monkeypatch, tmp_path):
+    finding = tu.evidence_finding()
+    component = tu.evidence_component(finding)
+    scanner = _run_scan(
+        monkeypatch,
+        tmp_path,
+        document=tu.evidence_document(
+            [finding],
+            [component],
+            triage_status=evidence.TRIAGE_STATUS_UNAVAILABLE,
+        ),
+        triage_rows=[tu.triage_row(finding)],
+    )
+    scanner._set_comparison_skipped(
+        PIN_LOCK_UPDATED, "test fixture scanned only the current pin"
+    )
+    findings_file = tmp_path / "findings.json"
+    summary = tmp_path / "summary.md"
+    report_dir = tmp_path / "report"
+    scanner.write_findings(findings_file)
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary))
+
+    reporter = flakevuln_main._run_report(
+        findings=findings_file,
+        outdir=report_dir,
+    )
+
+    key = [scanner.scope_flakeref, TARGET, PIN_CURRENT]
+    assert json.loads(findings_file.read_text(encoding="utf-8"))[
+        "triage_unavailable_scans"
+    ] == [key]
+    assert reporter.triage_unavailable_scans == {tuple(key)}
+    warning = "Repology triage enrichment was unavailable for 1 scan state."
+    summary_text = summary.read_text(encoding="utf-8")
+    assert summary_text.startswith(
+        f"# Flakevuln Scan Summary\n\n> [!WARNING]\n> {warning}"
+    )
+    assert warning in (report_dir / "README.md").read_text(encoding="utf-8")
+
+
 def test_legacy_findings_load_and_render_as_before(tmp_path):
     """A version-1 file has no schema_version and no evidence at all."""
     scanner = tu.make_scanner(tmp_path, flakeref="flake")
@@ -1040,6 +1104,16 @@ def test_v2_without_completed_scans_loads_by_inference(monkeypatch, tmp_path, ca
 
     assert scanner.completed_scans == {(scanner.scope_flakeref, TARGET, PIN_CURRENT)}
     assert "missing completed_scans" in caplog.text
+
+
+def test_v2_without_triage_unavailable_scans_loads_as_available(monkeypatch, tmp_path):
+    """The status list is an additive field absent from older v2 artifacts."""
+    data = _findings_payload(monkeypatch, tmp_path)
+    del data["triage_unavailable_scans"]
+
+    scanner = FlakeScanner.from_findings_data(data)
+
+    assert scanner.triage_unavailable_scans == set()
 
 
 def test_enabled_comparison_requires_success_or_failure_record(monkeypatch, tmp_path):

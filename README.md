@@ -229,6 +229,11 @@ repositories also need GitHub Code Security enabled and `actions: read`.
   versions by vulnerability and package, so the Security tab will normally show
   more alerts than the report's Currently Active table. The report's
   patch-evidence suppression can increase that difference.
+- Repology outages: a scan with valid fallback triage rows remains successful.
+  Findings and any requested SARIF are retained, Repology-provided version and
+  classification fields stay blank, and the report begins with a degraded-mode
+  warning. Malformed, missing, or evidence-inconsistent triage output still
+  fails the affected scan state.
 - Baseline diffing: the action persists a prior findings set keyed by flakeref,
   targets, and `input-name`, then reports what changed since the last
   successful run for that same scope.

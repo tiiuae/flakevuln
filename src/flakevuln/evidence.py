@@ -20,6 +20,8 @@ FINDINGS_SCHEMA_VERSION = 2
 
 # The vulnxscan evidence sidecar schema this release understands.
 VULNXSCAN_EVIDENCE_SCHEMA_VERSION = 1
+TRIAGE_STATUS = "triage_status"
+TRIAGE_STATUS_UNAVAILABLE = "unavailable"
 
 # Aggregate patch-evidence states, mirroring the vulnxscan contract.
 PATCH_STATE_ALL_MATCH = "all_components_match"
@@ -197,8 +199,8 @@ def active_finding_ids(findings):
 def load_sidecar(path):
     """Read and validate a vulnxscan evidence sidecar.
 
-    Returns `(findings, components)`. Raises `EvidenceError` for anything that
-    must not be mistaken for an empty, clean scan.
+    Returns `(findings, components, triage_status)`. Raises `EvidenceError` for
+    anything that must not be mistaken for an empty, clean scan.
     """
     path = Path(path)
     try:
@@ -214,7 +216,8 @@ def load_sidecar(path):
         document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
         raise EvidenceError(f"invalid evidence report '{path}': {error}") from error
-    return validate_document(document)
+    findings, components = validate_document(document)
+    return findings, components, document.get(TRIAGE_STATUS)
 
 
 def validate_document(document):
@@ -229,6 +232,8 @@ def validate_document(document):
             f"unsupported evidence schema version {version}; "
             f"this flakevuln supports version {VULNXSCAN_EVIDENCE_SCHEMA_VERSION}"
         )
+    if document.get(TRIAGE_STATUS) not in (None, TRIAGE_STATUS_UNAVAILABLE):
+        raise EvidenceError("evidence report has an invalid triage_status")
     _require_document_list(document, "observations")
     findings = _require_document_list(document, "findings")
     components = _require_document_list(document, "components")

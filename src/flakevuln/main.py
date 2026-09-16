@@ -1138,6 +1138,7 @@ class FlakeScanner:
         self.scope_targets = []
         self.scanned_targets = []
         self.completed_scans = set()
+        self.triage_unavailable_scans = set()
         self.eval_flakeref = "."
         self.remote_flake = False
         LOG.info("Scanning '%s'", flakeref)
@@ -1254,6 +1255,20 @@ class FlakeScanner:
             self._comparison_skip_reason(pintype)
             for pintype in (PIN_LOCK_UPDATED, PIN_NIX_UNSTABLE)
             if self._comparison_skip_reason(pintype)
+        ]
+
+    def _triage_notes(self):
+        count = len(self.triage_unavailable_scans)
+        if not count:
+            return []
+        scan_states = _plural(count, "scan state", "scan states")
+        return [
+            "> [!WARNING]\n"
+            f"> Repology triage enrichment was unavailable for {count} "
+            f"{scan_states}.\n"
+            "> Findings and any requested SARIF were retained, but "
+            "Repology-provided\n"
+            "> version and classification fields are blank."
         ]
 
     def _lock_nodes_and_input_node(self, lockfile, input_name, *, fatal=True):
@@ -1409,6 +1424,14 @@ class FlakeScanner:
             if completed_scans_included
             else set()
         )
+        self.triage_unavailable_scans = (
+            _validated_scan_keys(
+                data.get("triage_unavailable_scans", []),
+                "triage_unavailable_scans",
+            )
+            if findings_schema_version == evidence.FINDINGS_SCHEMA_VERSION
+            else set()
+        )
         self.errors = data.get("errors", {})
         self.repo_head = data.get("repo_head", "")
         self.flakeref = data.get("flakeref", "")
@@ -1462,6 +1485,7 @@ class FlakeScanner:
                 )
             self.completed_scans = self._completed_scan_key_set(rows)
         self._validate_completed_scans(rows, reachable, completed_scans_included)
+        self._validate_triage_unavailable_scans()
         self._check_evidence_covers_scan_rows()
         return self
 
@@ -1638,6 +1662,15 @@ class FlakeScanner:
                     f"scan state {list(key)} has neither results nor an error"
                 )
 
+    def _validate_triage_unavailable_scans(self):
+        """Require degraded triage markers to name successful scan states."""
+        invalid = self.triage_unavailable_scans - self.completed_scans
+        if invalid:
+            key = sorted(invalid)[0]
+            raise evidence.EvidenceError(
+                f"unavailable triage marker {list(key)} does not name a completed scan"
+            )
+
     def _validate_error_keys(self, rows, reachable):
         """Require recorded scan failures to name reachable, result-free keys.
 
@@ -1744,6 +1777,9 @@ class FlakeScanner:
             "scanned_targets": [list(t) for t in self.scanned_targets],
             "completed_scans": [
                 list(key) for key in sorted(self._completed_scan_key_set(scan_rows))
+            ],
+            "triage_unavailable_scans": [
+                list(key) for key in sorted(self.triage_unavailable_scans)
             ],
             "scope_targets": [
                 [self._scope_target_flakeref(flakeref), target]
@@ -3908,7 +3944,7 @@ in builtins.listToAttrs (map (name: {{ inherit name; value = get name; }}) args.
             sys.exit(1)
         started = time.monotonic()
         try:
-            findings, components = evidence.load_sidecar(out_evidence)
+            findings, components, triage_status = evidence.load_sidecar(out_evidence)
         except evidence.EvidenceError as error:
             _log_scan_timing(
                 f"read outputs '{target}' on {pintype}", started, "failed=true"
@@ -3966,7 +4002,7 @@ in builtins.listToAttrs (map (name: {{ inherit name; value = get name; }}) args.
         self.evidence_findings.extend(evidence.annotate(findings, **annotation))
         self.component_evidence.extend(evidence.annotate(components, **annotation))
         self._record_package_inventory(cmd, target, pintype, drv_path)
-        self._record_completed_scan(target, pintype)
+        self._record_completed_scan(target, pintype, triage_status)
 
     def _record_package_inventory(self, cmd, target, pintype, drv_path):
         inventory_store = None
@@ -4062,9 +4098,18 @@ in builtins.listToAttrs (map (name: {{ inherit name; value = get name; }}) args.
             for package, versions in sorted(inventory.items())
         }
 
-    def _record_completed_scan(self, target, pintype):
-        """Remember a successful scan state, even when it found no rows."""
-        self.completed_scans.add((self.scope_flakeref, str(target), str(pintype)))
+    def _record_completed_scan(self, target, pintype, triage_status=None):
+        """Remember a successful scan state and any degraded triage status."""
+        key = (self.scope_flakeref, str(target), str(pintype))
+        self.completed_scans.add(key)
+        if triage_status != evidence.TRIAGE_STATUS_UNAVAILABLE:
+            return
+        self.triage_unavailable_scans.add(key)
+        LOG.warning(
+            "Repology triage enrichment was unavailable for '%s' on %s",
+            target,
+            pintype,
+        )
 
     def _read_triage_rows(self, target, pintype, out_triage, findings):
         """Return the triage rows that match the accepted evidence findings.
@@ -5356,7 +5401,7 @@ def _run_report(  # noqa: PLR0913, PLR0914, PLR0915
     _log_report_timing("load findings/baseline", started)
     # Network enrichment runs only here, in the trusted phase, once on the
     # current findings set, and is non-fatal.
-    notes = []
+    notes = getattr(reporter, "_triage_notes", lambda: [])()
     actionable = None
     actionable_detail = ""
     pr_detail = ""
