@@ -45,6 +45,9 @@ inputs:
   sarif-location:
     description: Repository-relative file responsible for the scanned closure; empty disables SARIF output
     default: ''
+  strict-scanner:
+    description: Fail closed on degraded scanner data (required CPE dictionary and grype DB update check)
+    default: 'false'
 
 outputs:
   findings-path:
@@ -248,6 +251,7 @@ runs:
         UNSTABLE_REF: ${{ inputs.unstable-ref }}
         WHITELIST: ${{ inputs.whitelist }}
         SARIF_LOCATION: ${{ inputs.sarif-location }}
+        STRICT_SCANNER: ${{ inputs.strict-scanner }}
         TARGETS: ${{ inputs.targets }}
         OUTDIR: ${{ steps.cache-meta.outputs.outdir }}
         LEGACY_OUTDIR: ${{ runner.temp }}/flakevuln
@@ -267,11 +271,13 @@ runs:
         if [ -n "$SARIF_LOCATION" ]; then
           sarif+=( "--sarif=$OUTDIR/vulns.sarif" "--sarif-location=$SARIF_LOCATION" )
         fi
+        strict=()
+        if [ "$STRICT_SCANNER" = "true" ]; then strict+=( "--strict-scanner" ); fi
         "$FLAKEVULN_BIN" scan \
           --flakeref="$FLAKEREF" \
           --input-name="$INPUT_NAME" \
           --unstable-ref="$UNSTABLE_REF" \
-          "${wl[@]}" "${sarif[@]}" "${targets[@]}" \
+          "${wl[@]}" "${sarif[@]}" "${strict[@]}" "${targets[@]}" \
           --findings="$OUTDIR/findings.json"
         # Compatibility for callers that uploaded the historical path directly.
         rm -rf "$LEGACY_OUTDIR"

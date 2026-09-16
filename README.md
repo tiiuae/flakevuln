@@ -171,6 +171,7 @@ repositories also need GitHub Code Security enabled and `actions: read`.
 | `upload-report` | no | `true` | Upload the findings and rendered report as an artifact. With `false` the Step Summary is still trimmed, so publish `report-path` yourself or the omitted tables are unreachable. |
 | `report-retention-days` | no | `30` | Number of days to retain the uploaded report artifact. |
 | `sarif-location` | no | `""` | Repository-relative file responsible for the scanned closure. Enables SARIF output for a single target. |
+| `strict-scanner` | no | `false` | Fail closed on degraded scanner data: require vulnxscan's CPE dictionary and grype's database update check on every scan. |
 
 ### Outputs
 
@@ -237,6 +238,12 @@ repositories also need GitHub Code Security enabled and `actions: read`.
 - Baseline diffing: the action persists a prior findings set keyed by flakeref,
   targets, and `input-name`, then reports what changed since the last
   successful run for that same scope.
+- Strict scanner policy: `strict-scanner: true` (CLI: `--strict-scanner`)
+  passes `--require-cpe-dictionary` to vulnxscan and sets
+  `GRYPE_DB_REQUIRE_UPDATE_CHECK=true` on every scan, so a cold CPE cache
+  without network access or a skipped grype DB update fails the scan instead
+  of producing partial findings. It is off by default; enable it when a green
+  run must never rest on degraded scanner data.
 
 ### Caches and report output
 
