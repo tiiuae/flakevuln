@@ -344,6 +344,13 @@ def _add_scan_parser(subparsers):
     scan.add_argument("--sarif", help=helps, type=Path)
     helps = "Repository-relative file responsible for the scanned closure."
     scan.add_argument("--sarif-location", help=helps)
+    helps = (
+        "Fail closed on degraded scanner data: require vulnxscan's CPE "
+        "dictionary and grype's database update check on every scan. "
+        "Scanner failures then fail the scan instead of recording partial "
+        "findings."
+    )
+    scan.add_argument("--strict-scanner", help=helps, action="store_true")
     _add_verbose_arg(scan)
     return scan
 
@@ -454,6 +461,11 @@ def _add_local_parser(subparsers, scan_parser, report_parser):
         "--project-url",
         help=scan_parser._option_string_actions["--project-url"].help,
         default="",
+    )
+    local.add_argument(
+        "--strict-scanner",
+        help=scan_parser._option_string_actions["--strict-scanner"].help,
+        action="store_true",
     )
     local.add_argument(
         "--nixprs",
@@ -1109,6 +1121,7 @@ class FlakeScanner:
         verbosity=1,
         sarif_out=None,
         sarif_location=None,
+        strict_scanner=False,
         excluded_paths=(),
     ):
         self.df_scan = _empty_scan_df()
@@ -1123,6 +1136,7 @@ class FlakeScanner:
         self.verbosity = _normalize_verbosity(verbosity)
         self.sarif_out = Path(sarif_out).resolve() if sarif_out is not None else None
         self.sarif_location = sarif_location
+        self.strict_scanner = strict_scanner
         self.excluded_paths = tuple(
             Path(path).resolve() for path in excluded_paths if path is not None
         )
@@ -3858,6 +3872,14 @@ in builtins.listToAttrs (map (name: {{ inherit name; value = get name; }}) args.
         cmd = [*cmd, "--format=sarif", f"--sarif-location={self.sarif_location}"]
         return cmd, out, out_triage
 
+    def _strict_scanner_policy(self, cmd):
+        """Apply fail-closed scanner settings when strict mode is enabled."""
+        if not self.strict_scanner:
+            return cmd, None
+        return [*cmd, "--require-cpe-dictionary"], {
+            "GRYPE_DB_REQUIRE_UPDATE_CHECK": "true"
+        }
+
     def _read_scan_results(self, cmd, target, pintype, override=None):
         started = time.monotonic()
         drv_path = self._evaluate_target_drv(target, pintype, override=override)
@@ -3871,6 +3893,7 @@ in builtins.listToAttrs (map (name: {{ inherit name; value = get name; }}) args.
         out, out_triage, out_evidence = self._scan_output_paths(target, pintype)
         if sarif_requested:
             cmd, out, out_triage = self._prepare_sarif_output(cmd)
+        cmd, strict_evars = self._strict_scanner_policy(cmd)
         cmd = [
             *cmd,
             f"--out={out}",
@@ -3884,6 +3907,7 @@ in builtins.listToAttrs (map (name: {{ inherit name; value = get name; }}) args.
         ret = exec_cmd(
             cmd,
             raise_on_error=False,
+            evars=strict_evars,
             capture=True,
             cwd=self.tmpdir,
         )
@@ -5005,6 +5029,7 @@ def _cmd_scan(args):
         whitelist=args.whitelist,
         sarif=getattr(args, "sarif", None),
         sarif_location=getattr(args, "sarif_location", None),
+        strict_scanner=getattr(args, "strict_scanner", False),
         excluded_paths=getattr(args, "excluded_paths", ()),
     )
 
@@ -5276,6 +5301,7 @@ def _run_scan(  # noqa: PLR0913
     whitelist=None,
     sarif=None,
     sarif_location=None,
+    strict_scanner=False,
     excluded_paths=(),
 ):
     """Run a scan and materialize findings."""
@@ -5304,6 +5330,7 @@ def _run_scan(  # noqa: PLR0913
         verbosity=verbosity,
         sarif_out=sarif,
         sarif_location=sarif_location,
+        strict_scanner=strict_scanner,
         excluded_paths=excluded_paths,
     )
     _log_scan_timing("initialize scanner", started)
@@ -5541,6 +5568,7 @@ def _cmd_local(args):
             findings=findings,
             verbosity=args.verbose,
             whitelist=args.whitelist,
+            strict_scanner=getattr(args, "strict_scanner", False),
             excluded_paths=_local_output_excluded_paths(outdir),
         )
         reporter = _run_report(

@@ -110,6 +110,40 @@ def test_scan_parser_accepts_sarif_output():
     assert args.sarif_location == "flake.nix"
 
 
+def test_scan_parser_defaults_strict_scanner_off():
+    args = flakevuln_main._getargs(
+        [
+            "scan",
+            "--flakeref=.",
+            "--target=packages.x86_64-linux.default",
+            "--findings=findings.json",
+        ]
+    )
+
+    assert args.strict_scanner is False
+
+
+def test_scan_parser_accepts_strict_scanner():
+    args = flakevuln_main._getargs(
+        [
+            "scan",
+            "--flakeref=.",
+            "--target=packages.x86_64-linux.default",
+            "--findings=findings.json",
+            "--strict-scanner",
+        ]
+    )
+
+    assert args.strict_scanner is True
+
+
+def test_local_parser_accepts_strict_scanner():
+    args = flakevuln_main._getargs(["local", "--strict-scanner", "target"])
+
+    assert args.command == "local"
+    assert args.strict_scanner is True
+
+
 def test_exec_cmd_treats_arguments_literally(tmp_path):
     """Arguments with shell metacharacters should not be interpreted."""
     marker = tmp_path / "marker"
@@ -3306,6 +3340,35 @@ def test_read_scan_results_runs_vulnxscan_in_tmpdir(monkeypatch, tmp_path):
     assert "--require-cpe-dictionary" not in captured["cmd"]
     assert captured["evars"] is None
     assert captured["cwd"] == scanner.tmpdir
+
+
+def test_read_scan_results_strict_scanner_fails_closed(monkeypatch, tmp_path):
+    """--strict-scanner requires the CPE dictionary and grype DB update check."""
+    scanner = _make_scanner(tmp_path)
+    scanner.strict_scanner = True
+    captured = {}
+
+    monkeypatch.setattr(
+        scanner, "_evaluate_target_drv", lambda *_a, **_k: "/nix/store/x.drv"
+    )
+
+    def fake_exec(cmd, *_args, **kwargs):
+        captured["cmd"] = cmd
+        captured["evars"] = kwargs.get("evars")
+
+        class _Ret:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return _Ret()
+
+    monkeypatch.setattr(flakevuln_main, "exec_cmd", fake_exec)
+
+    scanner._read_scan_results(["vulnxscan"], "t", PIN_CURRENT)
+
+    assert "--require-cpe-dictionary" in captured["cmd"]
+    assert captured["evars"] == {"GRYPE_DB_REQUIRE_UPDATE_CHECK": "true"}
 
 
 def test_read_scan_results_logs_scan_timing(monkeypatch, tmp_path, caplog):

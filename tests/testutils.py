@@ -33,6 +33,7 @@ def make_scanner(tmp_path, flakeref="github:example/flake", unstable_ref=""):
     scanner.evidence_included = False
     scanner.sarif_out = None
     scanner.sarif_location = None
+    scanner.strict_scanner = False
     scanner.errors = {}
     scanner.flakeref = flakeref
     scanner.scope_flakeref = flakevuln_main._canonical_scope_flakeref(flakeref)
