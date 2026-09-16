@@ -346,9 +346,8 @@ def _add_scan_parser(subparsers):
     scan.add_argument("--sarif-location", help=helps)
     helps = (
         "Fail closed on degraded scanner data: require vulnxscan's CPE "
-        "dictionary and grype's database update check on every scan. "
-        "Scanner failures then fail the scan instead of recording partial "
-        "findings."
+        "dictionary and grype database update checks to succeed. Scanner "
+        "failures then fail the scan instead of recording partial findings."
     )
     scan.add_argument("--strict-scanner", help=helps, action="store_true")
     _add_verbose_arg(scan)
@@ -3913,7 +3912,14 @@ in builtins.listToAttrs (map (name: {{ inherit name; value = get name; }}) args.
         if not self.strict_scanner:
             return cmd, None
         return [*cmd, "--require-cpe-dictionary"], {
-            "GRYPE_DB_REQUIRE_UPDATE_CHECK": "true"
+            # Auto-update is the default, but spell it out so a config file
+            # cannot weaken the strict guarantee. require-update-check makes
+            # an attempted update check fatal. Grype rate-limits checks via
+            # max-update-check-frequency (default 2h), so scans after the
+            # action's grype DB update warm-up skip the check and reuse its
+            # result instead of paying for a redundant check per scan.
+            "GRYPE_DB_AUTO_UPDATE": "true",
+            "GRYPE_DB_REQUIRE_UPDATE_CHECK": "true",
         }
 
     def _read_scan_results(self, cmd, target, pintype, override=None):
@@ -3956,7 +3962,7 @@ in builtins.listToAttrs (map (name: {{ inherit name; value = get name; }}) args.
                 f"Error scanning '{target}' on {pintype}",
                 ret.stderr or ret.stdout,
             )
-            if sarif_requested:
+            if sarif_requested or self.strict_scanner:
                 sys.exit(ret.returncode or 1)
             return
         if sarif_requested and (not out.is_file() or out.stat().st_size == 0):

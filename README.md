@@ -239,10 +239,13 @@ repositories also need GitHub Code Security enabled and `actions: read`.
   targets, and `input-name`, then reports what changed since the last
   successful run for that same scope.
 - Strict scanner policy: `strict-scanner: true` (CLI: `--strict-scanner`)
-  passes `--require-cpe-dictionary` to vulnxscan and sets
-  `GRYPE_DB_REQUIRE_UPDATE_CHECK=true` on every scan, so a cold CPE cache
-  without network access or a skipped grype DB update fails the scan instead
-  of producing partial findings. It is off by default; enable it when a green
+  passes `--require-cpe-dictionary` to vulnxscan and makes grype database
+  update checks fatal when attempted (`GRYPE_DB_AUTO_UPDATE=true`,
+  `GRYPE_DB_REQUIRE_UPDATE_CHECK=true`). Grype rate-limits update checks
+  (default: one per 2h), so scans after the action's grype DB update step
+  skip the check and reuse its result; a scan whose own check runs and
+  fails — or a cold CPE cache without network access — fails instead of
+  producing partial findings. It is off by default; enable it when a green
   run must never rest on degraded scanner data.
 
 ### Caches and report output

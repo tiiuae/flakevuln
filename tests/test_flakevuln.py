@@ -3368,7 +3368,48 @@ def test_read_scan_results_strict_scanner_fails_closed(monkeypatch, tmp_path):
     scanner._read_scan_results(["vulnxscan"], "t", PIN_CURRENT)
 
     assert "--require-cpe-dictionary" in captured["cmd"]
-    assert captured["evars"] == {"GRYPE_DB_REQUIRE_UPDATE_CHECK": "true"}
+    assert captured["evars"] == {
+        "GRYPE_DB_AUTO_UPDATE": "true",
+        "GRYPE_DB_REQUIRE_UPDATE_CHECK": "true",
+    }
+
+
+def _failing_vulnxscan(*_args, **_kwargs):
+    class _Ret:
+        returncode = 7
+        stdout = ""
+        stderr = "scanner failed"
+
+    return _Ret()
+
+
+def test_read_scan_results_strict_scanner_exits_on_scanner_error(monkeypatch, tmp_path):
+    """Strict mode fails the scan instead of recording partial findings."""
+    scanner = _make_scanner(tmp_path)
+    scanner.strict_scanner = True
+    monkeypatch.setattr(
+        scanner, "_evaluate_target_drv", lambda *_a, **_k: "/nix/store/x.drv"
+    )
+    monkeypatch.setattr(flakevuln_main, "exec_cmd", _failing_vulnxscan)
+
+    with pytest.raises(SystemExit) as excinfo:
+        scanner._read_scan_results(["vulnxscan"], "t", PIN_CURRENT)
+
+    assert excinfo.value.code == 7
+    assert scanner.errors
+
+
+def test_read_scan_results_non_strict_records_scanner_error(monkeypatch, tmp_path):
+    """Default mode records the scanner failure and continues."""
+    scanner = _make_scanner(tmp_path)
+    monkeypatch.setattr(
+        scanner, "_evaluate_target_drv", lambda *_a, **_k: "/nix/store/x.drv"
+    )
+    monkeypatch.setattr(flakevuln_main, "exec_cmd", _failing_vulnxscan)
+
+    scanner._read_scan_results(["vulnxscan"], "t", PIN_CURRENT)
+
+    assert scanner.errors
 
 
 def test_read_scan_results_logs_scan_timing(monkeypatch, tmp_path, caplog):
