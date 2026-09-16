@@ -53,6 +53,7 @@ def make_scanner(tmp_path, flakeref="github:example/flake", unstable_ref=""):
     scanner.scope_targets = []
     scanner.scanned_targets = []
     scanner.completed_scans = set()
+    scanner.triage_unavailable_scans = set()
     scanner.tmpdir = scanner_tmpdir
     scanner.lockfile = scanner_tmpdir / "flake.lock"
     scanner.lockfile_bak = scanner_tmpdir / "flake.lock.bak"

@@ -122,6 +122,7 @@ evidence report to agree:
 | active evidence findings, missing or invalid triage CSV | scan failure |
 | triage IDs or evidence fields disagree with active evidence | scan failure |
 | valid active evidence and matching triage CSV | successful scan |
+| matching fallback CSV with `triage_status: unavailable` | successful degraded scan; findings are retained and reports warn that Repology fields are blank |
 
 IDs are compared as *sets*: Repology can legitimately produce several triage
 rows for one finding. A failure in one pin state is recorded against that state
@@ -138,6 +139,7 @@ scan states from running.
   "vulnxscan_evidence_schema_version": 1,
   "evidence_included": true,
   "completed_scans": [],
+  "triage_unavailable_scans": [],
   "scan_rows": [],
   "evidence_findings": [],
   "component_evidence": [],
@@ -158,6 +160,13 @@ carry and logs a warning. That preserves their previous behavior, but it is a
 compatibility mode: it detects contradictions in the data that exists rather
 than proving no scan state was omitted, and it cannot recover a successful
 zero-finding scan state that the old file format had no way to express.
+
+`triage_unavailable_scans` holds the same triples for successful scans whose
+vulnxscan sidecar reported `triage_status: unavailable`. Each entry must also
+appear in `completed_scans`. The trusted report phase uses this list to put a
+warning at the top of the Step Summary and published report without trusting
+free-form text from the scan phase. Older version-2 artifacts omit the field
+and load with no degraded scan markers.
 
 `evidence_findings` holds vulnxscan's evidence findings, including the fully
 suppressed ones that are absent from `scan_rows`; `component_evidence` holds
@@ -198,8 +207,9 @@ sidecar, and 256 MiB per findings file.
 
 ## Imported vulnxscan contract
 
-Evidence sidecar `schema_version: 1`. `flakevuln` imports `findings` and
-`components`; raw scanner `observations` stay in vulnxscan's own output.
+Evidence sidecar `schema_version: 1`. `flakevuln` imports `findings`,
+`components`, and the optional `triage_status: unavailable` marker; raw scanner
+`observations` stay in vulnxscan's own output.
 
 Finding fields: `finding_id`, `vuln_id`, `package`, `version`, `severity`,
 `scanners`, `url`, `sortcol`, `evidence_scope`, `patch_state`,
