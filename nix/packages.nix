@@ -64,7 +64,10 @@
           dependencies = build_inputs;
           pythonImportsCheck = [ "flakevuln" ];
           makeWrapperArgs = [
-            "--prefix PATH : ${lib.makeBinPath runtime_inputs}"
+            "--prefix"
+            "PATH"
+            ":"
+            (lib.makeBinPath runtime_inputs)
           ];
         };
       };
