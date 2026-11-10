@@ -23,12 +23,14 @@ TARGET = "packages.x86_64-linux.default"
 # note points readers at "Component Evidence" by name, so splitting a report on
 # the short string would cut it at the pointer instead of at the section.
 COMPONENT_EVIDENCE_HEADING = "Patched and Partially Patched Findings (press to expand)"
-VALID_SARIF = json.dumps(
-    {
-        "version": "2.1.0",
-        "runs": [{"tool": {"driver": {"name": "vulnxscan"}}, "results": []}],
-    }
-)
+
+
+def _sarif_scanner(tmp_path):
+    scanner = tu.make_scanner(tmp_path)
+    scanner.evidence_included = True
+    scanner.sarif_out = tmp_path / "vulns.sarif"
+    scanner.sarif_location = "flake.nix"
+    return scanner
 
 
 def _run_scan(
@@ -56,13 +58,13 @@ def _run_scan(
     return scanner
 
 
-def _scanner_with(monkeypatch, tmp_path, findings, components, triage_rows):
+def _scanner_with(monkeypatch, tmp_path, findings, components, report_rows):
     """Return a scanner that completed one current scan with given evidence."""
     scanner = _run_scan(
         monkeypatch,
         tmp_path,
         document=tu.evidence_document(findings, components),
-        triage_rows=triage_rows,
+        report_rows=report_rows,
     )
     scanner._set_comparison_skipped(
         PIN_LOCK_UPDATED, "test fixture scanned only the current pin"
@@ -126,7 +128,7 @@ def test_buildtime_scan_records_available_package_inventory(
         pintype=pintype,
         buildtime=True,
         document=tu.evidence_document([finding], [component]),
-        triage_rows=[tu.triage_row(finding)],
+        report_rows=[tu.report_row(finding)],
     )
 
     assert getattr(scanner, field) == (
@@ -191,11 +193,7 @@ def test_unavailable_triage_status_is_the_only_supported_marker(tmp_path):
     path = tmp_path / "evidence.json"
     path.write_text(json.dumps(document), encoding="utf-8")
 
-    assert evidence.load_sidecar(path) == (
-        [],
-        [],
-        evidence.TRIAGE_STATUS_UNAVAILABLE,
-    )
+    assert evidence.load_sidecar(path) == document
 
     document[evidence.TRIAGE_STATUS] = "partial"
     with pytest.raises(evidence.EvidenceError, match="triage_status"):
@@ -457,14 +455,21 @@ def test_sidecar_ingestion_limits_fail_instead_of_truncating(monkeypatch, tmp_pa
 # --- scan outcome matrix ---------------------------------------------------
 
 
-def test_scan_without_findings_is_a_clean_success(monkeypatch, tmp_path):
-    """Zero exit, empty evidence, no triage output: a clean scan."""
+@pytest.mark.parametrize("sarif", [False, True])
+def test_scan_without_findings_is_a_clean_success(monkeypatch, tmp_path, sarif):
+    """Zero exit, empty evidence, no CSV output: a clean scan."""
     scanner = _run_scan(
-        monkeypatch, tmp_path, document=tu.evidence_document(), triage_rows=None
+        monkeypatch,
+        tmp_path,
+        scanner=_sarif_scanner(tmp_path) if sarif else None,
+        document=tu.evidence_document(),
+        report_rows=None,
     )
     assert not _has_error(scanner)
     assert scanner.df_scan.empty
     assert scanner.evidence_findings == []
+    if sarif:
+        assert json.loads(scanner.sarif_out.read_text())["runs"][0]["results"] == []
 
 
 def test_failed_scan_is_reported_separately_from_a_clean_scan(monkeypatch, tmp_path):
@@ -482,8 +487,8 @@ def test_failed_scan_is_reported_separately_from_a_clean_scan(monkeypatch, tmp_p
 @pytest.mark.parametrize(
     ("name", "fake"),
     [
-        ("missing evidence", {"document": None, "triage_rows": None}),
-        ("malformed evidence", {"evidence_text": "{not json", "triage_rows": None}),
+        ("missing evidence", {"document": None, "report_rows": None}),
+        ("malformed evidence", {"evidence_text": "{not json", "report_rows": None}),
         (
             "unsupported evidence schema",
             {"document": tu.evidence_document([], [], schema_version=99)},
@@ -498,61 +503,66 @@ def test_unusable_evidence_fails_the_scan(monkeypatch, tmp_path, name, fake):
     assert scanner.evidence_findings == []
 
 
-def test_missing_evidence_fails_even_when_triage_exists(monkeypatch, tmp_path):
+def test_missing_evidence_fails_even_when_csv_exists(monkeypatch, tmp_path):
     """The evidence report is validated before the aggregate output is used."""
     finding = tu.evidence_finding()
     scanner = _run_scan(
         monkeypatch,
         tmp_path,
         document=None,
-        triage_rows=[tu.triage_row(finding)],
+        report_rows=[tu.report_row(finding)],
     )
     assert _has_error(scanner)
     assert scanner.df_scan.empty
 
 
-def test_suppressed_only_scan_succeeds_without_triage_output(monkeypatch, tmp_path):
-    """Fully patch-suppressed findings leave no triage rows, and that is fine."""
+@pytest.mark.parametrize("sarif", [False, True])
+def test_suppressed_only_scan_succeeds_without_csv_output(monkeypatch, tmp_path, sarif):
+    """Fully patch-suppressed findings leave no CSV rows, and that is fine."""
     finding, component = tu.matched_finding()
     scanner = _run_scan(
         monkeypatch,
         tmp_path,
+        scanner=_sarif_scanner(tmp_path) if sarif else None,
         document=tu.evidence_document([finding], [component]),
-        triage_rows=None,
+        report_rows=None,
     )
     assert not _has_error(scanner)
     assert scanner.df_scan.empty
     assert len(scanner.evidence_findings) == 1
     assert scanner.evidence_findings[0][evidence.SUPPRESSED] is True
 
+    if sarif:
+        assert json.loads(scanner.sarif_out.read_text())["runs"][0]["results"] == []
 
-def test_active_evidence_without_triage_rows_fails(monkeypatch, tmp_path):
+
+def test_active_evidence_without_report_rows_fails(monkeypatch, tmp_path):
     finding = tu.evidence_finding()
     component = tu.evidence_component(finding)
     scanner = _run_scan(
         monkeypatch,
         tmp_path,
         document=tu.evidence_document([finding], [component]),
-        triage_rows=None,
+        report_rows=None,
     )
     assert _has_error(scanner)
     assert scanner.evidence_findings == []
 
 
-def test_triage_rows_without_active_evidence_fail(monkeypatch, tmp_path):
-    """A triage row nobody can explain is an inconsistency, not a finding."""
+def test_report_rows_without_active_evidence_fail(monkeypatch, tmp_path):
+    """A CSV row nobody can explain is an inconsistency, not a finding."""
     finding = tu.evidence_finding()
     scanner = _run_scan(
         monkeypatch,
         tmp_path,
         document=tu.evidence_document(),
-        triage_rows=[tu.triage_row(finding)],
+        report_rows=[tu.report_row(finding)],
     )
     assert _has_error(scanner)
     assert scanner.df_scan.empty
 
 
-def test_triage_and_evidence_id_mismatch_fails(monkeypatch, tmp_path):
+def test_csv_and_evidence_id_mismatch_fails(monkeypatch, tmp_path):
     finding = tu.evidence_finding()
     component = tu.evidence_component(finding)
     other = tu.evidence_finding("CVE-2026-2")
@@ -560,13 +570,13 @@ def test_triage_and_evidence_id_mismatch_fails(monkeypatch, tmp_path):
         monkeypatch,
         tmp_path,
         document=tu.evidence_document([finding], [component]),
-        triage_rows=[tu.triage_row(other)],
+        report_rows=[tu.report_row(other)],
     )
     assert _has_error(scanner)
     assert scanner.df_scan.empty
 
 
-def test_malformed_triage_csv_fails(monkeypatch, tmp_path):
+def test_malformed_findings_csv_fails(monkeypatch, tmp_path):
     finding = tu.evidence_finding()
     component = tu.evidence_component(finding)
     document = tu.evidence_document([finding], [component])
@@ -577,7 +587,7 @@ def test_malformed_triage_csv_fails(monkeypatch, tmp_path):
         flakevuln_main.Path(evidence_out).write_text(
             json.dumps(document), encoding="utf-8"
         )
-        tu.triage_path(out).write_text("", encoding="utf-8")
+        Path(out).write_text("", encoding="utf-8")
         return flakevuln_main.subprocess.CompletedProcess([], 0, "", "")
 
     scanner = tu.make_scanner(tmp_path)
@@ -591,138 +601,120 @@ def test_malformed_triage_csv_fails(monkeypatch, tmp_path):
     assert _has_error(scanner)
 
 
-def test_unavailable_triage_keeps_native_sarif(monkeypatch, tmp_path):
-    finding = tu.evidence_finding()
-    component = tu.evidence_component(finding)
-    scanner = tu.make_scanner(tmp_path)
-    scanner.evidence_included = True
-    scanner.sarif_out = tmp_path / "vulns.sarif"
-    scanner.sarif_location = "flake.nix"
-    captured = []
-    fake = tu.fake_vulnxscan(
-        document=tu.evidence_document(
-            [finding],
-            [component],
-            triage_status=evidence.TRIAGE_STATUS_UNAVAILABLE,
-        ),
-        triage_rows=[tu.triage_row(finding)],
-    )
-
-    monkeypatch.setattr(
-        scanner, "_evaluate_target_drv", lambda *_a, **_k: "/nix/store/x.drv"
-    )
-
-    def _fake(cmd, *args, **kwargs):
-        captured.extend(cmd)
-        result = fake(cmd, *args, **kwargs)
-        Path(tu.arg_value(cmd, "--out=")).write_text(VALID_SARIF, encoding="utf-8")
-        return result
-
-    monkeypatch.setattr(flakevuln_main, "exec_cmd", _fake)
-
-    scanner._read_scan_results(["vulnxscan"], TARGET, PIN_CURRENT)
-
-    assert "--format=sarif" in captured
-    assert "--sarif-location=flake.nix" in captured
-    assert f"--out={scanner.sarif_out}" in captured
-    assert scanner.sarif_out.read_text(encoding="utf-8") == VALID_SARIF
-    assert not _has_error(scanner)
-    assert (scanner.scope_flakeref, TARGET, PIN_CURRENT) in scanner.completed_scans
-    assert scanner.triage_unavailable_scans == {
-        (scanner.scope_flakeref, TARGET, PIN_CURRENT)
-    }
-
-
 def test_current_sarif_scan_fails_on_scanner_error(monkeypatch, tmp_path):
-    scanner = tu.make_scanner(tmp_path)
-    scanner.sarif_out = tmp_path / "vulns.sarif"
-    scanner.sarif_location = "flake.nix"
-    monkeypatch.setattr(
-        scanner, "_evaluate_target_drv", lambda *_a, **_k: "/nix/store/x.drv"
-    )
-    fake = tu.fake_vulnxscan(returncode=7, stderr="scanner failed")
-
-    def _fake(cmd, *args, **kwargs):
-        Path(tu.arg_value(cmd, "--out=")).write_text(VALID_SARIF, encoding="utf-8")
-        return fake(cmd, *args, **kwargs)
-
-    monkeypatch.setattr(flakevuln_main, "exec_cmd", _fake)
-
-    with pytest.raises(SystemExit) as excinfo:
-        scanner._read_scan_results(["vulnxscan"], TARGET, PIN_CURRENT)
-
-    assert excinfo.value.code == 7
+    scanner = _sarif_scanner(tmp_path)
+    scanner.sarif_out.write_text("stale SARIF")
+    with pytest.raises(SystemExit) as error:
+        _run_scan(
+            monkeypatch,
+            tmp_path,
+            scanner=scanner,
+            returncode=7,
+            stderr="scanner failed",
+        )
+    assert error.value.code == 7
     assert _has_error(scanner)
     assert not scanner.sarif_out.exists()
+
+
+def test_failed_sarif_evaluation_discards_stale_output(monkeypatch, tmp_path):
+    scanner = _sarif_scanner(tmp_path)
+    scanner.sarif_out.write_text("stale SARIF")
+    monkeypatch.setattr(scanner, "_evaluate_target_drv", lambda *_a, **_k: None)
+    with pytest.raises(SystemExit) as error:
+        scanner._read_scan_results(["vulnxscan"], TARGET, PIN_CURRENT)
+    assert error.value.code == 1
+    assert not scanner.sarif_out.exists()
+
+
+def test_native_sarif_keeps_metadata_and_filters_whitelist_and_patches(
+    monkeypatch, tmp_path
+):
+    """Export validated ordinary CSV without losing raw scanner fix metadata."""
+    active = tu.evidence_finding("CVE-2026-1001")
+    whitelisted = tu.evidence_finding("CVE-2026-1002")
+    patched, patched_component = tu.matched_finding("CVE-2026-1003")
+    document = tu.evidence_document(
+        [active, whitelisted, patched],
+        [
+            tu.evidence_component(active),
+            tu.evidence_component(whitelisted),
+            patched_component,
+        ],
+        observations=[
+            {
+                "vuln_id": active["vuln_id"],
+                "package": active["package"],
+                "version": active["version"],
+                "fix_versions": "1.1, 1.2",
+            }
+        ],
+    )
+    scanner = _run_scan(
+        monkeypatch,
+        tmp_path,
+        scanner=_sarif_scanner(tmp_path),
+        document=document,
+        report_rows=[
+            tu.report_row(active),
+            tu.report_row(whitelisted, whitelist="True"),
+        ],
+    )
+    assert not _has_error(scanner)
+    assert len(scanner.df_scan) == 2
+    assert len(scanner.evidence_findings) == 3
+    assert not scanner.triage_unavailable_scans
+    assert "version_nixpkgs" not in scanner.df_scan
+    run = json.loads(scanner.sarif_out.read_text())["runs"][0]
+    assert [result["ruleId"] for result in run["results"]] == [active["vuln_id"]]
+    result = run["results"][0]
+    assert result["properties"]["fixVersions"] == ["1.1", "1.2"]
+    assert (
+        result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+        == "flake.nix"
+    )
+
+
+def test_native_sarif_export_failure_discards_partial_output(monkeypatch, tmp_path):
+    scanner = _sarif_scanner(tmp_path)
+    scanner.sarif_out.write_text("stale SARIF")
+
+    def fail_write(_document, path):
+        path.write_text("partial SARIF")
+        raise OSError("output unavailable")
+
+    monkeypatch.setattr("vulnxscan.sarif.write_sarif", fail_write)
+    with pytest.raises(SystemExit) as error:
+        _run_scan(
+            monkeypatch, tmp_path, scanner=scanner, document=tu.evidence_document()
+        )
+    assert error.value.code == 1
+    assert _has_error(scanner)
+    assert not scanner.sarif_out.exists()
+    assert not scanner.completed_scans
 
 
 def test_current_sarif_scan_discards_output_when_evidence_is_missing(
     monkeypatch, tmp_path
 ):
-    scanner = tu.make_scanner(tmp_path)
-    scanner.sarif_out = tmp_path / "vulns.sarif"
-    scanner.sarif_location = "flake.nix"
-    monkeypatch.setattr(
-        scanner, "_evaluate_target_drv", lambda *_a, **_k: "/nix/store/x.drv"
-    )
-    fake = tu.fake_vulnxscan(document=None)
-
-    def _fake(cmd, *args, **kwargs):
-        result = fake(cmd, *args, **kwargs)
-        Path(tu.arg_value(cmd, "--out=")).write_text(VALID_SARIF, encoding="utf-8")
-        return result
-
-    monkeypatch.setattr(flakevuln_main, "exec_cmd", _fake)
-
-    scanner._read_scan_results(["vulnxscan"], TARGET, PIN_CURRENT)
-
+    scanner = _sarif_scanner(tmp_path)
+    scanner.sarif_out.write_text("stale SARIF")
+    _run_scan(monkeypatch, tmp_path, scanner=scanner, document=None)
     assert _has_error(scanner)
     assert not scanner.sarif_out.exists()
 
 
-@pytest.mark.parametrize(
-    "sarif_text",
-    [None, ""],
-    ids=["missing", "empty"],
-)
-def test_current_sarif_scan_rejects_missing_or_empty_output(
-    monkeypatch, tmp_path, sarif_text
-):
-    scanner = tu.make_scanner(tmp_path)
-    scanner.sarif_out = tmp_path / "vulns.sarif"
-    scanner.sarif_location = "flake.nix"
-    monkeypatch.setattr(
-        scanner, "_evaluate_target_drv", lambda *_a, **_k: "/nix/store/x.drv"
-    )
-    fake = tu.fake_vulnxscan()
-
-    def _fake(cmd, *args, **kwargs):
-        result = fake(cmd, *args, **kwargs)
-        if sarif_text is not None:
-            Path(tu.arg_value(cmd, "--out=")).write_text(sarif_text, encoding="utf-8")
-        return result
-
-    monkeypatch.setattr(flakevuln_main, "exec_cmd", _fake)
-
-    with pytest.raises(SystemExit) as excinfo:
-        scanner._read_scan_results(["vulnxscan"], TARGET, PIN_CURRENT)
-
-    assert excinfo.value.code == 1
-    assert _has_error(scanner)
-    assert not scanner.sarif_out.exists()
-
-
-def test_triage_csv_without_finding_id_column_fails(monkeypatch, tmp_path):
+def test_findings_csv_without_finding_id_column_fails(monkeypatch, tmp_path):
     """An aggregate row that cannot be joined to evidence is not accepted."""
     finding = tu.evidence_finding()
     component = tu.evidence_component(finding)
-    row = tu.triage_row(finding)
+    row = tu.report_row(finding)
     del row["finding_id"]
     scanner = _run_scan(
         monkeypatch,
         tmp_path,
         document=tu.evidence_document([finding], [component]),
-        triage_rows=[row],
+        report_rows=[row],
     )
     assert _has_error(scanner)
 
@@ -735,17 +727,17 @@ def test_triage_csv_without_finding_id_column_fails(monkeypatch, tmp_path):
         evidence.MATCH_COUNT,
     ],
 )
-def test_triage_csv_missing_evidence_column_fails(monkeypatch, tmp_path, field):
+def test_findings_csv_missing_evidence_column_fails(monkeypatch, tmp_path, field):
     """The aggregate row must carry the evidence fields it renders."""
     finding = tu.evidence_finding()
     component = tu.evidence_component(finding)
-    row = tu.triage_row(finding)
+    row = tu.report_row(finding)
     del row[field]
     scanner = _run_scan(
         monkeypatch,
         tmp_path,
         document=tu.evidence_document([finding], [component]),
-        triage_rows=[row],
+        report_rows=[row],
     )
     error = scanner._read_error(scanner.flakeref, TARGET, [PIN_CURRENT])
     assert error is not None
@@ -760,7 +752,7 @@ def test_triage_csv_missing_evidence_column_fails(monkeypatch, tmp_path, field):
         (evidence.MATCH_COUNT, "9"),
     ],
 )
-def test_triage_csv_evidence_values_must_match_sidecar(
+def test_findings_csv_evidence_values_must_match_sidecar(
     monkeypatch, tmp_path, field, value
 ):
     """A matching finding_id cannot bless contradictory aggregate evidence."""
@@ -770,7 +762,7 @@ def test_triage_csv_evidence_values_must_match_sidecar(
         monkeypatch,
         tmp_path,
         document=tu.evidence_document([finding], [component]),
-        triage_rows=[tu.triage_row(finding, **{field: value})],
+        report_rows=[tu.report_row(finding, **{field: value})],
     )
     error = scanner._read_error(scanner.flakeref, TARGET, [PIN_CURRENT])
     assert error is not None
@@ -778,23 +770,19 @@ def test_triage_csv_evidence_values_must_match_sidecar(
     assert scanner.df_scan.empty
 
 
-def test_repology_duplicate_triage_rows_are_accepted(monkeypatch, tmp_path):
-    """Repology can emit several rows per finding; IDs are compared as sets."""
+def test_duplicate_findings_rows_are_rejected(monkeypatch, tmp_path):
+    """The ordinary CSV must have exactly one row per active finding."""
     finding = tu.evidence_finding()
     component = tu.evidence_component(finding)
-    rows = [
-        tu.triage_row(finding, version_nixpkgs="1.1"),
-        tu.triage_row(finding, version_nixpkgs="1.2"),
-    ]
     scanner = _run_scan(
         monkeypatch,
         tmp_path,
         document=tu.evidence_document([finding], [component]),
-        triage_rows=rows,
+        report_rows=[tu.report_row(finding), tu.report_row(finding)],
     )
-    assert not _has_error(scanner)
-    assert len(scanner.df_scan) == 2
-    assert len(scanner.evidence_findings) == 1
+    assert _has_error(scanner)
+    assert scanner.df_scan.empty
+    assert not scanner.evidence_findings
 
 
 def test_scan_failure_does_not_block_other_scan_states(monkeypatch, tmp_path):
@@ -812,7 +800,7 @@ def test_scan_failure_does_not_block_other_scan_states(monkeypatch, tmp_path):
         scanner=scanner,
         pintype=PIN_LOCK_UPDATED,
         document=tu.evidence_document([finding], [component]),
-        triage_rows=[tu.triage_row(finding)],
+        report_rows=[tu.report_row(finding)],
     )
 
     assert _has_error(scanner, PIN_CURRENT)
@@ -834,7 +822,7 @@ def test_evidence_is_annotated_per_scan_state(monkeypatch, tmp_path):
             scanner=scanner,
             pintype=pintype,
             document=tu.evidence_document([finding], [component]),
-            triage_rows=[tu.triage_row(finding)],
+            report_rows=[tu.report_row(finding)],
         )
 
     keys = [evidence.scan_key(row) for row in scanner.evidence_findings]
@@ -856,7 +844,7 @@ def test_version_2_findings_round_trip(monkeypatch, tmp_path):
     """Evidence survives write/read with its JSON arrays intact."""
     finding, components = tu.mixed_finding()
     scanner = _scanner_with(
-        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+        monkeypatch, tmp_path, [finding], components, [tu.report_row(finding)]
     )
     findings_file = tmp_path / "findings.json"
     scanner.write_findings(findings_file)
@@ -878,7 +866,7 @@ def test_version_2_findings_round_trip(monkeypatch, tmp_path):
     ]
 
 
-def test_unavailable_triage_round_trips_and_warns_in_reports(monkeypatch, tmp_path):
+def test_historical_triage_warning_round_trips_in_reports(monkeypatch, tmp_path):
     finding = tu.evidence_finding()
     component = tu.evidence_component(finding)
     scanner = _run_scan(
@@ -889,11 +877,14 @@ def test_unavailable_triage_round_trips_and_warns_in_reports(monkeypatch, tmp_pa
             [component],
             triage_status=evidence.TRIAGE_STATUS_UNAVAILABLE,
         ),
-        triage_rows=[tu.triage_row(finding)],
+        report_rows=[tu.report_row(finding)],
     )
     scanner._set_comparison_skipped(
         PIN_LOCK_UPDATED, "test fixture scanned only the current pin"
     )
+    assert scanner._triage_notes() == []
+    # Historical findings retain their recorded degraded-triage warning.
+    scanner.triage_unavailable_scans.add((scanner.scope_flakeref, TARGET, PIN_CURRENT))
     findings_file = tmp_path / "findings.json"
     summary = tmp_path / "summary.md"
     report_dir = tmp_path / "report"
@@ -946,7 +937,7 @@ def _findings_payload(monkeypatch, tmp_path):
     """Return a written v2 findings payload with one active finding."""
     finding, components = tu.mixed_finding()
     scanner = _scanner_with(
-        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+        monkeypatch, tmp_path, [finding], components, [tu.report_row(finding)]
     )
     path = tmp_path / "findings.json"
     scanner.write_findings(path)
@@ -1064,7 +1055,7 @@ def test_evidence_for_an_unscanned_target_is_rejected(monkeypatch, tmp_path):
         tmp_path,
         [suppressed, active],
         [suppressed_component, *active_components],
-        [tu.triage_row(active)],
+        [tu.report_row(active)],
     )
     path = tmp_path / "findings.json"
     scanner.write_findings(path)
@@ -1180,7 +1171,7 @@ def test_disabled_comparison_never_reports_findings_as_fixed(monkeypatch, tmp_pa
     """
     finding, components = tu.mixed_finding()
     scanner = _scanner_with(
-        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+        monkeypatch, tmp_path, [finding], components, [tu.report_row(finding)]
     )
     scanner.comparison_state = {
         PIN_LOCK_UPDATED: {"show": False, "skip_reason": ""},
@@ -1208,7 +1199,7 @@ def test_shown_comparison_that_states_a_skip_reason_is_disabled(monkeypatch, tmp
     """
     finding, components = tu.mixed_finding()
     scanner = _scanner_with(
-        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+        monkeypatch, tmp_path, [finding], components, [tu.report_row(finding)]
     )
     scanner.comparison_state = scanner._normalize_comparison_state(
         {
@@ -1246,7 +1237,7 @@ def test_failure_on_a_row_only_target_counts_as_a_failure(monkeypatch, tmp_path)
         scanner=scanner,
         pintype=PIN_LOCK_UPDATED,
         document=tu.evidence_document([finding], components),
-        triage_rows=[tu.triage_row(finding)],
+        report_rows=[tu.report_row(finding)],
     )
     path = tmp_path / "findings.json"
     scanner.write_findings(path)
@@ -1356,7 +1347,7 @@ def test_evidence_included_requires_complete_evidence(monkeypatch, tmp_path):
     finding = tu.evidence_finding()
     component = tu.evidence_component(finding)
     scanner = _scanner_with(
-        monkeypatch, tmp_path, [finding], [component], [tu.triage_row(finding)]
+        monkeypatch, tmp_path, [finding], [component], [tu.report_row(finding)]
     )
     data = scanner._findings_data()
     data["evidence_findings"] = []
@@ -1369,7 +1360,7 @@ def test_evidence_included_false_requires_empty_evidence(monkeypatch, tmp_path):
     finding = tu.evidence_finding()
     component = tu.evidence_component(finding)
     scanner = _scanner_with(
-        monkeypatch, tmp_path, [finding], [component], [tu.triage_row(finding)]
+        monkeypatch, tmp_path, [finding], [component], [tu.report_row(finding)]
     )
     data = scanner._findings_data()
     data["evidence_included"] = False
@@ -1381,7 +1372,7 @@ def test_compact_baseline_omits_evidence_but_keeps_scan_rows(monkeypatch, tmp_pa
     """The rolling cache stays aggregate-only and remains renderable."""
     finding, components = tu.mixed_finding()
     scanner = _scanner_with(
-        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+        monkeypatch, tmp_path, [finding], components, [tu.report_row(finding)]
     )
     published = tmp_path / "findings.json"
     baseline = tmp_path / "cache" / "findings.json"
@@ -1459,7 +1450,7 @@ def test_flake_input_prefers_exact_nested_nixpkgs_match(monkeypatch, tmp_path):
 
     components, rows = scanner._annotate_flake_inputs(
         [component],
-        pd.DataFrame([tu.triage_row(finding)]),
+        pd.DataFrame([tu.report_row(finding)]),
     )
 
     assert components[0]["flake_input_paths"] == ["sbomnix/nixpkgs"]
@@ -1518,7 +1509,7 @@ def test_flake_input_scopes_unique_matches_and_retains_equivalent_fallbacks(
 
     components, _rows = scanner._annotate_flake_inputs(
         [component],
-        pd.DataFrame([tu.triage_row(finding)]),
+        pd.DataFrame([tu.report_row(finding)]),
         target="nixosConfigurations.builder.config.system.build.toplevel",
         target_drv="/nix/store/system.drv",
     )
@@ -1587,7 +1578,7 @@ def test_flake_input_probes_fallback_only_when_needed(
 
     components, _rows = scanner._annotate_flake_inputs(
         [component],
-        pd.DataFrame([tu.triage_row(finding)]),
+        pd.DataFrame([tu.report_row(finding)]),
         target=TARGET,
         target_drv="/nix/store/system.drv",
     )
@@ -1920,7 +1911,7 @@ def test_flake_input_strips_untrusted_sidecar_fields(monkeypatch, tmp_path):
 
     components, rows = scanner._annotate_flake_inputs(
         [component],
-        pd.DataFrame([tu.triage_row(finding)]),
+        pd.DataFrame([tu.report_row(finding)]),
     )
 
     assert not any(key.startswith("flake_input_") for key in components[0])
@@ -1961,7 +1952,7 @@ def test_flake_input_aggregate_tracks_unresolved_components(monkeypatch, tmp_pat
 
     components, rows = scanner._annotate_flake_inputs(
         [matched, unresolved],
-        pd.DataFrame([tu.triage_row(finding)]),
+        pd.DataFrame([tu.report_row(finding)]),
     )
 
     assert components[0]["flake_input_confidence"] == "exact"
@@ -2053,7 +2044,7 @@ def test_mixed_evidence_lists_both_derivations_in_the_diagnostics(
     """A finding whose derivations disagree is the case worth reading."""
     finding, components = tu.mixed_finding()
     scanner = _scanner_with(
-        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+        monkeypatch, tmp_path, [finding], components, [tu.report_row(finding)]
     )
     report = _render(scanner, tmp_path)
     diagnostics = report.split(COMPONENT_EVIDENCE_HEADING)[1]
@@ -2072,7 +2063,7 @@ def test_active_tables_carry_no_per_finding_evidence_column(monkeypatch, tmp_pat
     """
     finding, components = tu.mixed_finding()
     scanner = _scanner_with(
-        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+        monkeypatch, tmp_path, [finding], components, [tu.report_row(finding)]
     )
     report = _render(scanner, tmp_path)
     current_section = report.split(COMPONENT_EVIDENCE_HEADING)[0]
@@ -2093,7 +2084,7 @@ def test_suppressed_findings_appear_only_in_component_diagnostics(
         tmp_path,
         [finding, active],
         [component, active_component],
-        [tu.triage_row(active)],
+        [tu.report_row(active)],
     )
     report = _render(scanner, tmp_path)
     current_section = report.split(COMPONENT_EVIDENCE_HEADING)[0]
@@ -2115,21 +2106,21 @@ def test_bulk_no_match_findings_are_excluded_from_the_diagnostics(
     """
     findings = []
     components = []
-    triage_rows = []
+    report_rows = []
     for index in range(30):
         finding = tu.evidence_finding(f"CVE-2026-1{index:03d}")
         findings.append(finding)
         components.append(tu.evidence_component(finding))
-        triage_rows.append(tu.triage_row(finding))
+        report_rows.append(tu.report_row(finding))
     suppressed, suppressed_component = tu.matched_finding("CVE-2026-9999")
     findings.append(suppressed)
     components.append(suppressed_component)
     mixed, mixed_components = tu.mixed_finding("CVE-2026-5555")
     findings.append(mixed)
     components.extend(mixed_components)
-    triage_rows.append(tu.triage_row(mixed))
+    report_rows.append(tu.report_row(mixed))
 
-    scanner = _scanner_with(monkeypatch, tmp_path, findings, components, triage_rows)
+    scanner = _scanner_with(monkeypatch, tmp_path, findings, components, report_rows)
     report = _render(scanner, tmp_path)
     diagnostics = report.split(COMPONENT_EVIDENCE_HEADING)[1]
 
@@ -2159,7 +2150,7 @@ def test_suppressed_findings_are_accounted_for_in_the_active_section(
         tmp_path,
         [suppressed, active],
         [suppressed_component, tu.evidence_component(active)],
-        [tu.triage_row(active)],
+        [tu.report_row(active)],
     )
     report = _render(scanner, tmp_path)
     current_section = report.split(COMPONENT_EVIDENCE_HEADING)[0]
@@ -2176,7 +2167,7 @@ def test_diagnostics_use_plain_language_not_schema_enums(monkeypatch, tmp_path):
     """A reader should never have to decode `no_vuln_id_patch_name_match`."""
     finding, components = tu.mixed_finding()
     scanner = _scanner_with(
-        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+        monkeypatch, tmp_path, [finding], components, [tu.report_row(finding)]
     )
     report = _render(scanner, tmp_path)
 
@@ -2198,7 +2189,7 @@ def test_diagnostics_link_the_vulnerability_and_omit_output_paths(
     finding, components = tu.mixed_finding()
     components[0]["output_paths"] = ["/nix/store/eee-pkg-1.0-out"]
     scanner = _scanner_with(
-        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+        monkeypatch, tmp_path, [finding], components, [tu.report_row(finding)]
     )
     report = _render(scanner, tmp_path)
     diagnostics = report.split(COMPONENT_EVIDENCE_HEADING)[1]
@@ -2241,7 +2232,7 @@ def test_partially_patched_findings_are_marked(monkeypatch, tmp_path):
     """The active tables point at the evidence for the ambiguous findings."""
     finding, components = tu.mixed_finding()
     scanner = _scanner_with(
-        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+        monkeypatch, tmp_path, [finding], components, [tu.report_row(finding)]
     )
     report = _render(scanner, tmp_path)
     current_section, diagnostics = report.split(COMPONENT_EVIDENCE_HEADING)
@@ -2259,11 +2250,11 @@ def test_the_marker_is_separated_from_an_existing_comment(monkeypatch, tmp_path)
     """
     finding, components = tu.mixed_finding()
     scanner = _scanner_with(
-        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+        monkeypatch, tmp_path, [finding], components, [tu.report_row(finding)]
     )
     marks = scanner._evidence_marks(scanner.flakeref, TARGET)
     row = {
-        **tu.triage_row(finding, whitelist_comment="fixed downstream"),
+        **tu.report_row(finding, whitelist_comment="fixed downstream"),
         "pintype": PIN_CURRENT,
     }
 
@@ -2284,11 +2275,11 @@ def test_the_marker_does_not_double_existing_punctuation(
     """
     finding, components = tu.mixed_finding()
     scanner = _scanner_with(
-        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+        monkeypatch, tmp_path, [finding], components, [tu.report_row(finding)]
     )
     marks = scanner._evidence_marks(scanner.flakeref, TARGET)
     row = {
-        **tu.triage_row(finding, whitelist_comment=comment),
+        **tu.report_row(finding, whitelist_comment=comment),
         "pintype": PIN_CURRENT,
     }
 
@@ -2307,13 +2298,13 @@ def test_rows_from_another_run_are_not_marked(monkeypatch, tmp_path):
     """
     finding, components = tu.mixed_finding()
     scanner = _scanner_with(
-        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+        monkeypatch, tmp_path, [finding], components, [tu.report_row(finding)]
     )
     marks = scanner._evidence_marks(scanner.flakeref, TARGET)
     stale = pd.DataFrame(
         [
             {
-                **tu.triage_row(tu.evidence_finding("CVE-2026-404")),
+                **tu.report_row(tu.evidence_finding("CVE-2026-404")),
                 "pintype": PIN_CURRENT,
                 "patch_state": evidence.PATCH_STATE_MIXED,
                 "finding_id": "sha256:not-from-this-run",
@@ -2345,7 +2336,7 @@ def test_one_finding_is_marked_alike_in_every_pin_state(monkeypatch, tmp_path):
             scanner=scanner,
             pintype=pintype,
             document=tu.evidence_document([finding], components),
-            triage_rows=[tu.triage_row(finding, whitelist="True")],
+            report_rows=[tu.report_row(finding, whitelist="True")],
         )
     report = _render(scanner, tmp_path)
     whitelisted = report.split("<summary>Whitelisted")[1].split("</details>")[0]
@@ -2369,7 +2360,7 @@ def test_marker_count_covers_whitelisted_findings_too(monkeypatch, tmp_path):
         tmp_path,
         [listed, hidden],
         [*listed_components, *hidden_components],
-        [tu.triage_row(listed), tu.triage_row(hidden, whitelist="True")],
+        [tu.report_row(listed), tu.report_row(hidden, whitelist="True")],
     )
     report = _render(scanner, tmp_path)
     current_section = report.split(COMPONENT_EVIDENCE_HEADING)[0]
@@ -2392,7 +2383,7 @@ def test_no_marker_when_every_finding_is_a_plain_no_match(monkeypatch, tmp_path)
         tmp_path,
         [finding],
         [tu.evidence_component(finding)],
-        [tu.triage_row(finding)],
+        [tu.report_row(finding)],
     )
     report = _render(scanner, tmp_path)
 
@@ -2402,7 +2393,7 @@ def test_no_marker_when_every_finding_is_a_plain_no_match(monkeypatch, tmp_path)
 def test_no_suppression_note_when_nothing_was_suppressed(monkeypatch, tmp_path):
     finding, components = tu.mixed_finding()
     scanner = _scanner_with(
-        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+        monkeypatch, tmp_path, [finding], components, [tu.report_row(finding)]
     )
     report = _render(scanner, tmp_path)
 
@@ -2415,7 +2406,7 @@ def test_package_version_only_findings_stay_active_and_are_flagged(
     """Unresolvable component identity is ambiguous, so it stays visible."""
     finding, component = tu.package_version_only_finding()
     scanner = _scanner_with(
-        monkeypatch, tmp_path, [finding], [component], [tu.triage_row(finding)]
+        monkeypatch, tmp_path, [finding], [component], [tu.report_row(finding)]
     )
     report = _render(scanner, tmp_path)
     current_section, diagnostics = report.split(COMPONENT_EVIDENCE_HEADING)
@@ -2437,7 +2428,7 @@ def test_a_no_match_only_scan_renders_an_empty_diagnostics_section(
     finding = tu.evidence_finding()
     component = tu.evidence_component(finding)
     scanner = _scanner_with(
-        monkeypatch, tmp_path, [finding], [component], [tu.triage_row(finding)]
+        monkeypatch, tmp_path, [finding], [component], [tu.report_row(finding)]
     )
     report = _render(scanner, tmp_path)
     current_section, diagnostics = report.split(COMPONENT_EVIDENCE_HEADING)
@@ -2459,7 +2450,7 @@ def test_component_evidence_renders_untrusted_paths_inert(monkeypatch, tmp_path)
     components[0]["patches"] = [hostile_patch]
     components[0]["matching_patch_paths"] = [hostile_patch]
     scanner = _scanner_with(
-        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+        monkeypatch, tmp_path, [finding], components, [tu.report_row(finding)]
     )
     report = _render(scanner, tmp_path)
 
@@ -2483,7 +2474,7 @@ def test_evidence_paths_render_as_code_spans(monkeypatch, tmp_path):
     components[0]["patches"] = [patch]
     components[0]["matching_patch_paths"] = [patch]
     scanner = _scanner_with(
-        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+        monkeypatch, tmp_path, [finding], components, [tu.report_row(finding)]
     )
 
     report = _render(scanner, tmp_path)
@@ -2515,7 +2506,7 @@ def test_component_diagnostics_bounds_affect_rendering_only(monkeypatch, tmp_pat
     finding, components = tu.mixed_finding()
     components[1]["output_paths"] = [f"/nix/store/out-{i}" for i in range(7)]
     scanner = _scanner_with(
-        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+        monkeypatch, tmp_path, [finding], components, [tu.report_row(finding)]
     )
     monkeypatch.setattr(evidence, "MAX_RENDERED_COMPONENT_ROWS", 1)
     monkeypatch.setattr(evidence, "MAX_RENDERED_PATHS", 2)
@@ -2534,7 +2525,7 @@ def test_long_scalar_values_are_bounded_in_diagnostics(monkeypatch, tmp_path):
     finding, components = tu.mixed_finding()
     components[0]["drv_path"] = "/nix/store/" + "a" * 2000
     scanner = _scanner_with(
-        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+        monkeypatch, tmp_path, [finding], components, [tu.report_row(finding)]
     )
     report = _render(scanner, tmp_path)
     assert "a" * 2000 not in report
@@ -2546,7 +2537,7 @@ def test_step_summary_and_target_report_share_the_component_section(
 ):
     finding, components = tu.mixed_finding()
     scanner = _scanner_with(
-        monkeypatch, tmp_path, [finding], components, [tu.triage_row(finding)]
+        monkeypatch, tmp_path, [finding], components, [tu.report_row(finding)]
     )
     report = _render(scanner, tmp_path)
     summary = scanner.render_detailed_summary()
@@ -2559,7 +2550,7 @@ def test_step_summary_and_target_report_share_the_component_section(
 
 def test_component_diagnostics_are_scoped_to_the_current_scan(monkeypatch, tmp_path):
     """Diagnostics explain the current scan, not the comparison scans."""
-    # Suppressed findings carry no triage rows, so each scan below is a
+    # Suppressed findings carry no CSV rows, so each scan below is a
     # suppressed-only scan, a clean success with no active vulnerabilities.
     finding, component = tu.matched_finding()
     other, other_component = tu.matched_finding("CVE-2026-2")
@@ -2572,7 +2563,7 @@ def test_component_diagnostics_are_scoped_to_the_current_scan(monkeypatch, tmp_p
         tmp_path,
         scanner=scanner,
         document=tu.evidence_document([finding], [component]),
-        triage_rows=None,
+        report_rows=None,
     )
     _run_scan(
         monkeypatch,
@@ -2580,7 +2571,7 @@ def test_component_diagnostics_are_scoped_to_the_current_scan(monkeypatch, tmp_p
         scanner=scanner,
         pintype=PIN_LOCK_UPDATED,
         document=tu.evidence_document([other], [other_component]),
-        triage_rows=None,
+        report_rows=None,
     )
 
     rows = scanner._component_evidence_rows(scanner.flakeref, TARGET)

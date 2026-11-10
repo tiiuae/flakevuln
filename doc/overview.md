@@ -53,8 +53,9 @@ for more detail.
 [`vulnxscan`](https://github.com/tiiuae/sbomnix/blob/main/doc/vulnxscan.md) from
 [`sbomnix`](https://github.com/tiiuae/sbomnix) for the underlying analysis.
 `vulnxscan` derives Nix-aware software-bill-of-materials data and combines
-results from Vulnix, Grype, and OSV. Repology supplies upstream-version
-information used during triage.
+results from Vulnix, Grype, and OSV. Scans consume ordinary CSV and component
+evidence JSON without Repology lookups. Version comparisons come from the
+evaluated dependency states.
 
 Coverage is defined by the configured outputs. Scanning one deployable image
 says which dependencies were found for that image; it does not imply that every

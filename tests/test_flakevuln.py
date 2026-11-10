@@ -93,21 +93,34 @@ def test_report_parser_accepts_nixprs_excluded_packages():
     assert args.nixprs_exclude_packages == ["linux", "openssl"]
 
 
-def test_scan_parser_accepts_sarif_output():
-    args = flakevuln_main._getargs(
-        [
-            "scan",
-            "--flakeref=.",
-            "--target=packages.x86_64-linux.default",
-            "--findings=findings.json",
-            "--sarif=current.sarif",
-            "--sarif-location=flake.nix",
-        ]
-    )
+@pytest.mark.parametrize(
+    ("location", "expected"),
+    [
+        ("flake.nix", "flake.nix"),
+        ("./flake.nix", "flake.nix"),
+        (".", None),
+        ("/flake.nix", None),
+        ("nix/../flake.nix", None),
+    ],
+)
+def test_scan_parser_validates_sarif_output(location, expected):
+    argv = [
+        "scan",
+        "--flakeref=.",
+        "--target=packages.x86_64-linux.default",
+        "--findings=findings.json",
+        "--sarif=current.sarif",
+        f"--sarif-location={location}",
+    ]
+    if expected is None:
+        with pytest.raises(SystemExit):
+            flakevuln_main._getargs(argv)
+        return
+    args = flakevuln_main._getargs(argv)
 
     assert args.command == "scan"
     assert args.sarif == Path("current.sarif")
-    assert args.sarif_location == "flake.nix"
+    assert args.sarif_location == expected
 
 
 def test_scan_parser_defaults_strict_scanner_off():
@@ -3159,6 +3172,7 @@ def test_scan_target_scan_model_verbs(monkeypatch, tmp_path, caplog):
         scanner.lockfile.write_text("updated", encoding="utf-8")
 
     def _rec(_cmd, target, pintype, override=None):
+        assert "--triage" not in _cmd
         calls.append(
             (target, pintype, override, scanner.lockfile.read_text(encoding="utf-8"))
         )

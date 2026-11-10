@@ -197,11 +197,7 @@ def active_finding_ids(findings):
 
 
 def load_sidecar(path):
-    """Read and validate a vulnxscan evidence sidecar.
-
-    Returns `(findings, components, triage_status)`. Raises `EvidenceError` for
-    anything that must not be mistaken for an empty, clean scan.
-    """
+    """Read and return a validated vulnxscan evidence document."""
     path = Path(path)
     try:
         size = path.stat().st_size
@@ -216,8 +212,8 @@ def load_sidecar(path):
         document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
         raise EvidenceError(f"invalid evidence report '{path}': {error}") from error
-    findings, components = validate_document(document)
-    return findings, components, document.get(TRIAGE_STATUS)
+    validate_document(document)
+    return document
 
 
 def validate_document(document):

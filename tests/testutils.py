@@ -206,15 +206,13 @@ def package_version_only_finding(vuln_id="CVE-2026-1", package="pkg", version="1
     return finding, component
 
 
-def triage_row(finding, **overrides):
-    """Return the triage CSV row vulnxscan emits for `finding`."""
+def report_row(finding, **overrides):
+    """Return the ordinary CSV row vulnxscan emits for `finding`."""
     row = {
         "vuln_id": finding["vuln_id"],
         "url": finding["url"],
         "package": finding["package"],
         "version_local": finding["version"],
-        "version_nixpkgs": "",
-        "version_upstream": "",
         "severity": finding["severity"],
         "sortcol": finding["sortcol"],
         "whitelist": "False",
@@ -229,13 +227,6 @@ def triage_row(finding, **overrides):
     return row
 
 
-def triage_path(out):
-    """Return the triage CSV path vulnxscan derives from `--out`."""
-    out = Path(out)
-    suffix = ".csv" if out.suffix == ".sarif" else out.suffix
-    return out.with_name(f"{out.stem}.triage{suffix}")
-
-
 def arg_value(cmd, prefix):
     """Return the value of the first `prefix`-prefixed argument in `cmd`."""
     for arg in cmd:
@@ -247,14 +238,14 @@ def arg_value(cmd, prefix):
 def fake_vulnxscan(
     *,
     document=None,
-    triage_rows=None,
+    report_rows=None,
     returncode=0,
     stderr="",
     evidence_text=None,
 ):
     """Return an `exec_cmd` stand-in that writes vulnxscan's output files.
 
-    `document` is written as the evidence sidecar, `triage_rows` as the triage
+    `document` is written as the evidence sidecar, `report_rows` as the ordinary
     CSV. Passing None for either models vulnxscan not writing that file at all;
     `evidence_text` writes raw bytes instead, for malformed-input tests.
     """
@@ -267,8 +258,8 @@ def fake_vulnxscan(
                 Path(evidence_out).write_text(evidence_text, encoding="utf-8")
             elif document is not None:
                 Path(evidence_out).write_text(json.dumps(document), encoding="utf-8")
-            if triage_rows is not None:
-                pd.DataFrame(triage_rows).to_csv(triage_path(out), index=False)
+            if report_rows is not None:
+                pd.DataFrame(report_rows).to_csv(Path(out), index=False)
         return SimpleNamespace(returncode=returncode, stdout="", stderr=stderr)
 
     return _run

@@ -90,8 +90,8 @@ jobs:
 ```
 
 Choose your own cron minute rather than reusing the one above. A scan fans out
-to shared community infrastructure, including `repology.org` and the Nixpkgs
-security tracker, and neither is a large service. Copies of the same schedule
+to shared community infrastructure, including vulnerability databases and the
+Nixpkgs security tracker. Copies of the same schedule
 across many repositories concentrate that load into a single minute, so
 staggering costs you nothing and helps the services everyone depends on.
 
@@ -222,19 +222,22 @@ repositories also need GitHub Code Security enabled and `actions: read`.
 - The primary findings path is the `findings-path` output. For compatibility,
   the action also writes a copy to `${{ runner.temp }}/flakevuln/findings.json`,
   but callers should migrate to the output path for multi-invocation jobs.
-- SARIF output: setting `sarif-location` exposes `sarif` after a nonempty
-  current-pin file and consistent companion outputs are generated. Scanner
-  errors and missing or empty SARIF fail the scan; rejected companion output
-  discards SARIF. It is written before the lock-updated and unstable scans. Code
+- SARIF output: setting `sarif-location` exposes `sarif` after the current-pin
+  CSV and evidence are validated and SARIF is written. Scanner or SARIF write
+  errors fail the scan; rejected companion output
+  discards SARIF. The native sbomnix exporter writes SARIF from the validated
+  current-pin CSV and evidence, without rerunning scanners. It is written
+  before the lock-updated and unstable scans. Code
   Scanning counts each affected package version, while the report collapses
   versions by vulnerability and package, so the Security tab will normally show
   more alerts than the report's Currently Active table. The report's
   patch-evidence suppression can increase that difference.
-- Repology outages: a scan with valid fallback triage rows remains successful.
-  Findings and any requested SARIF are retained, Repology-provided version and
-  classification fields stay blank, and the report begins with a degraded-mode
-  warning. Malformed, missing, or evidence-inconsistent triage output still
-  fails the affected scan state.
+- Scans use ordinary vulnxscan CSV and evidence JSON without `--triage` or
+  Repology requests. Nixpkgs unstable version hints come from evaluated scan
+  comparisons and package inventories. New scans no longer include Repology
+  version hints. Missing or inconsistent evidence still fails the affected scan
+  state. Historical findings files retain their recorded version hints and
+  degraded-triage warnings.
 - Baseline diffing: the action persists a prior findings set keyed by flakeref,
   targets, and `input-name`, then reports what changed since the last
   successful run for that same scope.
@@ -255,7 +258,7 @@ fresh state for the next run. It persists:
 
 - the `grype` database
 - the `vulnix` database
-- `sbomnix`'s shared HTTP cache for OSV, repology, and optional `nixprs` /
+- `sbomnix`'s shared HTTP cache for OSV and optional `nixprs` /
   `nixtracker` lookups
 - the previous-run findings baseline used for "since last run" sections
 
