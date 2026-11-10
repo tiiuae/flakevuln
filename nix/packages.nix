@@ -11,7 +11,10 @@
     }:
     let
       pp = pkgs.python3.pkgs;
-      pythonDeps = import ./python-deps.nix pp;
+      pythonDeps = import ./python-deps.nix {
+        inherit pp;
+        sbomnix = inputs'.sbomnix.packages.default;
+      };
       baseVersion = lib.removeSuffix "\n" (builtins.readFile ../VERSION);
       # Append git state so local builds are distinguishable from release
       # artifacts. shortRev is set on a clean tree; dirtyShortRev (Nix >= 2.14)
