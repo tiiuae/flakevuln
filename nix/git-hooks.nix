@@ -4,9 +4,12 @@
     git-hooks-nix.flakeModule
   ];
   perSystem =
-    { pkgs, ... }:
+    { pkgs, inputs', ... }:
     let
-      pythonDeps = import ./python-deps.nix pkgs.python3.pkgs;
+      pythonDeps = import ./python-deps.nix {
+        pp = pkgs.python3.pkgs;
+        sbomnix = inputs'.sbomnix.packages.default;
+      };
       # Python env used by pyright so it can resolve the project's imports.
       pyrightPythonEnv = pkgs.python3.withPackages (_: pythonDeps);
       pyrightWrapper = pkgs.writeShellScriptBin "pyright-flakevuln" ''

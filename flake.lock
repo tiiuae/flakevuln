@@ -154,11 +154,11 @@
         "vulnix": "vulnix"
       },
       "locked": {
-        "lastModified": 1789721520,
-        "narHash": "sha256-HqvmQW34CxNRigKuLe9mcTF4GzidcBqj++IbrGlk5Jo=",
+        "lastModified": 1794293576,
+        "narHash": "sha256-ss2eGNIg0eiSBZYBxv1wWurQWaA3PQrbnoBq7ssnLs0=",
         "owner": "tiiuae",
         "repo": "sbomnix",
-        "rev": "f3c241a49b27af9774894ad3cfb250d4d87280d8",
+        "rev": "94ce54e1c97c2f0f3bc8e81bbb386176b4b26ac7",
         "type": "github"
       },
       "original": {
@@ -210,11 +210,11 @@
         "treefmt-nix": "treefmt-nix"
       },
       "locked": {
-        "lastModified": 1786447879,
-        "narHash": "sha256-o5oszT1KeCSjrGwkZ68JY1lEeasQKK/EbRkLeBJFso8=",
+        "lastModified": 1792480408,
+        "narHash": "sha256-JgWYJuUBJjVsgWJviWvjvEOb4+5dk1hEhetEEkm9Gio=",
         "owner": "nix-community",
         "repo": "vulnix",
-        "rev": "b4582e52a7e7e032be54913f924bf5043ee75346",
+        "rev": "427de5d078fbed82c7a8acac163f68a0c49b221f",
         "type": "github"
       },
       "original": {
