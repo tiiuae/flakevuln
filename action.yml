@@ -193,7 +193,7 @@ runs:
           ${{ steps.cache-meta.outputs.vulnix_prefix }}
 
     # Restore sbomnix's shared requests-cache database across runs. This
-    # covers OSV, repology, and optional nixprs/nixtracker lookups without persisting the
+    # covers OSV and optional nixprs/nixtracker lookups without persisting the
     # unrelated dataframe/meta lock files that live under the same cache root.
     # Honor XDG_CACHE_HOME when the caller sets it.
     - name: Restore sbomnix HTTP responses

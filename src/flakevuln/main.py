@@ -19,7 +19,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import cast
 from urllib.parse import urlsplit, urlunsplit
 
@@ -44,8 +44,6 @@ EMPTY_SCAN_COLUMNS = [
     "severity",
     "sortcol",
     "version_local",
-    "version_nixpkgs",
-    "version_upstream",
     "whitelist",
     "url",
     "whitelist_comment",
@@ -54,15 +52,15 @@ EMPTY_SCAN_COLUMNS = [
     "nixpkgs_issue_status",
     "flake_input",
     # vulnxscan patch-evidence aggregates. Empty for legacy findings written
-    # before the evidence contract, which still render exactly as before. An
-    # empty scan frame carries them too, so a clean scan with no triage rows is
-    # not mistaken for triage output that is missing its evidence columns.
+    # before the evidence contract, which still render without evidence. An
+    # empty scan frame carries them too, so a clean scan with no report rows is
+    # not mistaken for report output that is missing its evidence columns.
     "finding_id",
     "evidence_scope",
     "patch_state",
     *evidence.COUNT_FIELDS,
 ]
-TRIAGE_EVIDENCE_COLUMNS = (
+FINDINGS_EVIDENCE_COLUMNS = (
     "vuln_id",
     "package",
     "version_local",
@@ -295,6 +293,14 @@ def _add_verbose_arg(parser):
     parser.add_argument("--verbose", help=helps, type=int, default=1)
 
 
+def _sarif_location(value):
+    """Normalize the repository-relative location accepted by vulnxscan."""
+    path = PurePosixPath(value)
+    if path == PurePosixPath(".") or path.is_absolute() or ".." in path.parts:
+        raise argparse.ArgumentTypeError("must be a repository-relative file path")
+    return path.as_posix()
+
+
 def _add_scan_parser(subparsers):
     """Add the low-level `scan` subcommand parser."""
     scan = subparsers.add_parser(
@@ -343,7 +349,7 @@ def _add_scan_parser(subparsers):
     helps = "Optional path for native vulnxscan SARIF output. Requires one target."
     scan.add_argument("--sarif", help=helps, type=Path)
     helps = "Repository-relative file responsible for the scanned closure."
-    scan.add_argument("--sarif-location", help=helps)
+    scan.add_argument("--sarif-location", help=helps, type=_sarif_location)
     helps = (
         "Fail closed on degraded scanner data: require vulnxscan's CPE "
         "dictionary and grype database update checks to succeed. Scanner "
@@ -2321,7 +2327,6 @@ class FlakeScanner:
         cmd_vulnxscan = [
             "vulnxscan",
             f"--verbose={self.verbosity}",
-            "--triage",
         ]
         if buildtime:
             cmd_vulnxscan.append("--buildtime")
@@ -3879,7 +3884,6 @@ in builtins.listToAttrs (map (name: {{ inherit name; value = get name; }}) args.
         out = self.tmpdir / f"vulnxscan.{stem}.csv"
         paths = (
             out,
-            out.with_name(f"{out.stem}.triage{out.suffix}"),
             out.with_name(f"{out.stem}.evidence.json"),
         )
         for path in paths:
@@ -3896,16 +3900,37 @@ in builtins.listToAttrs (map (name: {{ inherit name; value = get name; }}) args.
             "details": _tail_text(details),
         }
 
-    def _prepare_sarif_output(self, cmd):
-        """Replace current-pin CSV output with fresh native SARIF paths."""
+    def _prepare_sarif_output(self):
+        """Clear the requested SARIF before accepting a new current scan."""
         out = self.sarif_out
         assert out is not None
-        out_triage = out.with_name(f"{out.stem}.triage.csv")
         out.parent.mkdir(parents=True, exist_ok=True)
         out.unlink(missing_ok=True)
-        out_triage.unlink(missing_ok=True)
-        cmd = [*cmd, "--format=sarif", f"--sarif-location={self.sarif_location}"]
-        return cmd, out, out_triage
+
+    def _write_sarif_output(self, df, document, target, pintype):
+        """Export validated CSV and evidence with sbomnix's native writer."""
+        # sbomnix configures logging on import; ordinary report runs avoid it.
+        from vulnxscan.sarif import findings_to_sarif, write_sarif
+
+        out = self.sarif_out
+        assert out is not None
+        active = _normalize_scan_df(df)
+        active = active[active["whitelist"] == "False"]
+        try:
+            sarif = findings_to_sarif(
+                active,
+                evidence_document=document,
+                location=self.sarif_location,
+            )
+            write_sarif(sarif, out)
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
+            self._record_scan_error(
+                target,
+                pintype,
+                f"Could not write SARIF for '{target}' on {pintype}",
+                str(error),
+            )
+            sys.exit(1)
 
     def _strict_scanner_policy(self, cmd):
         """Apply fail-closed scanner settings when strict mode is enabled."""
@@ -3923,18 +3948,18 @@ in builtins.listToAttrs (map (name: {{ inherit name; value = get name; }}) args.
         }
 
     def _read_scan_results(self, cmd, target, pintype, override=None):
+        sarif_requested = self.sarif_out is not None and pintype == PIN_CURRENT
+        if sarif_requested:
+            self._prepare_sarif_output()
         started = time.monotonic()
         drv_path = self._evaluate_target_drv(target, pintype, override=override)
         _log_scan_timing(f"evaluate '{target}' on {pintype}", started)
-        sarif_requested = self.sarif_out is not None and pintype == PIN_CURRENT
         if drv_path is None:
             if sarif_requested:
                 LOG.fatal("Could not evaluate current target for SARIF output")
                 sys.exit(1)
             return
-        out, out_triage, out_evidence = self._scan_output_paths(target, pintype)
-        if sarif_requested:
-            cmd, out, out_triage = self._prepare_sarif_output(cmd)
+        out, out_evidence = self._scan_output_paths(target, pintype)
         cmd, strict_evars = self._strict_scanner_policy(cmd)
         cmd = [
             *cmd,
@@ -3965,16 +3990,9 @@ in builtins.listToAttrs (map (name: {{ inherit name; value = get name; }}) args.
             if sarif_requested or self.strict_scanner:
                 sys.exit(ret.returncode or 1)
             return
-        if sarif_requested and (not out.is_file() or out.stat().st_size == 0):
-            self._record_scan_error(
-                target,
-                pintype,
-                f"Missing or empty SARIF for '{target}' on {pintype}",
-            )
-            sys.exit(1)
         started = time.monotonic()
         try:
-            findings, components, triage_status = evidence.load_sidecar(out_evidence)
+            document = evidence.load_sidecar(out_evidence)
         except evidence.EvidenceError as error:
             _log_scan_timing(
                 f"read outputs '{target}' on {pintype}", started, "failed=true"
@@ -3988,7 +4006,9 @@ in builtins.listToAttrs (map (name: {{ inherit name; value = get name; }}) args.
                 str(error),
             )
             return
-        df = self._read_triage_rows(target, pintype, out_triage, findings)
+        findings = document["findings"]
+        components = document["components"]
+        df = self._read_findings_rows(target, pintype, out, findings)
         if df is None:
             _log_scan_timing(
                 f"read outputs '{target}' on {pintype}",
@@ -4016,6 +4036,8 @@ in builtins.listToAttrs (map (name: {{ inherit name; value = get name; }}) args.
         )
         if df is None:
             return
+        if sarif_requested:
+            self._write_sarif_output(df, document, target, pintype)
         if not df.empty:
             # Add the following columns to the beginning of df
             df.insert(0, "pintype", pintype)
@@ -4032,7 +4054,7 @@ in builtins.listToAttrs (map (name: {{ inherit name; value = get name; }}) args.
         self.evidence_findings.extend(evidence.annotate(findings, **annotation))
         self.component_evidence.extend(evidence.annotate(components, **annotation))
         self._record_package_inventory(cmd, target, pintype, drv_path)
-        self._record_completed_scan(target, pintype, triage_status)
+        self._record_completed_scan(target, pintype)
 
     def _record_package_inventory(self, cmd, target, pintype, drv_path):
         inventory_store = None
@@ -4128,67 +4150,54 @@ in builtins.listToAttrs (map (name: {{ inherit name; value = get name; }}) args.
             for package, versions in sorted(inventory.items())
         }
 
-    def _record_completed_scan(self, target, pintype, triage_status=None):
-        """Remember a successful scan state and any degraded triage status."""
+    def _record_completed_scan(self, target, pintype):
+        """Remember a successful scan state."""
         key = (self.scope_flakeref, str(target), str(pintype))
         self.completed_scans.add(key)
-        if triage_status != evidence.TRIAGE_STATUS_UNAVAILABLE:
-            return
-        self.triage_unavailable_scans.add(key)
-        LOG.warning(
-            "Repology triage enrichment was unavailable for '%s' on %s",
-            target,
-            pintype,
-        )
 
-    def _read_triage_rows(self, target, pintype, out_triage, findings):
-        """Return the triage rows that match the accepted evidence findings.
-
-        Returns None -- after recording a scan failure -- whenever the triage
-        output disagrees with the evidence report. Repology can emit several
-        triage rows for one finding, so the two are compared as ID *sets*.
-        """
+    def _read_findings_rows(self, target, pintype, out, findings):
+        """Return ordinary CSV rows matching the accepted evidence findings."""
         active_ids = evidence.active_finding_ids(findings)
         df = None
-        if out_triage.exists():
-            df = df_from_csv_file(out_triage, exit_on_error=False)
+        if out.exists():
+            df = df_from_csv_file(out, exit_on_error=False)
             if df is None:
                 self._record_scan_error(
                     target,
                     pintype,
-                    f"Invalid vulnxscan output '{out_triage}'",
+                    f"Invalid vulnxscan output '{out}'",
                 )
                 return None
         if df is None or df.empty:
-            triage_ids = set()
+            report_ids = set()
             df = _empty_scan_df()
         elif "finding_id" not in df.columns:
             self._record_scan_error(
                 target,
                 pintype,
-                f"vulnxscan triage output for '{target}' on {pintype} "
+                f"vulnxscan CSV output for '{target}' on {pintype} "
                 "is missing the finding_id column",
             )
             return None
         else:
-            triage_ids = set(df["finding_id"].astype(str))
-        if triage_ids != active_ids:
+            report_ids = set(df["finding_id"].astype(str))
+        if report_ids != active_ids:
             self._record_scan_error(
                 target,
                 pintype,
-                f"vulnxscan triage output for '{target}' on {pintype} "
+                f"vulnxscan CSV output for '{target}' on {pintype} "
                 "does not match its evidence report",
-                f"{len(triage_ids - active_ids)} triage finding(s) without "
-                f"evidence, {len(active_ids - triage_ids)} active evidence "
-                "finding(s) without triage rows",
+                f"{len(report_ids - active_ids)} CSV finding(s) without "
+                f"evidence, {len(active_ids - report_ids)} active evidence "
+                "finding(s) without CSV rows",
             )
             return None
-        mismatch = _triage_evidence_mismatch(df, findings)
+        mismatch = _findings_evidence_mismatch(df, findings)
         if mismatch:
             self._record_scan_error(
                 target,
                 pintype,
-                f"vulnxscan triage output for '{target}' on {pintype} "
+                f"vulnxscan CSV output for '{target}' on {pintype} "
                 "does not match its evidence report",
                 mismatch,
             )
@@ -4680,11 +4689,16 @@ def _evidence_row_mismatch(row, expected_row):
     return ""
 
 
-def _triage_evidence_mismatch(df, findings):
-    """Return why triage rows disagree with evidence, or empty on success."""
-    missing = [column for column in TRIAGE_EVIDENCE_COLUMNS if column not in df.columns]
+def _findings_evidence_mismatch(df, findings):
+    """Return why CSV rows disagree with evidence, or empty on success."""
+    missing = [
+        column for column in FINDINGS_EVIDENCE_COLUMNS if column not in df.columns
+    ]
     if missing:
         return f"missing evidence column(s): {', '.join(missing)}"
+
+    if df["finding_id"].duplicated().any():
+        return "duplicate finding_id values"
 
     expected = {
         str(finding[evidence.FINDING_ID]): _expected_evidence_row(finding)

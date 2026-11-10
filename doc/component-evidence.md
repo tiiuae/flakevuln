@@ -109,25 +109,31 @@ stays in the trusted `report` phase, as before.
 
 ## Scan outcomes
 
-Per target and pin state, `flakevuln` requests `--out`, `--triage`, and
-`--evidence-out` on unique paths, then requires the aggregate output and the
-evidence report to agree:
+Per target and pin state, `flakevuln` requests ordinary CSV with `--out` and
+evidence JSON with `--evidence-out` on unique paths. It does not request
+`--triage`. The aggregate output and evidence report must agree:
 
 | vulnxscan result | outcome |
 | --- | --- |
 | nonzero exit | scan failure; all output files ignored |
-| missing, malformed, or unsupported evidence | scan failure, even if a triage CSV exists |
-| valid empty evidence, no triage output | clean scan |
-| only patch-suppressed findings, no triage output | successful scan, evidence only |
-| active evidence findings, missing or invalid triage CSV | scan failure |
-| triage IDs or evidence fields disagree with active evidence | scan failure |
-| valid active evidence and matching triage CSV | successful scan |
-| matching fallback CSV with `triage_status: unavailable` | successful degraded scan; findings are retained and reports warn that Repology fields are blank |
+| missing, malformed, or unsupported evidence | scan failure, even if a CSV exists |
+| valid empty evidence, no CSV output | clean scan |
+| only patch-suppressed findings, no CSV output | successful scan, evidence only |
+| active evidence findings, missing or invalid CSV | scan failure |
+| CSV IDs or evidence fields disagree with active evidence | scan failure |
+| duplicate CSV finding IDs | scan failure |
+| valid active evidence and matching CSV | successful scan |
 
-IDs are compared as *sets*: Repology can legitimately produce several triage
-rows for one finding. A failure in one pin state is recorded against that state
+The CSV must contain exactly one row per active evidence finding, including
+whitelisted findings. A failure in one pin state is recorded against that state
 alone — it never becomes a "fixed" claim, and never stops the other configured
 scan states from running.
+
+Requested SARIF is generated with sbomnix's native exporter after CSV and
+evidence validation, using the same scanner results. Whitelisted and
+patch-suppressed findings are omitted from SARIF while remaining available in
+the corresponding report rows or evidence. Scanner descriptions, fix metadata,
+component paths and fingerprints retain the native vulnxscan representation.
 
 ## Findings schema
 
@@ -161,8 +167,9 @@ compatibility mode: it detects contradictions in the data that exists rather
 than proving no scan state was omitted, and it cannot recover a successful
 zero-finding scan state that the old file format had no way to express.
 
-`triage_unavailable_scans` holds the same triples for successful scans whose
-vulnxscan sidecar reported `triage_status: unavailable`. Each entry must also
+`triage_unavailable_scans` retains historical triples for successful scans whose
+vulnxscan sidecar reported `triage_status: unavailable`. New scans do not request
+triage and leave this list empty. Each historical entry must also
 appear in `completed_scans`. The trusted report phase uses this list to put a
 warning at the top of the Step Summary and published report without trusting
 free-form text from the scan phase. Older version-2 artifacts omit the field
@@ -207,9 +214,10 @@ sidecar, and 256 MiB per findings file.
 
 ## Imported vulnxscan contract
 
-Evidence sidecar `schema_version: 1`. `flakevuln` imports `findings`,
-`components`, and the optional `triage_status: unavailable` marker; raw scanner
-`observations` stay in vulnxscan's own output.
+Evidence sidecar `schema_version: 1`. `flakevuln` imports `findings` and
+`components`, and accepts the optional legacy `triage_status: unavailable`
+marker. Raw scanner `observations` supply descriptions and fix metadata to the
+native SARIF exporter; they are not copied into `findings.json`.
 
 Finding fields: `finding_id`, `vuln_id`, `package`, `version`, `severity`,
 `scanners`, `url`, `sortcol`, `evidence_scope`, `patch_state`,
@@ -230,7 +238,7 @@ Component fields: `finding_id`, `component_id`, `identity_sources`, `drv_path`,
 and its `identity_sources` are drawn from `scanner_component_ref`,
 `sbom_package_version_join`, `unresolved`.
 
-The same triage CSV columns (`finding_id`, `evidence_scope`, `patch_state`, and
+The ordinary CSV columns (`finding_id`, `evidence_scope`, `patch_state`, and
 the five counts) accompany the aggregate rows, which is what lets the two
 outputs be cross-checked.
 
