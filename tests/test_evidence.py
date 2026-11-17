@@ -139,6 +139,68 @@ def test_buildtime_scan_records_available_package_inventory(
 # --- vulnxscan contract fixtures ------------------------------------------
 
 
+@pytest.mark.parametrize("scan_state", ["active", "patched", "empty"])
+def test_sbomnix_reports_are_ingested_and_exported(monkeypatch, tmp_path, scan_state):
+    """Exercise the installed sbomnix producer, CLI arguments, and SARIF API."""
+    from vulnxscan.vulnscan import VulnScan
+    from vulnxscan.vulnxscan_cli import getargs
+
+    drv_path = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-pkg-1.0.drv"
+    vuln_id = "CVE-2026-1001"
+    sbom_csv = tmp_path / "sbom.csv"
+    patches = [f"/nix/store/src/{vuln_id}.patch"] if scan_state == "patched" else []
+    pd.DataFrame(
+        [
+            {
+                "store_path": drv_path,
+                "pname": "pkg",
+                "version": "1.0",
+                "output_paths_json": json.dumps([drv_path.removesuffix(".drv")]),
+                "patch_paths_json": json.dumps(patches),
+            }
+        ]
+    ).to_csv(sbom_csv, index=False)
+
+    def produce_report(cmd, **_kwargs):
+        upstream = VulnScan()
+        if scan_state != "empty":
+            upstream.df_grype = pd.DataFrame(
+                [
+                    {
+                        "vuln_id": vuln_id,
+                        "package": "pkg",
+                        "version": "1.0",
+                        "severity": "7.5",
+                        "scanner": "grype",
+                        "component_ref": drv_path,
+                        "fix_versions": "1.1",
+                    }
+                ]
+            )
+        upstream.report(getargs(cmd[1:]), sbom_csv)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    scanner = _sarif_scanner(tmp_path)
+    monkeypatch.setattr(scanner, "_evaluate_target_drv", lambda *_a, **_k: drv_path)
+    monkeypatch.setattr(flakevuln_main, "exec_cmd", produce_report)
+
+    scanner._read_scan_results(["vulnxscan"], TARGET, PIN_CURRENT)
+
+    assert not _has_error(scanner)
+    assert (scanner.scope_flakeref, TARGET, PIN_CURRENT) in scanner.completed_scans
+    assert len(scanner.df_scan) == (1 if scan_state == "active" else 0)
+    assert len(scanner.evidence_findings) == (0 if scan_state == "empty" else 1)
+    assert len(scanner.component_evidence) == (0 if scan_state == "empty" else 1)
+    results = json.loads(scanner.sarif_out.read_text())["runs"][0]["results"]
+    if scan_state == "active":
+        assert results[0]["ruleId"] == vuln_id
+        assert results[0]["properties"]["fixVersions"] == ["1.1"]
+    else:
+        assert results == []
+    if scan_state == "patched":
+        assert scanner.evidence_findings[0][evidence.SUPPRESSED] is True
+
+
 def test_contract_fixtures_carry_every_required_field():
     """The fixtures must be a complete example of the imported contract."""
     finding, components = tu.mixed_finding()

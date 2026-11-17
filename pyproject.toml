@@ -23,7 +23,7 @@ dependencies = [
   "requests",
   "requests-cache",
   "requests-ratelimiter",
-  "sbomnix @ git+https://github.com/tiiuae/sbomnix.git@v1.10.0",
+  "sbomnix @ git+https://github.com/tiiuae/sbomnix.git@f171f8a17b2132f0f9ad805dccee34fc5f3ffe0c",
   "tabulate",
 ]
 
