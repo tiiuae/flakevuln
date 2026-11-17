@@ -2974,6 +2974,80 @@ def test_snapshot_remote_flake_copies_only_flakefiles(monkeypatch, tmp_path):
     assert (scanner.repodir / "flake.lock").stat().st_mode & 0o200
 
 
+def test_snapshot_remote_flake_prefetches_missing_source(monkeypatch, tmp_path):
+    """Lazy flake metadata needs a source fetch pinned to the resolved revision."""
+    scanner = _bare_scanner(tmp_path)
+    source_root = tmp_path / "source"
+    locked_ref = "github:acme/widget/deadbeef?narHash=sha256-test"
+    metadata = {
+        "path": str(tmp_path / "lazy-source"),
+        "revision": "deadbeef",
+        "url": locked_ref,
+    }
+    monkeypatch.setattr(scanner, "_nix_flake_metadata", lambda _ref: metadata)
+    calls = []
+
+    def prefetch(cmd, **kwargs):
+        calls.append(cmd)
+        assert kwargs["capture"] is True
+        source_root.mkdir()
+        (source_root / "flake.nix").write_text("{}", encoding="utf-8")
+        (source_root / "flake.lock").write_text("{}", encoding="utf-8")
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=json.dumps({"storePath": str(source_root)}), stderr=""
+        )
+
+    monkeypatch.setattr(flakevuln_main, "exec_cmd", prefetch)
+
+    scanner._snapshot_workspace("github:acme/widget")
+
+    assert calls == [["nix", "flake", "prefetch", "--json", locked_ref]]
+    assert scanner.eval_flakeref == locked_ref
+    assert scanner.repo_head == "deadbeef"
+    assert (scanner.repodir / "flake.nix").read_text(encoding="utf-8") == "{}"
+    assert (scanner.repodir / "flake.lock").read_text(encoding="utf-8") == "{}"
+
+
+@pytest.mark.parametrize(
+    "fetch_result",
+    [
+        (1, "", "download failed", "Could not fetch flake source"),
+        (0, "not-json", "", "Invalid flake prefetch output"),
+        (0, "{}", "", "Invalid flake prefetch output"),
+        (0, '{"storePath": ""}', "", "Invalid flake prefetch output"),
+        (0, '{"storePath": "."}', "", "Invalid flake prefetch output"),
+    ],
+)
+def test_snapshot_remote_flake_prefetch_failure_exits_cleanly(
+    monkeypatch, tmp_path, caplog, fetch_result
+):
+    """A failed fetch or invalid result must produce a clear scan error."""
+    returncode, stdout, stderr, message = fetch_result
+    scanner = _bare_scanner(tmp_path)
+    locked_ref = "github:acme/widget/deadbeef"
+    monkeypatch.setattr(
+        scanner,
+        "_nix_flake_metadata",
+        lambda _ref: {"path": str(tmp_path / "missing"), "url": locked_ref},
+    )
+
+    def prefetch(cmd, **kwargs):
+        assert kwargs["raise_on_error"] is False
+        return subprocess.CompletedProcess(cmd, returncode, stdout, stderr)
+
+    monkeypatch.setattr(flakevuln_main, "exec_cmd", prefetch)
+
+    with pytest.raises(SystemExit) as error:
+        scanner._snapshot_workspace("github:acme/widget")
+
+    assert error.value.code == 1
+    assert message in caplog.text
+    assert locked_ref in caplog.text
+    if stderr:
+        assert stderr in caplog.text
+    assert not (scanner.tmpdir / "repo").exists()
+
+
 def test_report_scopes_whitelisted_findings_to_target(monkeypatch, tmp_path):
     """The whitelisted section should only include the active target."""
     scanner = _make_scanner(tmp_path)

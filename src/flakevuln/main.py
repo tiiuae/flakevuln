@@ -2162,6 +2162,42 @@ class FlakeScanner:
             LOG.fatal("Could not resolve flake metadata for '%s'", flakeref)
             sys.exit(1)
         source_root = Path(metadata["path"])
+        locked_flakeref = _metadata_locked_flakeref(metadata)
+        if not source_root.exists():
+            # Metadata can describe a lazy source tree without putting it in
+            # the store. Fetch only that source, pinned to the resolved revision.
+            ret = exec_cmd(
+                [
+                    "nix",
+                    "flake",
+                    "prefetch",
+                    *_nix_verbosity_flags(self.verbosity),
+                    "--json",
+                    locked_flakeref,
+                ],
+                capture=True,
+                raise_on_error=False,
+            )
+            if ret.returncode != 0:
+                LOG.fatal(
+                    "Could not fetch flake source for '%s':\n%s",
+                    locked_flakeref,
+                    _tail_text(ret.stderr or ret.stdout),
+                )
+                sys.exit(1)
+            try:
+                source_root = Path(json.loads(ret.stdout)["storePath"])
+                if not source_root.is_absolute() or not source_root.is_dir():
+                    raise ValueError(
+                        "storePath must name an existing absolute directory"
+                    )
+            except (ValueError, TypeError, KeyError) as error:
+                LOG.fatal(
+                    "Invalid flake prefetch output for '%s':\n%s",
+                    locked_flakeref,
+                    error,
+                )
+                sys.exit(1)
         subdir = _metadata_flake_subdir(metadata)
         source_flake_dir = source_root if subdir == "." else source_root / subdir
         snapshot_flake_dir = snapshot_root if subdir == "." else snapshot_root / subdir
@@ -2175,7 +2211,7 @@ class FlakeScanner:
         if not isinstance(locked, dict):
             locked = {}
         self.repo_head = metadata.get("revision") or locked.get("rev", "")
-        self.eval_flakeref = _metadata_locked_flakeref(metadata)
+        self.eval_flakeref = locked_flakeref
         self.remote_flake = True
 
     def _materialize_git_snapshot(self, src_repo, root, snapshot_root, submodules):
@@ -3228,10 +3264,10 @@ class FlakeScanner:
                 axis=1,
             )
         if up_ver and "version_nixpkgs" in df:
-            # `vulnxscan --triage` gets this from Repology's `nix_unstable`
-            # repository metadata. Use it only when no successful evaluated
-            # comparison is available; a missing finding in a successful scan
-            # is authoritative and must not be replaced with metadata.
+            # Older findings may carry Repology's `nix_unstable` repository
+            # metadata. Use it only when no successful evaluated comparison
+            # is available; a missing finding in a successful scan is
+            # authoritative and must not be replaced with metadata.
             ver_rename = PIN_NIX_UNSTABLE
             if ver_rename not in report_cols:
                 report_cols.append(ver_rename)
